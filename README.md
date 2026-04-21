@@ -26,6 +26,58 @@ Continue? [y/N]
 
 Once the VM boots, run `c` to launch Claude Code.
 
+## Named instances
+
+Run multiple isolated VMs simultaneously, like Wine prefixes. Each named
+instance gets its own data directory, overlay image, and network ports.
+
+```sh
+# Default instance (unchanged behavior)
+nix run github:illustris/cc-sandbox
+
+# Create and start a named instance
+nix run github:illustris/cc-sandbox -- --name work
+nix run github:illustris/cc-sandbox -- --name personal --vcpu 8 --mem 16384
+
+# List all instances and their ports
+nix run github:illustris/cc-sandbox -- --list
+```
+
+Ports are auto-assigned when an instance is first created (default starts
+at SSH 2222 / HTTP 8080; each new instance increments by one). You can
+override ports by editing the instance config.
+
+Claude authentication (`~/.claude.json`) and base Claude config (`~/.claude/`)
+are shared across all instances. Each instance gets its own overlay on
+top of the shared config, so per-instance Claude settings persist
+independently.
+
+## Flags
+
+| Flag | Description |
+|---|---|
+| `--name NAME` | Use a named instance (creates it on first run) |
+| `--vcpu N` | Set vCPU count (default: config.json or 16) |
+| `--mem N` | Set RAM in megabytes (default: config.json or 32768) |
+| `--init-only` | Run all setup steps but do not start the VM |
+| `--list` | List all instances with their ports and status |
+| `--help` | Show usage information |
+
+When an instance is first created, `--vcpu` and `--mem` are saved to its
+`config.json`. On subsequent runs they override the config for that run
+only.
+
+```sh
+# Prepare runtime directory without booting
+nix run github:illustris/cc-sandbox -- --init-only
+
+# Launch with 8 cores and 16 GB RAM
+nix run github:illustris/cc-sandbox -- --vcpu 8 --mem 16384
+
+# Create a named instance without starting it
+nix run github:illustris/cc-sandbox -- --name work --init-only
+```
+
 ## Configuration
 
 All settings are in `~/.config/cc-sandbox/` (or `$XDG_CONFIG_HOME/cc-sandbox/`).
@@ -57,6 +109,29 @@ Edit them and restart the VM -- no rebuild needed.
 
 Only include the keys you want to change -- missing keys use the defaults.
 
+### Per-instance configuration
+
+Named instances store their config under `~/.config/cc-sandbox/instances/<name>/`:
+
+```
+~/.config/cc-sandbox/
+  config.json                  # default instance
+  authorized_keys              # shared SSH keys
+  instances/
+    work/
+      config.json              # auto-generated with unique ports
+      authorized_keys          # optional per-instance SSH keys
+    personal/
+      config.json
+```
+
+Each instance config has the same format as the default `config.json`.
+SSH keys fall back to the shared `authorized_keys` unless a per-instance
+file exists.
+
+Data (VM state, overlays) is stored per-instance under
+`~/.local/share/cc-sandbox/instances/<name>/`.
+
 ### authorized_keys
 
 SSH public keys, one per line (same format as `~/.ssh/authorized_keys`).
@@ -85,25 +160,6 @@ Override where data lives on the host with environment variables:
 CC_SANDBOX_DATA=/mnt/fast/cc-sandbox nix run .
 ```
 
-## Flags
-
-| Flag | Description |
-|---|---|
-| `--init-only` | Run all setup steps but do not start the VM |
-| `--vcpu N` | Override vCPU count (default: config.json or 16) |
-| `--mem N` | Override RAM in megabytes (default: config.json or 32768) |
-
-Flags override `config.json` for the current run without modifying the
-config file.
-
-```sh
-# Prepare runtime directory without booting
-nix run github:illustris/cc-sandbox -- --init-only
-
-# Launch with 8 cores and 16 GB RAM
-nix run github:illustris/cc-sandbox -- --vcpu 8 --mem 16384
-```
-
 ## How it works
 
 QEMU's 9p share sources must be absolute paths known at build time. The
@@ -121,6 +177,11 @@ Runtime settings (vcpu, memory, ports) are applied by patching the microvm
 runner script's QEMU arguments at launch time. Settings that affect the
 guest (overlay sizes, SSH keys) are written to the shared data directory
 where systemd services inside the VM pick them up at boot.
+
+Named instances use separate runtime directories (`/tmp/cc-sandbox-<name>/`),
+each with its own symlinks and PID lock. The wrapper patches the QEMU
+runner's 9p share source paths to point at the instance-specific runtime
+directory, so the same VM image serves all instances.
 
 ## Defaults
 
@@ -140,8 +201,9 @@ Pre-installed tools: `claude-code`, `git`, `curl`, `jq`, `vim`, `ncdu`,
 ## Limitations
 
 - x86_64-linux only (QEMU with KVM)
-- One instance at a time (PID lock at `/tmp/cc-sandbox`)
+- One instance per name at a time (PID lock per runtime directory).
+  Multiple differently-named instances can run simultaneously.
 - The writable nix store overlay is a tmpfs -- installed packages do not
   persist across VM reboots
 - Changing `overlaySize` only affects newly created overlay images; delete
-  `~/.local/share/cc-sandbox/claude-overlay.img` to recreate with a new size
+  the overlay image to recreate with a new size
