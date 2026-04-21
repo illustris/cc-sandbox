@@ -85,6 +85,25 @@ Override where data lives on the host with environment variables:
 CC_SANDBOX_DATA=/mnt/fast/cc-sandbox nix run .
 ```
 
+## Flags
+
+| Flag | Description |
+|---|---|
+| `--init-only` | Run all setup steps but do not start the VM |
+| `--vcpu N` | Override vCPU count (default: config.json or 16) |
+| `--mem N` | Override RAM in megabytes (default: config.json or 32768) |
+
+Flags override `config.json` for the current run without modifying the
+config file.
+
+```sh
+# Prepare runtime directory without booting
+nix run github:illustris/cc-sandbox -- --init-only
+
+# Launch with 8 cores and 16 GB RAM
+nix run github:illustris/cc-sandbox -- --vcpu 8 --mem 16384
+```
+
 ## How it works
 
 QEMU's 9p share sources must be absolute paths known at build time. The
