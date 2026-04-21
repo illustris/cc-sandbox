@@ -5,12 +5,18 @@ Usage: cc-sandbox [OPTIONS]
 Run Claude Code in an isolated QEMU microvm.
 
 Options:
-  --name NAME    Use a named instance (creates it on first run)
-  --vcpu N       Override vCPU count (default: config or 16)
-  --mem N        Override RAM in megabytes (default: config or 32768)
-  --init-only    Run all setup steps but do not start the VM
-  --list         List all instances with their ports and status
-  --help         Show this help message
+  --name NAME      Use a named instance (creates it on first run)
+  --vcpu N         Set vCPU count (default: config or 16)
+  --mem N          Set RAM in megabytes (default: config or 32768)
+  --network MODE   Network mode: full or none (default: config or full)
+  --init-only      Run all setup steps but do not start the VM
+  --list           List all instances with their ports and status
+  --help           Show this help message
+
+Network modes (config.json):
+  "full"           Unrestricted networking (default)
+  "none"           Block all outbound traffic (QEMU restrict=on)
+  {"rules":[...]}  Ordered CIDR allow/deny rules (requires sudo)
 
 Environment variables:
   CC_SANDBOX_DATA           Persistent data volume (default: ~/.local/share/cc-sandbox)
@@ -21,6 +27,7 @@ Examples:
   cc-sandbox                          Start the default instance
   cc-sandbox --name work              Start a named instance
   cc-sandbox --name work --vcpu 8     Named instance with 8 cores
+  cc-sandbox --network none           Start fully isolated
   cc-sandbox --list                   Show all instances
   cc-sandbox --init-only              Set up without booting
 EOF
@@ -30,6 +37,7 @@ EOF
 INIT_ONLY=0
 FLAG_VCPU=""
 FLAG_MEM=""
+FLAG_NETWORK=""
 INSTANCE_NAME=""
 LIST_INSTANCES=0
 while [ $# -gt 0 ]; do
@@ -37,6 +45,7 @@ while [ $# -gt 0 ]; do
 		--init-only) INIT_ONLY=1 ;;
 		--vcpu) FLAG_VCPU="$2"; shift ;;
 		--mem) FLAG_MEM="$2"; shift ;;
+		--network) FLAG_NETWORK="$2"; shift ;;
 		--name) INSTANCE_NAME="$2"; shift ;;
 		--list) LIST_INSTANCES=1 ;;
 		--help) usage ;;
@@ -57,11 +66,26 @@ if [ -n "$INSTANCE_NAME" ]; then
 	fi
 fi
 
+# -- Validate --network CLI value ---------------------------------
+if [ -n "$FLAG_NETWORK" ] && [ "$FLAG_NETWORK" != "full" ] && [ "$FLAG_NETWORK" != "none" ]; then
+	echo "Error: --network must be \"full\" or \"none\"."
+	exit 1
+fi
+
+# -- Resolve real user for sudo context ----------------------------
+if [ -n "${SUDO_USER:-}" ]; then
+	REAL_USER="$SUDO_USER"
+	REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+	REAL_USER="$(id -un)"
+	REAL_HOME="$HOME"
+fi
+
 # -- Paths ---------------------------------------------------------
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cc-sandbox"
-BASE_DATA="${CC_SANDBOX_DATA:-$HOME/.local/share/cc-sandbox}"
-REAL_CLAUDE_CONFIG="${CC_SANDBOX_CLAUDE_CONFIG:-$HOME/.claude}"
-REAL_CLAUDE_AUTH="${CC_SANDBOX_CLAUDE_AUTH:-$HOME/.claude.json}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cc-sandbox"
+BASE_DATA="${CC_SANDBOX_DATA:-$REAL_HOME/.local/share/cc-sandbox}"
+REAL_CLAUDE_CONFIG="${CC_SANDBOX_CLAUDE_CONFIG:-$REAL_HOME/.claude}"
+REAL_CLAUDE_AUTH="${CC_SANDBOX_CLAUDE_AUTH:-$REAL_HOME/.claude.json}"
 BASE_RUNTIME="@runtimeDir@"
 
 if [ -n "$INSTANCE_NAME" ]; then
@@ -76,15 +100,25 @@ fi
 
 # -- List instances ------------------------------------------------
 if [ "$LIST_INSTANCES" -eq 1 ]; then
+	net_label() {
+		local raw
+		raw=$(jq -c '.network // "full"' "$1")
+		if [ "$raw" = '"full"' ] || [ "$raw" = '"none"' ]; then
+			echo "$raw" | tr -d '"'
+		else
+			echo "rules"
+		fi
+	}
 	echo "Instances:"
 	if [ -f "$CONFIG_DIR/config.json" ]; then
 		ssh_p=$(jq -r '.sshPort // 2222' "$CONFIG_DIR/config.json")
 		http_p=$(jq -r '.httpPort // 8080' "$CONFIG_DIR/config.json")
+		net=$(net_label "$CONFIG_DIR/config.json")
 		running=""
 		if [ -f "$BASE_RUNTIME/pid" ] && kill -0 "$(cat "$BASE_RUNTIME/pid")" 2>/dev/null; then
 			running=" (running)"
 		fi
-		echo "  (default)  ssh:$ssh_p  http:$http_p$running"
+		echo "  (default)  ssh:$ssh_p  http:$http_p  net:$net$running"
 	fi
 	if [ -d "$CONFIG_DIR/instances" ]; then
 		for dir in "$CONFIG_DIR/instances"/*/; do
@@ -94,12 +128,13 @@ if [ "$LIST_INSTANCES" -eq 1 ]; then
 			if [ -f "$cfg" ]; then
 				ssh_p=$(jq -r '.sshPort // 2222' "$cfg")
 				http_p=$(jq -r '.httpPort // 8080' "$cfg")
+				net=$(net_label "$cfg")
 				running=""
 				inst_runtime="${BASE_RUNTIME}-${name}"
 				if [ -f "$inst_runtime/pid" ] && kill -0 "$(cat "$inst_runtime/pid")" 2>/dev/null; then
 					running=" (running)"
 				fi
-				echo "  $name  ssh:$ssh_p  http:$http_p$running"
+				echo "  $name  ssh:$ssh_p  http:$http_p  net:$net$running"
 			fi
 		done
 	fi
@@ -171,11 +206,13 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 
 	INIT_VCPU="${FLAG_VCPU:-16}"
 	INIT_MEM="${FLAG_MEM:-32768}"
+	INIT_NETWORK="${FLAG_NETWORK:-full}"
 
 	if [ ! -f "$CONFIG_DIR/config.json" ] && [ -z "$INSTANCE_NAME" ]; then
 		jq -n --tab \
 			--argjson vcpu "$INIT_VCPU" \
 			--argjson mem "$INIT_MEM" \
+			--arg network "$INIT_NETWORK" \
 			'{
 				vcpu: $vcpu,
 				mem: $mem,
@@ -183,7 +220,8 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 				httpPort: 8080,
 				overlaySize: "128M",
 				storeOverlaySize: "16G",
-				bindAddr: "127.0.0.1"
+				bindAddr: "127.0.0.1",
+				network: $network
 			}' > "$CONFIG_DIR/config.json"
 	fi
 
@@ -196,13 +234,15 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 				httpPort: 8080,
 				overlaySize: "128M",
 				storeOverlaySize: "16G",
-				bindAddr: "127.0.0.1"
+				bindAddr: "127.0.0.1",
+				network: "full"
 			}' > "$CONFIG_DIR/config.json"
 		fi
 		read -r next_ssh next_http <<< "$(next_available_ports)"
 		jq -n --tab \
 			--argjson vcpu "$INIT_VCPU" \
 			--argjson mem "$INIT_MEM" \
+			--arg network "$INIT_NETWORK" \
 			--argjson ssh "$next_ssh" \
 			--argjson http "$next_http" \
 			'{
@@ -212,7 +252,8 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 				httpPort: $http,
 				overlaySize: "128M",
 				storeOverlaySize: "16G",
-				bindAddr: "127.0.0.1"
+				bindAddr: "127.0.0.1",
+				network: $network
 			}' > "$INSTANCE_CONFIG_DIR/config.json"
 		echo "Instance \"$INSTANCE_NAME\" ports: SSH=$next_ssh HTTP=$next_http"
 	fi
@@ -224,6 +265,12 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		echo '{}' > "$REAL_CLAUDE_AUTH"
 		chmod 600 "$REAL_CLAUDE_AUTH"
 	fi
+fi
+
+# -- Fix file ownership after init under sudo ----------------------
+if [ -n "${SUDO_USER:-}" ]; then
+	chown -R "$REAL_USER" "$CONFIG_DIR" "$REAL_DATA" "$REAL_CLAUDE_CONFIG"
+	chown "$REAL_USER" "$REAL_CLAUDE_AUTH"
 fi
 
 # -- Validate and read runtime config -----------------------------
@@ -240,6 +287,24 @@ HTTP_PORT=$(jq -r '.httpPort // 8080' "$ACTIVE_CONFIG")
 OVERLAY_SIZE=$(jq -r '.overlaySize // "128M"' "$ACTIVE_CONFIG")
 STORE_OVERLAY_SIZE=$(jq -r '.storeOverlaySize // "16G"' "$ACTIVE_CONFIG")
 BIND_ADDR=$(jq -r '.bindAddr // "127.0.0.1"' "$ACTIVE_CONFIG")
+
+# -- Classify network mode -----------------------------------------
+if [ -n "$FLAG_NETWORK" ]; then
+	NETWORK_MODE="$FLAG_NETWORK"
+else
+	NETWORK_RAW=$(jq -c '.network // "full"' "$ACTIVE_CONFIG")
+	if [ "$NETWORK_RAW" = '"full"' ] || [ "$NETWORK_RAW" = '"none"' ]; then
+		NETWORK_MODE=$(echo "$NETWORK_RAW" | tr -d '"')
+	else
+		NETWORK_MODE="rules"
+	fi
+fi
+
+# -- Validate rules mode requires root -----------------------------
+if [ "$NETWORK_MODE" = "rules" ] && [ "$(id -u)" -ne 0 ]; then
+	echo "Error: network rules mode requires root. Run with: sudo $(basename "$0")"
+	exit 1
+fi
 
 # -- Write VM-side config into the data directory ------------------
 mkdir -p "$REAL_DATA/.config"
@@ -268,13 +333,21 @@ ln -sfn "$REAL_CLAUDE_CONFIG" "$RUNTIME/claude-config"
 ln -sfn "$REAL_CLAUDE_AUTH" "$RUNTIME/claude-auth.json"
 
 # -- Patch the microvm runner with runtime QEMU settings -----------
-sed -E \
-	-e "s/( )-smp [0-9]+/\1-smp $VCPU/" \
-	-e "s/( )-m [0-9]+/\1-m $MEM/" \
-	-e "s/hostfwd=tcp:[^-]*-:22/hostfwd=tcp:$BIND_ADDR:$SSH_PORT-:22/g" \
-	-e "s/hostfwd=tcp:[^-]*-:8080/hostfwd=tcp:$BIND_ADDR:$HTTP_PORT-:8080/g" \
-	-e "s|${BASE_RUNTIME}/|${RUNTIME}/|g" \
-	"@runner@/bin/microvm-run" > "$RUNTIME/run"
+SED_ARGS=(
+	-e "s/( )-smp [0-9]+/\1-smp $VCPU/"
+	-e "s/( )-m [0-9]+/\1-m $MEM/"
+	-e "s/hostfwd=tcp:[^-]*-:22/hostfwd=tcp:$BIND_ADDR:$SSH_PORT-:22/g"
+	-e "s/hostfwd=tcp:[^-]*-:8080/hostfwd=tcp:$BIND_ADDR:$HTTP_PORT-:8080/g"
+	-e "s|${BASE_RUNTIME}/|${RUNTIME}/|g"
+)
+if [ "$NETWORK_MODE" = "none" ]; then
+	SED_ARGS+=(-e "s/(user,id=usernet)/\1,restrict=on/")
+elif [ "$NETWORK_MODE" = "rules" ]; then
+	# Bind hostfwd to 0.0.0.0 inside the netns (socat bridges from host)
+	SED_ARGS+=(-e "s/hostfwd=tcp:[^:]*:/hostfwd=tcp:0.0.0.0:/g")
+fi
+
+sed -E "${SED_ARGS[@]}" "@runner@/bin/microvm-run" > "$RUNTIME/run"
 chmod +x "$RUNTIME/run"
 
 if [ "$INIT_ONLY" -eq 1 ]; then
@@ -282,5 +355,72 @@ if [ "$INIT_ONLY" -eq 1 ]; then
 	exit 0
 fi
 
-cd "$RUNTIME"
-exec "$RUNTIME/run"
+# -- Launch --------------------------------------------------------
+if [ "$NETWORK_MODE" = "none" ]; then
+	echo "Warning: network mode is \"none\" -- all outbound traffic is blocked."
+	echo "Claude Code requires API access via SSH tunnel or similar."
+fi
+
+if [ "$NETWORK_MODE" = "rules" ]; then
+	# -- Derive unique /30 subnet from SSH port --
+	SUBNET_ID=$((SSH_PORT - 2222))
+	NETNS_HOST_IP="172.31.$((SUBNET_ID / 64)).$((SUBNET_ID % 64 * 4 + 1))"
+	NETNS_NS_IP="172.31.$((SUBNET_ID / 64)).$((SUBNET_ID % 64 * 4 + 2))"
+	NETNS_CIDR="172.31.$((SUBNET_ID / 64)).$((SUBNET_ID % 64 * 4))/30"
+	NETNS_NAME="cc-sandbox-$$"
+	VETH_HOST="vc$$"
+	VETH_NS="vn$$"
+
+	# -- Create namespace and veth pair --
+	ip netns add "$NETNS_NAME"
+	ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+	ip link set "$VETH_NS" netns "$NETNS_NAME"
+	ip addr add "$NETNS_HOST_IP/30" dev "$VETH_HOST"
+	ip link set "$VETH_HOST" up
+	ip netns exec "$NETNS_NAME" ip addr add "$NETNS_NS_IP/30" dev "$VETH_NS"
+	ip netns exec "$NETNS_NAME" ip link set "$VETH_NS" up
+	ip netns exec "$NETNS_NAME" ip link set lo up
+	ip netns exec "$NETNS_NAME" ip route add default via "$NETNS_HOST_IP"
+
+	# -- NAT and forwarding --
+	sysctl -qw net.ipv4.ip_forward=1
+	iptables -t nat -A POSTROUTING -s "$NETNS_CIDR" -j MASQUERADE
+
+	# -- Generate and apply nftables rules inside namespace --
+	NFT_RULES="table inet sandbox {
+	    chain output {
+	        type filter hook output priority 0; policy drop;
+	        oifname \"lo\" accept
+	        ct state established,related accept
+	        meta l4proto { tcp, udp } th dport 53 accept
+$(jq -r '.network.rules[] |
+    if .allow then "        ip daddr \(.allow) accept"
+    elif .deny then "        ip daddr \(.deny) drop"
+    else empty end' "$ACTIVE_CONFIG")
+	    }
+	}"
+	ip netns exec "$NETNS_NAME" nft -f - <<< "$NFT_RULES"
+
+	# -- Cleanup handler --
+	cleanup_netns() {
+		kill "$SOCAT_SSH_PID" "$SOCAT_HTTP_PID" 2>/dev/null || true
+		ip netns del "$NETNS_NAME" 2>/dev/null || true
+		ip link del "$VETH_HOST" 2>/dev/null || true
+		iptables -t nat -D POSTROUTING -s "$NETNS_CIDR" -j MASQUERADE 2>/dev/null || true
+		rm -rf "$RUNTIME"
+	}
+	trap cleanup_netns EXIT
+
+	# -- Port forwarding: host -> namespace --
+	socat "TCP-LISTEN:$SSH_PORT,bind=$BIND_ADDR,fork,reuseaddr" "TCP:$NETNS_NS_IP:$SSH_PORT" &
+	SOCAT_SSH_PID=$!
+	socat "TCP-LISTEN:$HTTP_PORT,bind=$BIND_ADDR,fork,reuseaddr" "TCP:$NETNS_NS_IP:$HTTP_PORT" &
+	SOCAT_HTTP_PID=$!
+
+	# -- Launch QEMU inside the namespace as original user --
+	cd "$RUNTIME"
+	ip netns exec "$NETNS_NAME" sudo -u "$REAL_USER" "$RUNTIME/run"
+else
+	cd "$RUNTIME"
+	"$RUNTIME/run"
+fi
