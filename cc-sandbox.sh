@@ -43,6 +43,12 @@ LIST_INSTANCES=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--init-only) INIT_ONLY=1 ;;
+		--vcpu|--mem|--network|--name)
+			if [ $# -lt 2 ]; then
+				echo "Error: $1 requires a value."
+				exit 1
+			fi
+			;;&
 		--vcpu) FLAG_VCPU="$2"; shift ;;
 		--mem) FLAG_MEM="$2"; shift ;;
 		--network) FLAG_NETWORK="$2"; shift ;;
@@ -326,6 +332,7 @@ if [ -e "$RUNTIME" ]; then
 fi
 mkdir -p "$RUNTIME"
 echo "$$" > "$RUNTIME/pid"
+PASST_PID=""
 trap 'kill "$PASST_PID" 2>/dev/null || true; rm -rf "'"$RUNTIME"'"' EXIT
 
 ln -sfn "$REAL_DATA" "$RUNTIME/data"
@@ -427,6 +434,8 @@ $(jq -r '.network.rules[] |
 	ip netns exec "$NETNS_NAME" nft -f - <<< "$NFT_RULES"
 
 	# -- Cleanup handler --
+	SOCAT_SSH_PID=""
+	SOCAT_HTTP_PID=""
 	cleanup_netns() {
 		kill "$PASST_PID" "$SOCAT_SSH_PID" "$SOCAT_HTTP_PID" 2>/dev/null || true
 		ip netns del "$NETNS_NAME" 2>/dev/null || true
