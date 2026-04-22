@@ -252,15 +252,59 @@
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
 		in rec {
+			netfilter = pkgs.stdenv.mkDerivation {
+				pname = "cc-sandbox-netfilter";
+				version = "0.1.0";
+				src = lib.cleanSourceWith {
+					filter = name: type: !(
+						lib.hasSuffix ".nix" (toString name)
+						|| lib.hasSuffix ".lock" (toString name)
+					);
+					src = lib.cleanSource ./netfilter;
+				};
+				nativeBuildInputs = [ pkgs.zig ];
+				dontConfigure = true;
+				dontInstall = true;
+				buildPhase = ''
+					export HOME=$TMPDIR
+					zig build --prefix $out -Doptimize=ReleaseSafe \
+						--global-cache-dir $TMPDIR/.zig-global-cache
+				'';
+			};
 			cc-sandbox = pkgs.writeShellApplication {
 				name = "cc-sandbox";
-				runtimeInputs = with pkgs; [ coreutils gnused jq iproute2 nftables socat iptables passt ];
+				runtimeInputs = with pkgs; [ coreutils gnused jq passt ];
 				text = illustris-lib.replaceVarsInString {
 					runtimeDir = runtimeDir;
 					runner = "${runner}";
+					netfilter = "${netfilter}/lib/libnetfilter.so";
 				} null (builtins.readFile ./cc-sandbox.sh);
 			};
 			default = cc-sandbox;
+		});
+
+		checks = forAllSystems (system: let
+			pkgs = nixpkgs.legacyPackages.${system};
+		in {
+			netfilter-tests = pkgs.stdenv.mkDerivation {
+				pname = "cc-sandbox-netfilter-tests";
+				version = "0.1.0";
+				src = lib.cleanSourceWith {
+					filter = name: type: !(
+						lib.hasSuffix ".nix" (toString name)
+						|| lib.hasSuffix ".lock" (toString name)
+					);
+					src = lib.cleanSource ./netfilter;
+				};
+				nativeBuildInputs = [ pkgs.zig ];
+				dontConfigure = true;
+				dontInstall = true;
+				buildPhase = ''
+					export HOME=$TMPDIR
+					zig build test --global-cache-dir $TMPDIR/.zig-global-cache \
+						&& touch $out
+				'';
+			};
 		});
 
 		nixosConfigurations = lib.listToAttrs (map (system: {

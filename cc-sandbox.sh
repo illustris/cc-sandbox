@@ -1,6 +1,7 @@
 usage() {
 	cat <<'EOF'
 Usage: cc-sandbox [OPTIONS]
+       cc-sandbox rules COMMAND [--name NAME]
 
 Run Claude Code in an isolated QEMU microvm.
 
@@ -8,15 +9,21 @@ Options:
   --name NAME      Use a named instance (creates it on first run)
   --vcpu N         Set vCPU count (default: config or 16)
   --mem N          Set RAM in megabytes (default: config or 32768)
-  --network MODE   Network mode: full or none (default: config or full)
+  --network MODE   Network mode: full, none, or rules (default: config or full)
   --init-only      Run all setup steps but do not start the VM
   --list           List all instances with their ports and status
   --help           Show this help message
 
-Network modes (config.json):
+Network modes:
   "full"           Unrestricted networking (default)
   "none"           Block all outbound traffic (QEMU restrict=on)
-  {"rules":[...]}  Ordered CIDR allow/deny rules (requires sudo)
+  "rules"          Ordered CIDR allow/deny rules (LD_PRELOAD filter on passt)
+
+Rules subcommands:
+  rules list                     List current rules with indices
+  rules add allow|deny CIDR      Append a rule
+  rules del INDEX                Delete a rule by index (1-based)
+  rules set                      Replace all rules from stdin
 
 Environment variables:
   CC_SANDBOX_DATA           Persistent data volume (default: ~/.local/share/cc-sandbox)
@@ -28,6 +35,9 @@ Examples:
   cc-sandbox --name work              Start a named instance
   cc-sandbox --name work --vcpu 8     Named instance with 8 cores
   cc-sandbox --network none           Start fully isolated
+  cc-sandbox --network rules          Init with deny-all rules mode
+  cc-sandbox rules add allow 10.0.0.0/8 --name work
+  cc-sandbox rules list --name work
   cc-sandbox --list                   Show all instances
   cc-sandbox --init-only              Set up without booting
 EOF
@@ -40,6 +50,9 @@ FLAG_MEM=""
 FLAG_NETWORK=""
 INSTANCE_NAME=""
 LIST_INSTANCES=0
+RULES_CMD=""
+RULES_ACTION=""
+RULES_ARG=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--init-only) INIT_ONLY=1 ;;
@@ -55,6 +68,31 @@ while [ $# -gt 0 ]; do
 		--name) INSTANCE_NAME="$2"; shift ;;
 		--list) LIST_INSTANCES=1 ;;
 		--help) usage ;;
+		rules)
+			if [ $# -lt 2 ]; then
+				echo "Error: rules requires a subcommand (list, add, del, set)."
+				exit 1
+			fi
+			RULES_CMD="$2"; shift
+			case "$RULES_CMD" in
+				add)
+					if [ $# -lt 3 ]; then
+						echo "Error: rules add requires ACTION CIDR (e.g., rules add allow 10.0.0.0/8)."
+						exit 1
+					fi
+					RULES_ACTION="$2"; RULES_ARG="$3"; shift 2
+					;;
+				del)
+					if [ $# -lt 2 ]; then
+						echo "Error: rules del requires INDEX."
+						exit 1
+					fi
+					RULES_ARG="$2"; shift
+					;;
+				list|set) ;;
+				*) echo "Error: unknown rules subcommand \"$RULES_CMD\"."; exit 1 ;;
+			esac
+			;;
 	esac
 	shift
 done
@@ -73,8 +111,8 @@ if [ -n "$INSTANCE_NAME" ]; then
 fi
 
 # -- Validate --network CLI value ---------------------------------
-if [ -n "$FLAG_NETWORK" ] && [ "$FLAG_NETWORK" != "full" ] && [ "$FLAG_NETWORK" != "none" ]; then
-	echo "Error: --network must be \"full\" or \"none\"."
+if [ -n "$FLAG_NETWORK" ] && [ "$FLAG_NETWORK" != "full" ] && [ "$FLAG_NETWORK" != "none" ] && [ "$FLAG_NETWORK" != "rules" ]; then
+	echo "Error: --network must be \"full\", \"none\", or \"rules\"."
 	exit 1
 fi
 
@@ -147,6 +185,81 @@ if [ "$LIST_INSTANCES" -eq 1 ]; then
 	exit 0
 fi
 
+# -- Rules subcommand ----------------------------------------------
+if [ -n "$RULES_CMD" ]; then
+	ACTIVE_CONFIG="$INSTANCE_CONFIG_DIR/config.json"
+	if [ ! -f "$ACTIVE_CONFIG" ]; then
+		echo "Error: no config found at $ACTIVE_CONFIG"
+		exit 1
+	fi
+
+	# Verify it's in rules mode
+	NETWORK_RAW=$(jq -c '.network // "full"' "$ACTIVE_CONFIG")
+	if [ "$NETWORK_RAW" = '"full"' ] || [ "$NETWORK_RAW" = '"none"' ]; then
+		echo "Error: instance is not in rules mode (network is $(echo "$NETWORK_RAW" | tr -d '"'))."
+		echo "Set network to rules mode first: edit $ACTIVE_CONFIG or reinit with --network rules."
+		exit 1
+	fi
+
+	case "$RULES_CMD" in
+		list)
+			jq -r '.network.rules | to_entries[] | "\(.key + 1): \(if .value.allow then "allow \(.value.allow)" elif .value.deny then "deny \(.value.deny)" else "unknown" end)"' "$ACTIVE_CONFIG"
+			;;
+		add)
+			if [ "$RULES_ACTION" != "allow" ] && [ "$RULES_ACTION" != "deny" ]; then
+				echo "Error: action must be \"allow\" or \"deny\"."
+				exit 1
+			fi
+			jq --tab --arg action "$RULES_ACTION" --arg cidr "$RULES_ARG" \
+				'.network.rules += [{($action): $cidr}]' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
+				&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
+			echo "Added: $RULES_ACTION $RULES_ARG"
+			;;
+		del)
+			idx=$((RULES_ARG - 1))
+			if [ "$idx" -lt 0 ]; then
+				echo "Error: index must be >= 1."
+				exit 1
+			fi
+			jq --tab --argjson idx "$idx" \
+				'.network.rules |= (.[0:$idx] + .[$idx+1:])' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
+				&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
+			echo "Deleted rule $RULES_ARG."
+			;;
+		set)
+			# Read rules from stdin, convert to JSON array
+			RULES_JSON="[]"
+			while IFS= read -r line; do
+				trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+				[ -z "$trimmed" ] && continue
+				[[ "$trimmed" == \#* ]] && continue
+				action=$(echo "$trimmed" | cut -d' ' -f1)
+				cidr=$(echo "$trimmed" | cut -d' ' -f2)
+				if [ "$action" != "allow" ] && [ "$action" != "deny" ]; then
+					echo "Error: invalid action \"$action\" in line: $trimmed"
+					exit 1
+				fi
+				RULES_JSON=$(echo "$RULES_JSON" | jq --arg a "$action" --arg c "$cidr" '. + [{($a): $c}]')
+			done
+			jq --tab --argjson rules "$RULES_JSON" '.network.rules = $rules' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
+				&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
+			echo "Rules replaced."
+			;;
+	esac
+
+	# Signal running passt to reload rules
+	if [ -f "$RUNTIME/passt.pid" ] && kill -0 "$(cat "$RUNTIME/passt.pid")" 2>/dev/null; then
+		# Regenerate the runtime rules file
+		jq -r '.network.rules[] |
+			if .allow then "allow \(.allow)"
+			elif .deny then "deny \(.deny)"
+			else empty end' "$ACTIVE_CONFIG" > "$RUNTIME/netfilter-rules"
+		kill -USR1 "$(cat "$RUNTIME/passt.pid")"
+		echo "Rules reloaded (signaled running instance)."
+	fi
+	exit 0
+fi
+
 # -- Auto-port assignment -----------------------------------------
 next_available_ports() {
 	local max_ssh=2222
@@ -214,11 +327,18 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 	INIT_MEM="${FLAG_MEM:-32768}"
 	INIT_NETWORK="${FLAG_NETWORK:-full}"
 
+	# Build network value for config: "full"/"none" as string, rules as object
+	if [ "$INIT_NETWORK" = "rules" ]; then
+		NETWORK_JQ='{"rules":[]}'
+	else
+		NETWORK_JQ="\"$INIT_NETWORK\""
+	fi
+
 	if [ ! -f "$CONFIG_DIR/config.json" ] && [ -z "$INSTANCE_NAME" ]; then
 		jq -n --tab \
 			--argjson vcpu "$INIT_VCPU" \
 			--argjson mem "$INIT_MEM" \
-			--arg network "$INIT_NETWORK" \
+			--argjson network "$NETWORK_JQ" \
 			'{
 				vcpu: $vcpu,
 				mem: $mem,
@@ -248,7 +368,7 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		jq -n --tab \
 			--argjson vcpu "$INIT_VCPU" \
 			--argjson mem "$INIT_MEM" \
-			--arg network "$INIT_NETWORK" \
+			--argjson network "$NETWORK_JQ" \
 			--argjson ssh "$next_ssh" \
 			--argjson http "$next_http" \
 			'{
@@ -306,12 +426,6 @@ else
 	fi
 fi
 
-# -- Validate rules mode requires root -----------------------------
-if [ "$NETWORK_MODE" = "rules" ] && [ "$(id -u)" -ne 0 ]; then
-	echo "Error: network rules mode requires root. Run with: sudo $(basename "$0")"
-	exit 1
-fi
-
 # -- Write VM-side config into the data directory ------------------
 mkdir -p "$REAL_DATA/.config"
 echo "$OVERLAY_SIZE" > "$REAL_DATA/.config/overlay-size"
@@ -339,14 +453,12 @@ ln -sfn "$REAL_DATA" "$RUNTIME/data"
 ln -sfn "$REAL_CLAUDE_CONFIG" "$RUNTIME/claude-config"
 ln -sfn "$REAL_CLAUDE_AUTH" "$RUNTIME/claude-auth.json"
 
-# -- Resolve host DNS for passt in rules mode ----------------------
-HOST_DNS=""
+# -- Generate rules file for LD_PRELOAD filter ---------------------
 if [ "$NETWORK_MODE" = "rules" ]; then
-	HOST_DNS=$(awk '/^nameserver/ { print $2; exit }' /etc/resolv.conf)
-	if [ "${HOST_DNS:-}" = "127.0.0.53" ] || [ "${HOST_DNS:-}" = "127.0.0.1" ]; then
-		HOST_DNS=$(resolvectl dns 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
-	fi
-	HOST_DNS="${HOST_DNS:-1.1.1.1}"
+	jq -r '.network.rules[] |
+		if .allow then "allow \(.allow)"
+		elif .deny then "deny \(.deny)"
+		else empty end' "$ACTIVE_CONFIG" > "$RUNTIME/netfilter-rules"
 fi
 
 # -- Patch the microvm runner with runtime QEMU settings -----------
@@ -394,81 +506,22 @@ wait_for_passt() {
 }
 
 if [ "$NETWORK_MODE" = "rules" ]; then
-	# -- Derive unique /30 subnet from SSH port --
-	SUBNET_ID=$((SSH_PORT - 2222))
-	NETNS_HOST_IP="172.31.$((SUBNET_ID / 64)).$((SUBNET_ID % 64 * 4 + 1))"
-	NETNS_NS_IP="172.31.$((SUBNET_ID / 64)).$((SUBNET_ID % 64 * 4 + 2))"
-	NETNS_CIDR="172.31.$((SUBNET_ID / 64)).$((SUBNET_ID % 64 * 4))/30"
-	NETNS_NAME="cc-sandbox-$$"
-	VETH_HOST="vc$$"
-	VETH_NS="vn$$"
-
-	# -- Create namespace and veth pair --
-	ip netns add "$NETNS_NAME"
-	ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
-	ip link set "$VETH_NS" netns "$NETNS_NAME"
-	ip addr add "$NETNS_HOST_IP/30" dev "$VETH_HOST"
-	ip link set "$VETH_HOST" up
-	ip netns exec "$NETNS_NAME" ip addr add "$NETNS_NS_IP/30" dev "$VETH_NS"
-	ip netns exec "$NETNS_NAME" ip link set "$VETH_NS" up
-	ip netns exec "$NETNS_NAME" ip link set lo up
-	ip netns exec "$NETNS_NAME" ip route add default via "$NETNS_HOST_IP"
-
-	# -- NAT and forwarding --
-	sysctl -qw net.ipv4.ip_forward=1
-	iptables -t nat -A POSTROUTING -s "$NETNS_CIDR" -j MASQUERADE
-
-	# -- Generate and apply nftables rules inside namespace --
-	NFT_RULES="table inet sandbox {
-	    chain output {
-	        type filter hook output priority 0; policy drop;
-	        oifname \"lo\" accept
-	        ct state established,related accept
-	        meta l4proto { tcp, udp } th dport 53 accept
-$(jq -r '.network.rules[] |
-    if .allow then "        ip daddr \(.allow) accept"
-    elif .deny then "        ip daddr \(.deny) drop"
-    else empty end' "$ACTIVE_CONFIG")
-	    }
-	}"
-	ip netns exec "$NETNS_NAME" nft -f - <<< "$NFT_RULES"
-
-	# -- Cleanup handler --
-	SOCAT_SSH_PID=""
-	SOCAT_HTTP_PID=""
-	cleanup_netns() {
-		kill "$PASST_PID" "$SOCAT_SSH_PID" "$SOCAT_HTTP_PID" 2>/dev/null || true
-		ip netns del "$NETNS_NAME" 2>/dev/null || true
-		ip link del "$VETH_HOST" 2>/dev/null || true
-		iptables -t nat -D POSTROUTING -s "$NETNS_CIDR" -j MASQUERADE 2>/dev/null || true
-		rm -rf "$RUNTIME"
-	}
-	trap cleanup_netns EXIT
-
-	# -- Port forwarding: host -> namespace --
-	socat "TCP-LISTEN:$SSH_PORT,bind=$BIND_ADDR,fork,reuseaddr" "TCP:$NETNS_NS_IP:$SSH_PORT" &
-	SOCAT_SSH_PID=$!
-	socat "TCP-LISTEN:$HTTP_PORT,bind=$BIND_ADDR,fork,reuseaddr" "TCP:$NETNS_NS_IP:$HTTP_PORT" &
-	SOCAT_HTTP_PID=$!
-
-	# -- Start passt inside the namespace --
-	chown "$REAL_USER" "$RUNTIME"
-	ip netns exec "$NETNS_NAME" sysctl -qw net.ipv4.ping_group_range="0 2147483647"
-	ip netns exec "$NETNS_NAME" sudo -u "$REAL_USER" \
-		passt --foreground \
-		--socket "$PASST_SOCK" -t "$SSH_PORT:22" -t "$HTTP_PORT:8080" \
-		-D "$HOST_DNS" &
-	PASST_PID=$!
-	wait_for_passt
-
-	# -- Launch QEMU inside the namespace as original user --
-	cd "$RUNTIME"
-	ip netns exec "$NETNS_NAME" sudo -u "$REAL_USER" "$RUNTIME/run"
-elif [ "$NETWORK_MODE" != "none" ]; then
-	# -- Full mode: start passt on host, then QEMU --
+	# Rules mode: passt with LD_PRELOAD netfilter
+	NETFILTER_RULES="$RUNTIME/netfilter-rules" \
+	LD_PRELOAD="@netfilter@" \
 	passt --foreground --socket "$PASST_SOCK" \
 		-t "$SSH_PORT:22" -t "$HTTP_PORT:8080" &
 	PASST_PID=$!
+	echo "$PASST_PID" > "$RUNTIME/passt.pid"
+	wait_for_passt
+	cd "$RUNTIME"
+	"$RUNTIME/run"
+elif [ "$NETWORK_MODE" != "none" ]; then
+	# Full mode: unrestricted passt
+	passt --foreground --socket "$PASST_SOCK" \
+		-t "$SSH_PORT:22" -t "$HTTP_PORT:8080" &
+	PASST_PID=$!
+	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
 	cd "$RUNTIME"
 	"$RUNTIME/run"
