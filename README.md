@@ -84,17 +84,20 @@ nix run github:illustris/cc-sandbox -- --network none
 
 ## Network modes
 
-By default the VM has unrestricted network access through QEMU's user-mode
-(SLIRP) networking. Three modes are available:
+Three modes are available. `full` and `rules` use
+[passt](https://passt.top/) for networking, which supports all IP protocols
+including ICMP. `none` uses QEMU's built-in SLIRP with `restrict=on`.
 
 ### full (default)
 
-Unrestricted networking. No extra privileges needed.
+Unrestricted networking via passt. All IP protocols (TCP, UDP, ICMP, etc.)
+work. No extra privileges needed.
 
 ### none
 
-QEMU's `restrict=on` blocks all outbound traffic from the guest. SSH and
-HTTP port forwards from the host still work. No extra privileges needed.
+QEMU's SLIRP `restrict=on` blocks all outbound traffic from the guest.
+SSH and HTTP port forwards from the host still work. No extra privileges
+needed.
 
 Note: Claude Code requires access to the Anthropic API. In `none` mode,
 Claude Code will not function unless API access is provided through another
@@ -104,6 +107,7 @@ channel (e.g., SSH port forwarding).
 
 Ordered CIDR allow/deny rules enforced via nftables inside a Linux network
 namespace. First match wins; default policy is deny. Requires `sudo`.
+All IP protocols (TCP, UDP, ICMP) are subject to the rules.
 
 ```json
 {

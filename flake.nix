@@ -254,7 +254,7 @@
 		in rec {
 			cc-sandbox = pkgs.writeShellApplication {
 				name = "cc-sandbox";
-				runtimeInputs = with pkgs; [ coreutils gnused jq iproute2 nftables socat iptables ];
+				runtimeInputs = with pkgs; [ coreutils gnused jq iproute2 nftables socat iptables passt ];
 				text = illustris-lib.replaceVarsInString {
 					runtimeDir = runtimeDir;
 					runner = "${runner}";

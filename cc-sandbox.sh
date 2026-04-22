@@ -326,25 +326,39 @@ if [ -e "$RUNTIME" ]; then
 fi
 mkdir -p "$RUNTIME"
 echo "$$" > "$RUNTIME/pid"
-trap 'rm -rf "'"$RUNTIME"'"' EXIT
+trap 'kill "$PASST_PID" 2>/dev/null || true; rm -rf "'"$RUNTIME"'"' EXIT
 
 ln -sfn "$REAL_DATA" "$RUNTIME/data"
 ln -sfn "$REAL_CLAUDE_CONFIG" "$RUNTIME/claude-config"
 ln -sfn "$REAL_CLAUDE_AUTH" "$RUNTIME/claude-auth.json"
 
+# -- Resolve host DNS for passt in rules mode ----------------------
+HOST_DNS=""
+if [ "$NETWORK_MODE" = "rules" ]; then
+	HOST_DNS=$(awk '/^nameserver/ { print $2; exit }' /etc/resolv.conf)
+	if [ "${HOST_DNS:-}" = "127.0.0.53" ] || [ "${HOST_DNS:-}" = "127.0.0.1" ]; then
+		HOST_DNS=$(resolvectl dns 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
+	fi
+	HOST_DNS="${HOST_DNS:-1.1.1.1}"
+fi
+
 # -- Patch the microvm runner with runtime QEMU settings -----------
+PASST_SOCK="$RUNTIME/passt.sock"
 SED_ARGS=(
 	-e "s/( )-smp [0-9]+/\1-smp $VCPU/"
 	-e "s/( )-m [0-9]+/\1-m $MEM/"
-	-e "s/hostfwd=tcp:[^-]*-:22/hostfwd=tcp:$BIND_ADDR:$SSH_PORT-:22/g"
-	-e "s/hostfwd=tcp:[^-]*-:8080/hostfwd=tcp:$BIND_ADDR:$HTTP_PORT-:8080/g"
 	-e "s|${BASE_RUNTIME}/|${RUNTIME}/|g"
 )
 if [ "$NETWORK_MODE" = "none" ]; then
-	SED_ARGS+=(-e "s/(user,id=usernet)/\1,restrict=on/")
-elif [ "$NETWORK_MODE" = "rules" ]; then
-	# Bind hostfwd to 0.0.0.0 inside the netns (socat bridges from host)
-	SED_ARGS+=(-e "s/hostfwd=tcp:[^:]*:/hostfwd=tcp:0.0.0.0:/g")
+	# SLIRP with restrict=on -- blocks all outbound, keeps port forwards
+	SED_ARGS+=(
+		-e "s/hostfwd=tcp:[^-]*-:22/hostfwd=tcp:$BIND_ADDR:$SSH_PORT-:22/g"
+		-e "s/hostfwd=tcp:[^-]*-:8080/hostfwd=tcp:$BIND_ADDR:$HTTP_PORT-:8080/g"
+		-e "s/(user,id=usernet)/\1,restrict=on/"
+	)
+else
+	# full and rules: connect to passt via unix socket (launched separately)
+	SED_ARGS+=(-e "s|-netdev '[^']*'|-netdev 'stream,id=usernet,server=off,addr.type=unix,addr.path=${PASST_SOCK}'|")
 fi
 
 sed -E "${SED_ARGS[@]}" "@runner@/bin/microvm-run" > "$RUNTIME/run"
@@ -360,6 +374,17 @@ if [ "$NETWORK_MODE" = "none" ]; then
 	echo "Warning: network mode is \"none\" -- all outbound traffic is blocked."
 	echo "Claude Code requires API access via SSH tunnel or similar."
 fi
+
+# -- Helper: wait for passt socket ---------------------------------
+wait_for_passt() {
+	while [ ! -S "$PASST_SOCK" ] && kill -0 "$PASST_PID" 2>/dev/null; do
+		sleep 0.1
+	done
+	if [ ! -S "$PASST_SOCK" ]; then
+		echo "Error: passt failed to start."
+		exit 1
+	fi
+}
 
 if [ "$NETWORK_MODE" = "rules" ]; then
 	# -- Derive unique /30 subnet from SSH port --
@@ -403,7 +428,7 @@ $(jq -r '.network.rules[] |
 
 	# -- Cleanup handler --
 	cleanup_netns() {
-		kill "$SOCAT_SSH_PID" "$SOCAT_HTTP_PID" 2>/dev/null || true
+		kill "$PASST_PID" "$SOCAT_SSH_PID" "$SOCAT_HTTP_PID" 2>/dev/null || true
 		ip netns del "$NETNS_NAME" 2>/dev/null || true
 		ip link del "$VETH_HOST" 2>/dev/null || true
 		iptables -t nat -D POSTROUTING -s "$NETNS_CIDR" -j MASQUERADE 2>/dev/null || true
@@ -417,9 +442,27 @@ $(jq -r '.network.rules[] |
 	socat "TCP-LISTEN:$HTTP_PORT,bind=$BIND_ADDR,fork,reuseaddr" "TCP:$NETNS_NS_IP:$HTTP_PORT" &
 	SOCAT_HTTP_PID=$!
 
+	# -- Start passt inside the namespace --
+	chown "$REAL_USER" "$RUNTIME"
+	ip netns exec "$NETNS_NAME" sysctl -qw net.ipv4.ping_group_range="0 2147483647"
+	ip netns exec "$NETNS_NAME" sudo -u "$REAL_USER" \
+		passt --foreground \
+		--socket "$PASST_SOCK" -t "$SSH_PORT:22" -t "$HTTP_PORT:8080" \
+		-D "$HOST_DNS" &
+	PASST_PID=$!
+	wait_for_passt
+
 	# -- Launch QEMU inside the namespace as original user --
 	cd "$RUNTIME"
 	ip netns exec "$NETNS_NAME" sudo -u "$REAL_USER" "$RUNTIME/run"
+elif [ "$NETWORK_MODE" != "none" ]; then
+	# -- Full mode: start passt on host, then QEMU --
+	passt --foreground --socket "$PASST_SOCK" \
+		-t "$SSH_PORT:22" -t "$HTTP_PORT:8080" &
+	PASST_PID=$!
+	wait_for_passt
+	cd "$RUNTIME"
+	"$RUNTIME/run"
 else
 	cd "$RUNTIME"
 	"$RUNTIME/run"
