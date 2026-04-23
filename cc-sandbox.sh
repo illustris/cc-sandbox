@@ -247,8 +247,8 @@ if [ -n "$RULES_CMD" ]; then
 			;;
 	esac
 
-	# Signal running passt to reload rules
-	if [ -f "$RUNTIME/passt.pid" ] && kill -0 "$(cat "$RUNTIME/passt.pid")" 2>/dev/null; then
+	# Signal running passt to reload rules (only for mutating commands)
+	if [ "$RULES_CMD" != "list" ] && [ -f "$RUNTIME/passt.pid" ] && kill -0 "$(cat "$RUNTIME/passt.pid")" 2>/dev/null; then
 		# Regenerate the runtime rules file
 		jq -r '.network.rules[] |
 			if .allow then "allow \(.allow)"
