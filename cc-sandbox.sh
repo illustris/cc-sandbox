@@ -478,6 +478,7 @@ PASST_SOCK="$RUNTIME/passt.sock"
 SED_ARGS=(
 	-e "s/( )-smp [0-9]+/\1-smp $VCPU/"
 	-e "s/( )-m [0-9]+/\1-m $MEM/"
+	-e "s/(memory-backend-memfd,id=mem,size=)[0-9]+(M)/\1${MEM}\2/"
 	-e "s|${BASE_RUNTIME}/|${RUNTIME}/|g"
 )
 if [ "$NETWORK_MODE" = "none" ]; then
