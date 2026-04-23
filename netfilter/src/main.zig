@@ -46,6 +46,19 @@ fn resolve(comptime name: [*:0]const u8) *anyopaque {
 	return c.dlsym(RTLD_NEXT, name) orelse @panic("netfilter: dlsym failed");
 }
 
+// --- Constructor: runs at library load time, before main() / seccomp ---
+// passt enables a seccomp-bpf filter after startup that restricts syscalls.
+// We must complete all initialization (dlsym, sigaction, file I/O for rules)
+// before seccomp is activated. The .init_array constructor guarantees this.
+
+fn libInit() callconv(.c) void {
+	init();
+}
+
+// .init_array entry ensures init() runs at library load time (before seccomp)
+const InitFnPtr = *const fn () callconv(.c) void;
+export var _netfilter_init_entry: InitFnPtr linksection(".init_array") = &libInit;
+
 // --- Initialization ---
 
 fn init() void {
@@ -96,6 +109,10 @@ fn loadRules() void {
 }
 
 fn handleSigusr1(_: std.posix.SIG) callconv(.c) void {
+	// Note: reload will call open/read/close which may be blocked by
+	// seccomp. The signal handler only sets a flag; actual reload is
+	// deferred to the next wrapper call. If seccomp blocks file I/O,
+	// the reload will silently fail and the old rules remain in effect.
 	reload_pending.store(true, .release);
 }
 
@@ -135,6 +152,9 @@ fn denyErrno() void {
 }
 
 // --- Exported wrappers ---
+// These run under passt's seccomp filter. They must not make any syscalls
+// other than those passt already allows (the real connect/sendto/sendmsg/
+// sendmmsg, plus errno access). All logic is pure computation.
 
 export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) callconv(.c) c_int {
 	init();

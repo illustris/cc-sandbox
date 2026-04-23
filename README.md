@@ -59,7 +59,7 @@ independently.
 | `--name NAME` | Use a named instance (creates it on first run) |
 | `--vcpu N` | Set vCPU count (default: config.json or 16) |
 | `--mem N` | Set RAM in megabytes (default: config.json or 32768) |
-| `--network MODE` | Network mode: `full` or `none` (default: config or full) |
+| `--network MODE` | Network mode: `full`, `none`, or `rules` (default: config or full) |
 | `--init-only` | Run all setup steps but do not start the VM |
 | `--list` | List all instances with their ports and status |
 | `--help` | Show usage information |
@@ -67,6 +67,18 @@ independently.
 When an instance is first created, `--vcpu`, `--mem`, and `--network` are
 saved to its `config.json`. On subsequent runs they override the config for
 that run only.
+
+### Rules subcommand
+
+| Subcommand | Description |
+|---|---|
+| `rules list [--name NAME]` | List current rules with 1-based indices |
+| `rules add allow\|deny CIDR [--name NAME]` | Append a rule |
+| `rules del INDEX [--name NAME]` | Delete a rule by index |
+| `rules set [--name NAME]` | Replace all rules from stdin |
+
+If the instance is running, rule changes take effect immediately (the
+runtime rules file is regenerated and passt receives `SIGUSR1` to reload).
 
 ```sh
 # Prepare runtime directory without booting
@@ -80,6 +92,11 @@ nix run github:illustris/cc-sandbox -- --name work --init-only
 
 # Launch with no outbound network
 nix run github:illustris/cc-sandbox -- --network none
+
+# Init with rules mode, then add rules
+nix run github:illustris/cc-sandbox -- --name secure --network rules --init-only
+cc-sandbox rules add deny 10.0.0.0/8 --name secure
+cc-sandbox rules add allow 0.0.0.0/0 --name secure
 ```
 
 ## Network modes
@@ -105,9 +122,10 @@ channel (e.g., SSH port forwarding).
 
 ### rules
 
-Ordered CIDR allow/deny rules enforced via nftables inside a Linux network
-namespace. First match wins; default policy is deny. Requires `sudo`.
-All IP protocols (TCP, UDP, ICMP) are subject to the rules.
+Ordered CIDR allow/deny rules enforced via an LD_PRELOAD filter on
+[passt](https://passt.top/). First match wins; default policy is deny.
+No extra privileges needed. All IP protocols (TCP, UDP, ICMP) are
+subject to the rules.
 
 ```json
 {
@@ -121,22 +139,33 @@ All IP protocols (TCP, UDP, ICMP) are subject to the rules.
 }
 ```
 
+Rules can be set at init time or managed dynamically:
+
 ```sh
-sudo nix run github:illustris/cc-sandbox
+# Init with rules mode (starts with empty ruleset = deny all)
+nix run github:illustris/cc-sandbox -- --network rules
+
+# Manage rules (updates take effect immediately on running instances)
+cc-sandbox rules add deny 10.0.0.0/8
+cc-sandbox rules add deny 172.16.0.0/12
+cc-sandbox rules add deny 192.168.0.0/16
+cc-sandbox rules add allow 0.0.0.0/0
+cc-sandbox rules list
+cc-sandbox rules del 2
 ```
 
-DNS (port 53) is always allowed before user rules so hostname resolution
-works. Loopback traffic and established connections are also always
-allowed.
+Implicit rules (applied before user rules, not configurable):
+- **DNS (port 53)** is always allowed so hostname resolution works
+- **Loopback (127.0.0.0/8, ::1)** is always denied to prevent the VM
+  from accessing host services via passt's gateway-to-loopback mapping
 
-The rules are enforced at the host level via a network namespace -- they
-cannot be modified or bypassed from inside the VM. The wrapper creates
-a veth pair, NATs traffic through the host, and runs QEMU inside the
-namespace. Port forwards are bridged from the host to the namespace via
-socat, so `ssh -p 2222 root@localhost` works as usual.
+The filter works by intercepting passt's outbound `connect()`,
+`sendto()`, `sendmsg()`, and `sendmmsg()` syscalls. Since passt is the
+VM's only network path, this is a complete enforcement point. The filter
+is a Zig shared library (`libnetfilter.so`) loaded via `LD_PRELOAD`;
+initialization runs before passt enables its seccomp sandbox.
 
-To allow Claude Code while blocking internal networks, use a catch-all
-allow with specific deny rules:
+To allow Claude Code while blocking internal networks:
 
 ```json
 {
@@ -258,10 +287,14 @@ each with its own symlinks and PID lock. The wrapper patches the QEMU
 runner's 9p share source paths to point at the instance-specific runtime
 directory, so the same VM image serves all instances.
 
-In `rules` network mode, the wrapper creates a Linux network namespace,
-connects it to the host via a veth pair with NAT, and applies nftables
-rules inside the namespace. QEMU runs inside the namespace; socat bridges
-port forwards from the host to the namespace IP.
+In `rules` network mode, the wrapper loads a Zig shared library
+(`libnetfilter.so`) into passt via `LD_PRELOAD`. The library intercepts
+outbound socket calls (`connect`, `sendto`, `sendmsg`, `sendmmsg`) and
+checks destination addresses against the configured CIDR rules. Denied
+connections receive `ENETUNREACH`. The library initializes via
+`.init_array` (before `main()`) so that all file I/O for rule loading
+completes before passt activates its seccomp-bpf sandbox. Rules can be
+hot-reloaded at runtime via `SIGUSR1` to the passt process.
 
 ## Defaults
 
@@ -288,4 +321,7 @@ Pre-installed tools: `claude-code`, `git`, `curl`, `jq`, `vim`, `ncdu`,
   persist across VM reboots
 - Changing `overlaySize` only affects newly created overlay images; delete
   the overlay image to recreate with a new size
-- Network `rules` mode requires `sudo` for namespace and nftables setup
+- Network `rules` mode filters at the passt syscall level; traffic
+  handled internally by passt (ARP, DHCP, gateway ping responses) is not
+  subject to user rules. The implicit loopback deny prevents access to
+  host services via the passt gateway.

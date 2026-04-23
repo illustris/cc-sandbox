@@ -24,19 +24,22 @@ pub const RuleSet = struct {
 
 	/// Evaluate a destination address and port against the ruleset.
 	pub fn evaluate(self: *const RuleSet, addr: IpAddr, port: u16) Action {
-		// Implicit: allow loopback
+		// Implicit: allow DNS (port 53) -- checked first so DNS to
+		// loopback resolvers (e.g. 127.0.0.53 systemd-resolved) works.
+		if (port == 53) return .allow;
+
+		// Implicit: deny loopback -- passt maps its gateway and the
+		// host's IP to 127.0.0.1, so allowing loopback would expose
+		// all host services to the sandbox.
 		switch (addr) {
 			.ipv4 => |ip| {
-				if (ip[0] == 127) return .allow;
+				if (ip[0] == 127) return .deny;
 			},
 			.ipv6 => |ip| {
-				if (std.mem.eql(u8, &ip, &ipv6_loopback)) return .allow;
-				if (isIpv4Mapped(ip) and ip[12] == 127) return .allow;
+				if (std.mem.eql(u8, &ip, &ipv6_loopback)) return .deny;
+				if (isIpv4Mapped(ip) and ip[12] == 127) return .deny;
 			},
 		}
-
-		// Implicit: allow DNS (port 53)
-		if (port == 53) return .allow;
 
 		// Normalize IPv4-mapped IPv6 to IPv4 for rule matching
 		const check_addr: IpAddr = switch (addr) {
@@ -261,10 +264,16 @@ test "isIpv4Mapped" {
 	try std.testing.expect(!isIpv4Mapped(not_mapped));
 }
 
-test "RuleSet evaluate loopback" {
+test "RuleSet evaluate loopback denied" {
 	const rs = RuleSet{};
-	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv4 = .{ 127, 0, 0, 1 } }, 80));
-	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv6 = ipv6_loopback }, 80));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.{ .ipv4 = .{ 127, 0, 0, 1 } }, 80));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.{ .ipv6 = ipv6_loopback }, 80));
+}
+
+test "RuleSet evaluate loopback DNS allowed" {
+	const rs = RuleSet{};
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv6 = ipv6_loopback }, 53));
 }
 
 test "RuleSet evaluate DNS" {
