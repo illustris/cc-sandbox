@@ -271,9 +271,14 @@
 						--global-cache-dir $TMPDIR/.zig-global-cache
 				'';
 			};
+			passt-cc = pkgs.passt.overrideAttrs (old: {
+				# Allow rt_sigreturn so LD_PRELOAD signal handlers work
+				# under passt's seccomp filter (needed for SIGUSR1 rule reload)
+				makeFlags = (old.makeFlags or []) ++ [ "EXTRA_SYSCALLS=rt_sigreturn" ];
+			});
 			cc-sandbox = pkgs.writeShellApplication {
 				name = "cc-sandbox";
-				runtimeInputs = with pkgs; [ coreutils gnused jq passt ];
+				runtimeInputs = with pkgs; [ coreutils gnused jq ] ++ [ passt-cc ];
 				text = illustris-lib.replaceVarsInString {
 					runtimeDir = runtimeDir;
 					runner = "${runner}";

@@ -20,10 +20,10 @@ Network modes:
   "rules"          Ordered CIDR allow/deny rules (LD_PRELOAD filter on passt)
 
 Rules subcommands:
-  rules list                     List current rules with indices
-  rules add allow|deny CIDR      Append a rule
-  rules del INDEX                Delete a rule by index (1-based)
-  rules set                      Replace all rules from stdin
+  rules list                          List current rules with indices
+  rules add allow|deny CIDR [--at N]  Add a rule (append, or insert at position N)
+  rules del INDEX                     Delete a rule by index (1-based)
+  rules set                           Replace all rules from stdin
 
 Environment variables:
   CC_SANDBOX_DATA           Persistent data volume (default: ~/.local/share/cc-sandbox)
@@ -80,18 +80,23 @@ while [ $# -gt 0 ]; do
 						echo "Error: rules add requires ACTION CIDR (e.g., rules add allow 10.0.0.0/8)."
 						exit 1
 					fi
-					RULES_ACTION="$2"; RULES_ARG="$3"; shift 2
+					RULES_ACTION="$2"; RULES_ARG="$3"; shift 3
+					RULES_POS=""
+					if [ $# -ge 2 ] && [ "$1" = "--at" ]; then
+						RULES_POS="$2"; shift 2
+					fi
 					;;
 				del)
 					if [ $# -lt 2 ]; then
 						echo "Error: rules del requires INDEX."
 						exit 1
 					fi
-					RULES_ARG="$2"; shift
+					RULES_ARG="$2"; shift 2
 					;;
-				list|set) ;;
+				list|set) shift ;;
 				*) echo "Error: unknown rules subcommand \"$RULES_CMD\"."; exit 1 ;;
 			esac
+			continue
 			;;
 	esac
 	shift
@@ -210,10 +215,18 @@ if [ -n "$RULES_CMD" ]; then
 				echo "Error: action must be \"allow\" or \"deny\"."
 				exit 1
 			fi
-			jq --tab --arg action "$RULES_ACTION" --arg cidr "$RULES_ARG" \
-				'.network.rules += [{($action): $cidr}]' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
-				&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
-			echo "Added: $RULES_ACTION $RULES_ARG"
+			if [ -n "$RULES_POS" ]; then
+				idx=$((RULES_POS - 1))
+				jq --tab --arg action "$RULES_ACTION" --arg cidr "$RULES_ARG" --argjson idx "$idx" \
+					'.network.rules |= (.[0:$idx] + [{($action): $cidr}] + .[$idx:])' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
+					&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
+				echo "Added: $RULES_ACTION $RULES_ARG at position $RULES_POS"
+			else
+				jq --tab --arg action "$RULES_ACTION" --arg cidr "$RULES_ARG" \
+					'.network.rules += [{($action): $cidr}]' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
+					&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
+				echo "Added: $RULES_ACTION $RULES_ARG"
+			fi
 			;;
 		del)
 			idx=$((RULES_ARG - 1))
@@ -247,15 +260,14 @@ if [ -n "$RULES_CMD" ]; then
 			;;
 	esac
 
-	# Signal running passt to reload rules (only for mutating commands)
+	# Regenerate runtime rules file and signal passt to reload
 	if [ "$RULES_CMD" != "list" ] && [ -f "$RUNTIME/passt.pid" ] && kill -0 "$(cat "$RUNTIME/passt.pid")" 2>/dev/null; then
-		# Regenerate the runtime rules file
 		jq -r '.network.rules[] |
 			if .allow then "allow \(.allow)"
 			elif .deny then "deny \(.deny)"
 			else empty end' "$ACTIVE_CONFIG" > "$RUNTIME/netfilter-rules"
 		kill -USR1 "$(cat "$RUNTIME/passt.pid")"
-		echo "Rules reloaded (signaled running instance)."
+		echo "Rules reloaded."
 	fi
 	exit 0
 fi

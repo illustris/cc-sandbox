@@ -11,10 +11,12 @@ const c = @cImport({
 	@cInclude("string.h");
 });
 
-// POSIX file I/O -- declared directly to avoid glibc fcntl.h macro issues
+// POSIX I/O -- declared directly to avoid glibc macro issues with fcntl.h
 const O_RDONLY: c_int = 0;
+const SEEK_SET: c_int = 0;
 extern "c" fn @"open"(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+extern "c" fn lseek(fd: c_int, offset: c_long, whence: c_int) c_long;
 extern "c" fn close(fd: c_int) c_int;
 
 // RTLD_NEXT = ((void *)-1)
@@ -26,9 +28,9 @@ var ruleset: filter.RuleSet = .{};
 var initialized: bool = false;
 var reload_pending = std.atomic.Value(bool).init(false);
 
-// Rules file path (null-terminated in buffer for C open())
-var rules_path_buf: [4097]u8 = undefined;
-var rules_path_len: usize = 0;
+// Rules file descriptor -- opened during lazy init (after passt's
+// close_open_files but before seccomp), kept open for lseek+read reloads.
+var rules_fd: c_int = -1;
 
 // --- Real libc function pointers ---
 
@@ -46,20 +48,17 @@ fn resolve(comptime name: [*:0]const u8) *anyopaque {
 	return c.dlsym(RTLD_NEXT, name) orelse @panic("netfilter: dlsym failed");
 }
 
-// --- Constructor: runs at library load time, before main() / seccomp ---
-// passt enables a seccomp-bpf filter after startup that restricts syscalls.
-// We must complete all initialization (dlsym, sigaction, file I/O for rules)
-// before seccomp is activated. The .init_array constructor guarantees this.
-
-fn libInit() callconv(.c) void {
-	init();
-}
-
-// .init_array entry ensures init() runs at library load time (before seccomp)
-const InitFnPtr = *const fn () callconv(.c) void;
-export var _netfilter_init_entry: InitFnPtr linksection(".init_array") = &libInit;
-
 // --- Initialization ---
+// Lazy init on first intercepted call. passt's startup sequence:
+//   1. .init_array constructors run (before main)
+//   2. main() → isolate_initial() → close_open_files() closes all fds > 2
+//   3. main() setup: creates sockets, calls connect() for probing etc.
+//   4. main() → isolate_postfork() → seccomp applied
+//
+// Our wrappers intercept connect() calls during step 3, which triggers
+// init(). At this point close_open_files is done (so our fd won't be
+// closed) and seccomp isn't applied yet (so open() works). This is the
+// only safe window for initialization.
 
 fn init() void {
 	if (initialized) return;
@@ -69,19 +68,18 @@ fn init() void {
 	real_sendmsg = @ptrCast(resolve("sendmsg"));
 	real_sendmmsg = @ptrCast(resolve("sendmmsg"));
 
-	// Install SIGUSR1 handler for live rule reload
+	// Install SIGUSR1 handler for rule reload.
+	// Requires rt_sigreturn in passt's seccomp allowlist.
 	var act: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
 	act.handler.handler = handleSigusr1;
 	std.posix.sigaction(std.posix.SIG.USR1, &act, null);
 
-	// Copy rules file path from environment (using libc getenv)
+	// Open rules file and keep fd for seccomp-safe reloads.
 	const env: ?[*:0]const u8 = c.getenv("NETFILTER_RULES");
 	if (env) |ptr| {
-		const len = c.strlen(ptr);
-		if (len > 0 and len < rules_path_buf.len) {
-			@memcpy(rules_path_buf[0..len], ptr[0..len]);
-			rules_path_buf[len] = 0;
-			rules_path_len = len;
+		const fd = @"open"(ptr, O_RDONLY, 0);
+		if (fd >= 0) {
+			rules_fd = fd;
 		}
 	}
 
@@ -89,18 +87,16 @@ fn init() void {
 	initialized = true;
 }
 
+/// Re-read rules from the pre-opened fd. Seccomp-safe: uses only lseek+read.
 fn loadRules() void {
-	if (rules_path_len == 0) return;
+	if (rules_fd < 0) return;
 
-	const path_z: [*:0]const u8 = @ptrCast(rules_path_buf[0..rules_path_len :0]);
-	const fd = @"open"(path_z, O_RDONLY, 0);
-	if (fd < 0) return;
-	defer _ = close(fd);
+	if (lseek(rules_fd, 0, SEEK_SET) < 0) return;
 
 	var buf: [8192]u8 = undefined;
 	var total: usize = 0;
 	while (total < buf.len) {
-		const n = read(fd, @ptrCast(&buf[total]), buf.len - total);
+		const n = read(rules_fd, @ptrCast(&buf[total]), buf.len - total);
 		if (n <= 0) break;
 		total += @intCast(n);
 	}
@@ -109,10 +105,6 @@ fn loadRules() void {
 }
 
 fn handleSigusr1(_: std.posix.SIG) callconv(.c) void {
-	// Note: reload will call open/read/close which may be blocked by
-	// seccomp. The signal handler only sets a flag; actual reload is
-	// deferred to the next wrapper call. If seccomp blocks file I/O,
-	// the reload will silently fail and the old rules remain in effect.
 	reload_pending.store(true, .release);
 }
 
@@ -152,9 +144,6 @@ fn denyErrno() void {
 }
 
 // --- Exported wrappers ---
-// These run under passt's seccomp filter. They must not make any syscalls
-// other than those passt already allows (the real connect/sendto/sendmsg/
-// sendmmsg, plus errno access). All logic is pure computation.
 
 export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) callconv(.c) c_int {
 	init();

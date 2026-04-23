@@ -73,7 +73,7 @@ that run only.
 | Subcommand | Description |
 |---|---|
 | `rules list [--name NAME]` | List current rules with 1-based indices |
-| `rules add allow\|deny CIDR [--name NAME]` | Append a rule |
+| `rules add allow\|deny CIDR [--at N] [--name NAME]` | Add a rule (append, or insert at position N) |
 | `rules del INDEX [--name NAME]` | Delete a rule by index |
 | `rules set [--name NAME]` | Replace all rules from stdin |
 
