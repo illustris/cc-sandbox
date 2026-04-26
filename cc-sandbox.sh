@@ -38,6 +38,8 @@ Options:
   --network MODE   Network mode: full, none, or rules (default: config or rules)
   --init-only      Run all setup steps but do not start the VM
   --list           List all instances with their ports and status
+  --no-auto-keys   On first init, leave authorized_keys empty instead of
+                   seeding it from ~/.ssh/*.pub and ssh-add -L.
   --help           Show this help message
 
 Per-instance customization:
@@ -90,6 +92,7 @@ INSTANCE_NAME=""
 LIST_INSTANCES=0
 RULES_MODE=0
 RULES_ARGS=()
+AUTO_KEYS=1
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--init-only) INIT_ONLY=1 ;;
@@ -104,6 +107,7 @@ while [ $# -gt 0 ]; do
 		--network) FLAG_NETWORK="$2"; shift ;;
 		--name) INSTANCE_NAME="$2"; shift ;;
 		--list) LIST_INSTANCES=1 ;;
+		--no-auto-keys) AUTO_KEYS=0 ;;
 		--help) usage ;;
 		rules)
 			RULES_MODE=1
@@ -318,7 +322,11 @@ if [ ! -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
 	ITEMS+=("$INSTANCE_FLAKE_DIR/flake.nix  (per-instance NixOS extensions, no-op default)")
 fi
 if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then
-	ITEMS+=("$CONFIG_DIR/authorized_keys  (SSH public keys, empty)")
+	if [ "$AUTO_KEYS" -eq 1 ]; then
+		ITEMS+=("$CONFIG_DIR/authorized_keys  (SSH public keys, seeded from ~/.ssh/*.pub + ssh-add -L)")
+	else
+		ITEMS+=("$CONFIG_DIR/authorized_keys  (SSH public keys, empty)")
+	fi
 fi
 if [ ! -d "$REAL_DATA" ]; then
 	ITEMS+=("$REAL_DATA/  (VM data${INSTANCE_NAME:+ for \"$INSTANCE_NAME\"})")
@@ -407,7 +415,25 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 	fi
 
 	if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then
-		touch "$CONFIG_DIR/authorized_keys"
+		if [ "$AUTO_KEYS" -eq 1 ]; then
+			# Seed from the host user's existing pubkeys and any keys loaded
+			# in their running ssh-agent (if SSH_AUTH_SOCK is set). Errors
+			# are tolerated: missing ~/.ssh, no .pub files, or no agent all
+			# just contribute zero lines. Result is sorted/deduped so the
+			# same key from both sources doesn't appear twice.
+			{
+				if [ -d "$REAL_HOME/.ssh" ]; then
+					for f in "$REAL_HOME/.ssh"/*.pub; do
+						[ -f "$f" ] && cat "$f"
+					done
+				fi
+				if [ -n "${SSH_AUTH_SOCK:-}" ] && command -v ssh-add >/dev/null; then
+					ssh-add -L 2>/dev/null || true
+				fi
+			} | grep -v '^[[:space:]]*\(#\|$\)' | sort -u > "$CONFIG_DIR/authorized_keys"
+		else
+			touch "$CONFIG_DIR/authorized_keys"
+		fi
 	fi
 	if [ ! -f "$REAL_CLAUDE_AUTH" ]; then
 		echo '{}' > "$REAL_CLAUDE_AUTH"

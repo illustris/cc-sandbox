@@ -16,7 +16,7 @@ touching anything:
 ```
 The following paths will be created:
   ~/.config/cc-sandbox/instances/default/config.json  (default settings)
-  ~/.config/cc-sandbox/authorized_keys  (SSH public keys, empty)
+  ~/.config/cc-sandbox/authorized_keys  (SSH public keys; seeded from ~/.ssh/*.pub + ssh-add -L)
   ~/.local/share/cc-sandbox/instances/default/  (VM data)
   ~/.claude/  (Claude config)
   ~/.claude.json  (Claude auth)
@@ -62,6 +62,7 @@ independently.
 | `--network MODE` | Network mode: `full`, `none`, or `rules` (default: config or rules) |
 | `--init-only` | Run all setup steps but do not start the VM |
 | `--list` | List all instances with their ports and status |
+| `--no-auto-keys` | On first init, leave `authorized_keys` empty instead of seeding it from `~/.ssh/*.pub` and `ssh-add -L` |
 | `--help` | Show usage information |
 
 When an instance is first created, `--vcpu`, `--mem`, and `--network` are
@@ -357,12 +358,14 @@ the flake.
 ### authorized_keys
 
 SSH public keys, one per line (same format as `~/.ssh/authorized_keys`).
-Empty by default. At launch, the wrapper copies either the per-instance
+On first init the shared file is seeded from `~/.ssh/*.pub` plus any keys
+loaded in the running ssh-agent (`ssh-add -L`); pass `--no-auto-keys` to
+keep it empty. At launch, the wrapper copies either the per-instance
 `authorized_keys` (if present) or the shared top-level one into the
 instance's data dir, where the VM reads it at boot.
 
 ```sh
-# Enable SSH access
+# Add another key after init
 cp ~/.ssh/id_ed25519.pub ~/.config/cc-sandbox/authorized_keys
 ssh -p 2222 root@localhost
 ```
