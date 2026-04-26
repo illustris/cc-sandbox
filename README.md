@@ -15,9 +15,9 @@ touching anything:
 
 ```
 The following paths will be created:
-  ~/.config/cc-sandbox/config.json  (default settings)
+  ~/.config/cc-sandbox/instances/default/config.json  (default settings)
   ~/.config/cc-sandbox/authorized_keys  (SSH public keys, empty)
-  ~/.local/share/cc-sandbox/  (VM data)
+  ~/.local/share/cc-sandbox/instances/default/  (VM data)
   ~/.claude/  (Claude config)
   ~/.claude.json  (Claude auth)
 
@@ -238,13 +238,16 @@ Only include the keys you want to change -- missing keys use the defaults.
 
 ### Per-instance configuration
 
-Named instances store their config under `~/.config/cc-sandbox/instances/<name>/`:
+Each instance has its own config dir under
+`~/.config/cc-sandbox/instances/<name>/`. The default instance uses the
+reserved name `default`, so the config layout mirrors the data layout:
 
 ```
 ~/.config/cc-sandbox/
-  config.json                  # default instance
-  authorized_keys              # shared SSH keys
+  authorized_keys              # shared SSH keys (fallback for all instances)
   instances/
+    default/
+      config.json              # default instance settings (sshPort 2222)
     work/
       config.json              # auto-generated with unique ports
       authorized_keys          # optional per-instance SSH keys
@@ -252,12 +255,25 @@ Named instances store their config under `~/.config/cc-sandbox/instances/<name>/
       config.json
 ```
 
-Each instance config has the same format as the default `config.json`.
-SSH keys fall back to the shared `authorized_keys` unless a per-instance
-file exists.
+Each instance config has the same format. SSH keys fall back to the
+shared top-level `authorized_keys` unless a per-instance file exists.
 
 Data (VM state, overlays) is stored per-instance under
-`~/.local/share/cc-sandbox/instances/<name>/`.
+`~/.local/share/cc-sandbox/instances/<name>/`. The default instance uses
+the reserved name `default`, so all instances are siblings and a
+default-instance boot does not 9p-share named-instance state into the
+default guest:
+
+```
+~/.local/share/cc-sandbox/
+  instances/
+    default/                   # default instance data
+      claude-overlay.img
+    work/                      # named instance data
+      claude-overlay.img
+    personal/
+      claude-overlay.img
+```
 
 ### authorized_keys
 
@@ -279,7 +295,7 @@ Override where data lives on the host with environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `CC_SANDBOX_DATA` | `$HOME/.local/share/cc-sandbox` | Persistent data volume |
+| `CC_SANDBOX_DATA` | `$HOME/.local/share/cc-sandbox` | Persistent data root. Each instance lives at `$CC_SANDBOX_DATA/instances/<name>/`; the default uses the reserved name `default`. |
 | `CC_SANDBOX_CLAUDE_CONFIG` | `$HOME/.claude` | Host Claude config (read-only in VM) |
 | `CC_SANDBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | Auth token for the VM |
 

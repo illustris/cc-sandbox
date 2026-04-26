@@ -29,7 +29,9 @@ Rules subcommands:
   rules set                           Replace all rules from stdin
 
 Environment variables:
-  CC_SANDBOX_DATA           Persistent data volume (default: ~/.local/share/cc-sandbox)
+  CC_SANDBOX_DATA           Persistent data root (default: ~/.local/share/cc-sandbox).
+                            Each instance lives at $CC_SANDBOX_DATA/instances/<name>;
+                            the default instance uses the reserved name "default".
   CC_SANDBOX_CLAUDE_CONFIG  Host Claude config dir (default: ~/.claude)
   CC_SANDBOX_CLAUDE_AUTH    Auth token file (default: ~/.claude.json)
 
@@ -131,14 +133,39 @@ REAL_CLAUDE_CONFIG="${CC_SANDBOX_CLAUDE_CONFIG:-$REAL_HOME/.claude}"
 REAL_CLAUDE_AUTH="${CC_SANDBOX_CLAUDE_AUTH:-$REAL_HOME/.claude.json}"
 BASE_RUNTIME="@runtimeDir@"
 
+EFFECTIVE_NAME="${INSTANCE_NAME:-default}"
+INSTANCE_CONFIG_DIR="$CONFIG_DIR/instances/$EFFECTIVE_NAME"
+REAL_DATA="$BASE_DATA/instances/$EFFECTIVE_NAME"
 if [ -n "$INSTANCE_NAME" ]; then
-	INSTANCE_CONFIG_DIR="$CONFIG_DIR/instances/$INSTANCE_NAME"
-	REAL_DATA="$BASE_DATA/instances/$INSTANCE_NAME"
 	RUNTIME="${BASE_RUNTIME}-${INSTANCE_NAME}"
 else
-	INSTANCE_CONFIG_DIR="$CONFIG_DIR"
-	REAL_DATA="$BASE_DATA"
 	RUNTIME="$BASE_RUNTIME"
+fi
+
+# Detect pre-fix layouts where the default instance's config and data
+# lived at the top level of $CONFIG_DIR / $BASE_DATA, which nested every
+# named instance inside the default (and exposed named-instance data to
+# the default guest via 9p).
+if [ -z "$INSTANCE_NAME" ]; then
+	OLD_CFG=""; OLD_DATA=""
+	[ -f "$CONFIG_DIR/config.json" ] && [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ] && OLD_CFG=1
+	[ -e "$BASE_DATA/claude-overlay.img" ] && [ ! -d "$REAL_DATA" ] && OLD_DATA=1
+	if [ -n "$OLD_CFG" ] || [ -n "$OLD_DATA" ]; then
+		echo "Error: cc-sandbox layout changed. The default instance now lives at:"
+		echo "  config: $INSTANCE_CONFIG_DIR/"
+		echo "  data:   $REAL_DATA/"
+		echo "Migrate with:"
+		if [ -n "$OLD_CFG" ]; then
+			echo "  mkdir -p '$INSTANCE_CONFIG_DIR'"
+			echo "  mv '$CONFIG_DIR/config.json' '$INSTANCE_CONFIG_DIR/'"
+		fi
+		if [ -n "$OLD_DATA" ]; then
+			echo "  mkdir -p '$REAL_DATA'"
+			echo "  mv '$BASE_DATA/claude-overlay.img' '$REAL_DATA/'"
+			echo "  [ -d '$BASE_DATA/.config' ] && mv '$BASE_DATA/.config' '$REAL_DATA/'"
+		fi
+		exit 1
+	fi
 fi
 
 # -- List instances ------------------------------------------------
@@ -153,32 +180,27 @@ if [ "$LIST_INSTANCES" -eq 1 ]; then
 		fi
 	}
 	echo "Instances:"
-	if [ -f "$CONFIG_DIR/config.json" ]; then
-		ssh_p=$(jq -r '.sshPort // 2222' "$CONFIG_DIR/config.json")
-		http_p=$(jq -r '.httpPort // 8080' "$CONFIG_DIR/config.json")
-		net=$(net_label "$CONFIG_DIR/config.json")
-		running=""
-		if [ -f "$BASE_RUNTIME/pid" ] && kill -0 "$(cat "$BASE_RUNTIME/pid")" 2>/dev/null; then
-			running=" (running)"
-		fi
-		echo "  (default)  ssh:$ssh_p  http:$http_p  net:$net$running"
-	fi
 	if [ -d "$CONFIG_DIR/instances" ]; then
 		for dir in "$CONFIG_DIR/instances"/*/; do
 			[ -d "$dir" ] || continue
 			name=$(basename "$dir")
 			cfg="$dir/config.json"
-			if [ -f "$cfg" ]; then
-				ssh_p=$(jq -r '.sshPort // 2222' "$cfg")
-				http_p=$(jq -r '.httpPort // 8080' "$cfg")
-				net=$(net_label "$cfg")
-				running=""
+			[ -f "$cfg" ] || continue
+			ssh_p=$(jq -r '.sshPort // 2222' "$cfg")
+			http_p=$(jq -r '.httpPort // 8080' "$cfg")
+			net=$(net_label "$cfg")
+			running=""
+			if [ "$name" = "default" ]; then
+				inst_runtime="$BASE_RUNTIME"
+				label="(default)"
+			else
 				inst_runtime="${BASE_RUNTIME}-${name}"
-				if [ -f "$inst_runtime/pid" ] && kill -0 "$(cat "$inst_runtime/pid")" 2>/dev/null; then
-					running=" (running)"
-				fi
-				echo "  $name  ssh:$ssh_p  http:$http_p  net:$net$running"
+				label="$name"
 			fi
+			if [ -f "$inst_runtime/pid" ] && kill -0 "$(cat "$inst_runtime/pid")" 2>/dev/null; then
+				running=" (running)"
+			fi
+			echo "  $label  ssh:$ssh_p  http:$http_p  net:$net$running"
 		done
 	fi
 	exit 0
@@ -199,16 +221,11 @@ fi
 
 # -- Auto-port assignment -----------------------------------------
 next_available_ports() {
+	# Seeded one below the default's canonical 2222/8080, so the first
+	# named instance auto-assigns to 2223/8081 even if the default does
+	# not yet exist (i.e. 2222/8080 stays reserved for the default).
 	local max_ssh=2222
 	local max_http=8080
-
-	if [ -f "$CONFIG_DIR/config.json" ]; then
-		local s h
-		s=$(jq -r '.sshPort // 0' "$CONFIG_DIR/config.json")
-		h=$(jq -r '.httpPort // 0' "$CONFIG_DIR/config.json")
-		[ "$s" -gt "$max_ssh" ] && max_ssh=$s
-		[ "$h" -gt "$max_http" ] && max_http=$h
-	fi
 
 	if [ -d "$CONFIG_DIR/instances" ]; then
 		for cfg in "$CONFIG_DIR/instances"/*/config.json; do
@@ -226,14 +243,15 @@ next_available_ports() {
 
 # -- First-time init: collect missing items, prompt once -----------
 ITEMS=()
-if [ ! -f "$CONFIG_DIR/config.json" ] && [ -z "$INSTANCE_NAME" ]; then
-	ITEMS+=("$CONFIG_DIR/config.json  (default settings)")
+if [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
+	if [ -z "$INSTANCE_NAME" ]; then
+		ITEMS+=("$INSTANCE_CONFIG_DIR/config.json  (default settings)")
+	else
+		ITEMS+=("$INSTANCE_CONFIG_DIR/config.json  (instance \"$INSTANCE_NAME\" settings)")
+	fi
 fi
 if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then
 	ITEMS+=("$CONFIG_DIR/authorized_keys  (SSH public keys, empty)")
-fi
-if [ -n "$INSTANCE_NAME" ] && [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
-	ITEMS+=("$INSTANCE_CONFIG_DIR/config.json  (instance \"$INSTANCE_NAME\" settings)")
 fi
 if [ ! -d "$REAL_DATA" ]; then
 	ITEMS+=("$REAL_DATA/  (VM data${INSTANCE_NAME:+ for \"$INSTANCE_NAME\"})")
@@ -257,8 +275,7 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		exit 1
 	fi
 
-	mkdir -p "$CONFIG_DIR" "$REAL_DATA" "$REAL_CLAUDE_CONFIG"
-	[ -n "$INSTANCE_NAME" ] && mkdir -p "$INSTANCE_CONFIG_DIR"
+	mkdir -p "$INSTANCE_CONFIG_DIR" "$REAL_DATA" "$REAL_CLAUDE_CONFIG"
 
 	INIT_VCPU="${FLAG_VCPU:-16}"
 	INIT_MEM="${FLAG_MEM:-32768}"
@@ -292,43 +309,19 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		NETWORK_JQ="\"$INIT_NETWORK\""
 	fi
 
-	if [ ! -f "$CONFIG_DIR/config.json" ] && [ -z "$INSTANCE_NAME" ]; then
-		jq -n --tab \
-			--argjson vcpu "$INIT_VCPU" \
-			--argjson mem "$INIT_MEM" \
-			--argjson network "$NETWORK_JQ" \
-			'{
-				vcpu: $vcpu,
-				mem: $mem,
-				sshPort: 2222,
-				httpPort: 8080,
-				overlaySize: "128M",
-				storeOverlaySize: "16G",
-				bindAddr: "127.0.0.1",
-				network: $network
-			}' > "$CONFIG_DIR/config.json"
-	fi
-
-	if [ -n "$INSTANCE_NAME" ] && [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
-		if [ ! -f "$CONFIG_DIR/config.json" ]; then
-			jq -n --tab '{
-				vcpu: 16,
-				mem: 32768,
-				sshPort: 2222,
-				httpPort: 8080,
-				overlaySize: "128M",
-				storeOverlaySize: "16G",
-				bindAddr: "127.0.0.1",
-				network: "full"
-			}' > "$CONFIG_DIR/config.json"
+	if [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
+		if [ -z "$INSTANCE_NAME" ]; then
+			INIT_SSH=2222
+			INIT_HTTP=8080
+		else
+			read -r INIT_SSH INIT_HTTP <<< "$(next_available_ports)"
 		fi
-		read -r next_ssh next_http <<< "$(next_available_ports)"
 		jq -n --tab \
 			--argjson vcpu "$INIT_VCPU" \
 			--argjson mem "$INIT_MEM" \
 			--argjson network "$NETWORK_JQ" \
-			--argjson ssh "$next_ssh" \
-			--argjson http "$next_http" \
+			--argjson ssh "$INIT_SSH" \
+			--argjson http "$INIT_HTTP" \
 			'{
 				vcpu: $vcpu,
 				mem: $mem,
@@ -339,7 +332,7 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 				bindAddr: "127.0.0.1",
 				network: $network
 			}' > "$INSTANCE_CONFIG_DIR/config.json"
-		echo "Instance \"$INSTANCE_NAME\" ports: SSH=$next_ssh HTTP=$next_http"
+		[ -n "$INSTANCE_NAME" ] && echo "Instance \"$INSTANCE_NAME\" ports: SSH=$INIT_SSH HTTP=$INIT_HTTP"
 	fi
 
 	if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then

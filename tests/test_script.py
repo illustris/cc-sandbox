@@ -51,12 +51,14 @@ machine.wait_for_open_port(9000)
 with subtest("Phase A: CLI / state without booting"):
     # A1: first-run init for the default instance, network=none
     machine.succeed(as_user("yes y | cc-sandbox --init-only --network none"))
-    machine.succeed("test -f /home/testuser/.config/cc-sandbox/config.json")
+    machine.succeed("test -f /home/testuser/.config/cc-sandbox/instances/default/config.json")
     machine.succeed("test -f /home/testuser/.config/cc-sandbox/authorized_keys")
-    machine.succeed("test -d /home/testuser/.local/share/cc-sandbox")
+    machine.succeed("test -d /home/testuser/.local/share/cc-sandbox/instances/default")
     machine.succeed("test -f /home/testuser/.claude.json")
+    # Old top-level default config must NOT be created any more.
+    machine.fail("test -e /home/testuser/.config/cc-sandbox/config.json")
     net = machine.succeed(
-        "jq -r .network /home/testuser/.config/cc-sandbox/config.json"
+        "jq -r .network /home/testuser/.config/cc-sandbox/instances/default/config.json"
     ).strip()
     assert net == "none", f"expected network=none, got {net!r}"
 
@@ -68,6 +70,11 @@ with subtest("Phase A: CLI / state without booting"):
 
     # A3: named instance with rules mode -> auto-assigned ports
     machine.succeed(as_user("yes y | cc-sandbox --init-only --name work --network rules"))
+    # Named instance data must be a sibling of the default's data dir, not
+    # nested inside it. A default-instance boot 9p-shares its data dir into
+    # the guest; if named instances live under it, they leak across.
+    machine.succeed("test -d /home/testuser/.local/share/cc-sandbox/instances/work")
+    machine.fail("test -e /home/testuser/.local/share/cc-sandbox/instances/default/instances")
     ssh_port = machine.succeed(
         "jq -r .sshPort /home/testuser/.config/cc-sandbox/instances/work/config.json"
     ).strip()
@@ -118,7 +125,7 @@ with subtest("Phase B: --network none blocks all outbound"):
 
 with subtest("Phase C: --network full allows outbound"):
     # Reinit the default instance in full mode
-    machine.succeed("rm -f /home/testuser/.config/cc-sandbox/config.json")
+    machine.succeed("rm -f /home/testuser/.config/cc-sandbox/instances/default/config.json")
     machine.succeed(as_user("yes y | cc-sandbox --init-only --network full"))
     machine.succeed(
         "cp /home/testuser/.ssh/id_ed25519.pub "
