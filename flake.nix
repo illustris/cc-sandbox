@@ -278,7 +278,7 @@
 			});
 			cc-sandbox = pkgs.writeShellApplication {
 				name = "cc-sandbox";
-				runtimeInputs = with pkgs; [ coreutils gnused jq ] ++ [ passt-cc ];
+				runtimeInputs = with pkgs; [ coreutils gnused gnugrep jq ] ++ [ passt-cc ];
 				text = illustris-lib.replaceVarsInString {
 					runtimeDir = runtimeDir;
 					runner = "${runner}";
@@ -310,6 +310,10 @@
 						&& touch $out
 				'';
 			};
+		} // lib.optionalAttrs (system == "x86_64-linux") {
+			cc-sandbox-vm = pkgs.testers.runNixOSTest (import ./tests/cc-sandbox.nix {
+				inherit self pkgs system;
+			});
 		});
 
 		nixosConfigurations = lib.listToAttrs (map (system: {
