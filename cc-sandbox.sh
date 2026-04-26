@@ -9,15 +9,18 @@ Options:
   --name NAME      Use a named instance (creates it on first run)
   --vcpu N         Set vCPU count (default: config or 16)
   --mem N          Set RAM in megabytes (default: config or 32768)
-  --network MODE   Network mode: full, none, or rules (default: config or full)
+  --network MODE   Network mode: full, none, or rules (default: config or rules)
   --init-only      Run all setup steps but do not start the VM
   --list           List all instances with their ports and status
   --help           Show this help message
 
 Network modes:
-  "full"           Unrestricted networking (default)
+  "full"           Unrestricted networking
   "none"           Block all outbound traffic (QEMU restrict=on)
-  "rules"          Ordered CIDR allow/deny rules (LD_PRELOAD filter on passt)
+  "rules"          Ordered CIDR allow/deny rules (LD_PRELOAD filter on passt).
+                   Default. Seeded with denies for private (RFC1918), link-local
+                   (incl. cloud metadata 169.254.169.254), and bogon ranges,
+                   followed by allow 0.0.0.0/0 for the public internet.
 
 Rules subcommands:
   rules list                          List current rules with indices
@@ -35,7 +38,7 @@ Examples:
   cc-sandbox --name work              Start a named instance
   cc-sandbox --name work --vcpu 8     Named instance with 8 cores
   cc-sandbox --network none           Start fully isolated
-  cc-sandbox --network rules          Init with deny-all rules mode
+  cc-sandbox --network full           Override default rules mode for unrestricted net
   cc-sandbox rules add allow 10.0.0.0/8 --name work
   cc-sandbox rules list --name work
   cc-sandbox --list                   Show all instances
@@ -208,7 +211,7 @@ if [ -n "$RULES_CMD" ]; then
 
 	case "$RULES_CMD" in
 		list)
-			jq -r '.network.rules | to_entries[] | "\(.key + 1): \(if .value.allow then "allow \(.value.allow)" elif .value.deny then "deny \(.value.deny)" else "unknown" end)"' "$ACTIVE_CONFIG"
+			jq -r '.network.rules | to_entries[] | "\(.key + 1): \(if .value.allow then "allow \(.value.allow)" elif .value.deny then "deny \(.value.deny)" else "unknown" end)\(if .value.comment then "  # \(.value.comment)" else "" end)"' "$ACTIVE_CONFIG"
 			;;
 		add)
 			if [ "$RULES_ACTION" != "allow" ] && [ "$RULES_ACTION" != "deny" ]; then
@@ -337,11 +340,32 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 
 	INIT_VCPU="${FLAG_VCPU:-16}"
 	INIT_MEM="${FLAG_MEM:-32768}"
-	INIT_NETWORK="${FLAG_NETWORK:-full}"
+	INIT_NETWORK="${FLAG_NETWORK:-rules}"
 
-	# Build network value for config: "full"/"none" as string, rules as object
+	# Build network value for config: "full"/"none" as string, rules as object.
+	# Default rules seed denies private/bogon ranges then allows public internet,
+	# so a fresh install gets working internet without exposing LAN or cloud
+	# metadata services to the sandbox. Loopback is omitted -- already denied
+	# implicitly in filter.zig.
 	if [ "$INIT_NETWORK" = "rules" ]; then
-		NETWORK_JQ='{"rules":[]}'
+		NETWORK_JQ=$(jq -nc '{
+			rules: [
+				{deny:  "0.0.0.0/8",        comment: "this network (RFC 1122)"},
+				{deny:  "10.0.0.0/8",       comment: "RFC1918 private"},
+				{deny:  "100.64.0.0/10",    comment: "carrier-grade NAT (RFC 6598)"},
+				{deny:  "169.254.0.0/16",   comment: "link-local incl. cloud metadata 169.254.169.254"},
+				{deny:  "172.16.0.0/12",    comment: "RFC1918 private"},
+				{deny:  "192.0.0.0/24",     comment: "IETF protocol assignments (RFC 6890)"},
+				{deny:  "192.0.2.0/24",     comment: "TEST-NET-1 documentation (RFC 5737)"},
+				{deny:  "192.168.0.0/16",   comment: "RFC1918 private"},
+				{deny:  "198.18.0.0/15",    comment: "benchmark testing (RFC 2544)"},
+				{deny:  "198.51.100.0/24",  comment: "TEST-NET-2 documentation (RFC 5737)"},
+				{deny:  "203.0.113.0/24",   comment: "TEST-NET-3 documentation (RFC 5737)"},
+				{deny:  "224.0.0.0/4",      comment: "multicast (RFC 5771)"},
+				{deny:  "240.0.0.0/4",      comment: "reserved/broadcast incl. 255.255.255.255"},
+				{allow: "0.0.0.0/0",        comment: "public internet"}
+			]
+		}')
 	else
 		NETWORK_JQ="\"$INIT_NETWORK\""
 	fi

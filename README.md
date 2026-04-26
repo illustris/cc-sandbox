@@ -59,7 +59,7 @@ independently.
 | `--name NAME` | Use a named instance (creates it on first run) |
 | `--vcpu N` | Set vCPU count (default: config.json or 16) |
 | `--mem N` | Set RAM in megabytes (default: config.json or 32768) |
-| `--network MODE` | Network mode: `full`, `none`, or `rules` (default: config or full) |
+| `--network MODE` | Network mode: `full`, `none`, or `rules` (default: config or rules) |
 | `--init-only` | Run all setup steps but do not start the VM |
 | `--list` | List all instances with their ports and status |
 | `--help` | Show usage information |
@@ -105,7 +105,7 @@ Three modes are available. `full` and `rules` use
 [passt](https://passt.top/) for networking, which supports all IP protocols
 including ICMP. `none` uses QEMU's built-in SLIRP with `restrict=on`.
 
-### full (default)
+### full
 
 Unrestricted networking via passt. All IP protocols (TCP, UDP, ICMP, etc.)
 work. No extra privileges needed.
@@ -120,38 +120,58 @@ Note: Claude Code requires access to the Anthropic API. In `none` mode,
 Claude Code will not function unless API access is provided through another
 channel (e.g., SSH port forwarding).
 
-### rules
+### rules (default)
 
 Ordered CIDR allow/deny rules enforced via an LD_PRELOAD filter on
 [passt](https://passt.top/). First match wins; default policy is deny.
 No extra privileges needed. All IP protocols (TCP, UDP, ICMP) are
 subject to the rules.
 
+A new instance is seeded with deny rules for private (RFC1918), link-local
+(including cloud metadata `169.254.169.254`), and bogon ranges, followed
+by `allow 0.0.0.0/0` for the public internet. Net effect: working internet
+out of the box, with LAN and metadata services blocked. Rule objects may
+optionally carry a `comment` field; it's preserved through edits and
+shown by `rules list` but ignored by the filter.
+
 ```json
 {
     "network": {
         "rules": [
-            {"allow": "10.0.1.0/24"},
-            {"deny": "10.0.0.0/8"},
-            {"allow": "0.0.0.0/0"}
+            {"deny":  "0.0.0.0/8",       "comment": "this network (RFC 1122)"},
+            {"deny":  "10.0.0.0/8",      "comment": "RFC1918 private"},
+            {"deny":  "100.64.0.0/10",   "comment": "carrier-grade NAT (RFC 6598)"},
+            {"deny":  "169.254.0.0/16",  "comment": "link-local incl. cloud metadata 169.254.169.254"},
+            {"deny":  "172.16.0.0/12",   "comment": "RFC1918 private"},
+            {"deny":  "192.0.0.0/24",    "comment": "IETF protocol assignments (RFC 6890)"},
+            {"deny":  "192.0.2.0/24",    "comment": "TEST-NET-1 documentation (RFC 5737)"},
+            {"deny":  "192.168.0.0/16",  "comment": "RFC1918 private"},
+            {"deny":  "198.18.0.0/15",   "comment": "benchmark testing (RFC 2544)"},
+            {"deny":  "198.51.100.0/24", "comment": "TEST-NET-2 documentation (RFC 5737)"},
+            {"deny":  "203.0.113.0/24",  "comment": "TEST-NET-3 documentation (RFC 5737)"},
+            {"deny":  "224.0.0.0/4",     "comment": "multicast (RFC 5771)"},
+            {"deny":  "240.0.0.0/4",     "comment": "reserved/broadcast incl. 255.255.255.255"},
+            {"allow": "0.0.0.0/0",       "comment": "public internet"}
         ]
     }
 }
 ```
 
-Rules can be set at init time or managed dynamically:
+To poke a hole for a specific LAN host, insert a more-specific allow
+ahead of the matching deny:
 
 ```sh
-# Init with rules mode (starts with empty ruleset = deny all)
-nix run github:illustris/cc-sandbox -- --network rules
+# Allow the NAS at 192.168.1.50 while keeping the rest of 192.168/16 denied
+cc-sandbox rules add allow 192.168.1.50/32 --at 8
+```
 
-# Manage rules (updates take effect immediately on running instances)
-cc-sandbox rules add deny 10.0.0.0/8
-cc-sandbox rules add deny 172.16.0.0/12
-cc-sandbox rules add deny 192.168.0.0/16
-cc-sandbox rules add allow 0.0.0.0/0
+Rules can be managed dynamically (updates take effect immediately on
+running instances via SIGUSR1):
+
+```sh
 cc-sandbox rules list
-cc-sandbox rules del 2
+cc-sandbox rules add deny 8.8.8.8/32 --at 1
+cc-sandbox rules del 1
 ```
 
 Implicit rules (applied before user rules, not configurable):
@@ -164,21 +184,6 @@ The filter works by intercepting passt's outbound `connect()`,
 VM's only network path, this is a complete enforcement point. The filter
 is a Zig shared library (`libnetfilter.so`) loaded via `LD_PRELOAD`;
 initialization runs before passt enables its seccomp sandbox.
-
-To allow Claude Code while blocking internal networks:
-
-```json
-{
-    "network": {
-        "rules": [
-            {"deny": "10.0.0.0/8"},
-            {"deny": "172.16.0.0/12"},
-            {"deny": "192.168.0.0/16"},
-            {"allow": "0.0.0.0/0"}
-        ]
-    }
-}
-```
 
 ## Configuration
 
@@ -196,7 +201,7 @@ Edit them and restart the VM -- no rebuild needed.
     "overlaySize": "128M",
     "storeOverlaySize": "16G",
     "bindAddr": "127.0.0.1",
-    "network": "full"
+    "network": {"rules": [...]}
 }
 ```
 
@@ -209,7 +214,7 @@ Edit them and restart the VM -- no rebuild needed.
 | `overlaySize` | string | `128M` | Persistent Claude config overlay image |
 | `storeOverlaySize` | string | `16G` | Writable nix store tmpfs |
 | `bindAddr` | string | `127.0.0.1` | Host bind address for port forwards |
-| `network` | string/object | `"full"` | Network mode: `"full"`, `"none"`, or `{"rules":[...]}` |
+| `network` | string/object | seeded `rules` | Network mode: `"full"`, `"none"`, or `{"rules":[...]}` |
 
 Only include the keys you want to change -- missing keys use the defaults.
 
@@ -306,7 +311,7 @@ hot-reloaded at runtime via `SIGUSR1` to the passt process.
 | Claude config overlay | 128 MB ext4 image |
 | SSH | 127.0.0.1:2222 -> 22 |
 | HTTP | 127.0.0.1:8080 -> 8080 |
-| Network | full (unrestricted) |
+| Network | rules (private/bogon denied, public allowed) |
 | Docker | enabled |
 
 Pre-installed tools: `claude-code`, `git`, `curl`, `jq`, `vim`, `ncdu`,
