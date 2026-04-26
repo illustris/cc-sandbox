@@ -278,7 +278,9 @@ default guest:
 ### authorized_keys
 
 SSH public keys, one per line (same format as `~/.ssh/authorized_keys`).
-Empty by default. The VM loads these at boot from the shared data directory.
+Empty by default. At launch, the wrapper copies either the per-instance
+`authorized_keys` (if present) or the shared top-level one into the
+instance's data dir, where the VM reads it at boot.
 
 ```sh
 # Enable SSH access
@@ -306,25 +308,25 @@ CC_SANDBOX_DATA=/mnt/fast/cc-sandbox nix run .
 ## How it works
 
 QEMU's 9p share sources must be absolute paths known at build time. The
-wrapper creates a symlink directory at `/tmp/cc-sandbox/` pointing to the
-user's actual paths, so the built VM image works for any user:
+wrapper creates a per-instance symlink directory pointing to the user's
+actual paths, so the built VM image works for any user. The default
+instance uses `/tmp/cc-sandbox/`; named instances use
+`/tmp/cc-sandbox-<name>/`. Each has its own symlinks and PID lock:
 
 ```
-/tmp/cc-sandbox/
-  data/            -> $CC_SANDBOX_DATA
+/tmp/cc-sandbox[-<name>]/
+  data/            -> $CC_SANDBOX_DATA/instances/<name>
   claude-config/   -> $CC_SANDBOX_CLAUDE_CONFIG
   claude-auth.json -> $CC_SANDBOX_CLAUDE_AUTH
 ```
 
 Runtime settings (vcpu, memory, ports) are applied by patching the microvm
 runner script's QEMU arguments at launch time. Settings that affect the
-guest (overlay sizes, SSH keys) are written to the shared data directory
-where systemd services inside the VM pick them up at boot.
-
-Named instances use separate runtime directories (`/tmp/cc-sandbox-<name>/`),
-each with its own symlinks and PID lock. The wrapper patches the QEMU
-runner's 9p share source paths to point at the instance-specific runtime
-directory, so the same VM image serves all instances.
+guest (overlay sizes, SSH keys) are written to the instance's data
+directory where systemd services inside the VM pick them up at boot. The
+wrapper patches the QEMU runner's 9p share source paths to point at the
+instance-specific runtime directory, so the same VM image serves all
+instances.
 
 In `rules` network mode, the wrapper loads a Zig shared library
 (`libnetfilter.so`) into passt via `LD_PRELOAD`. The library intercepts
