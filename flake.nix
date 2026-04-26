@@ -252,15 +252,15 @@
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
 		in rec {
-			netfilter = pkgs.stdenv.mkDerivation {
-				pname = "cc-sandbox-netfilter";
+			cc-sandbox-tools = pkgs.stdenv.mkDerivation {
+				pname = "cc-sandbox-tools";
 				version = "0.1.0";
 				src = lib.cleanSourceWith {
 					filter = name: type: !(
 						lib.hasSuffix ".nix" (toString name)
 						|| lib.hasSuffix ".lock" (toString name)
 					);
-					src = lib.cleanSource ./netfilter;
+					src = lib.cleanSource ./zig;
 				};
 				nativeBuildInputs = [ pkgs.zig ];
 				dontConfigure = true;
@@ -271,6 +271,8 @@
 						--global-cache-dir $TMPDIR/.zig-global-cache
 				'';
 			};
+			# Backwards-compatible alias
+			netfilter = cc-sandbox-tools;
 			passt-cc = pkgs.passt.overrideAttrs (old: {
 				# Allow rt_sigreturn so LD_PRELOAD signal handlers work
 				# under passt's seccomp filter (needed for SIGUSR1 rule reload)
@@ -282,7 +284,8 @@
 				text = illustris-lib.replaceVarsInString {
 					runtimeDir = runtimeDir;
 					runner = "${runner}";
-					netfilter = "${netfilter}/lib/libnetfilter.so";
+					netfilter = "${cc-sandbox-tools}/lib/libnetfilter.so";
+					rules = "${cc-sandbox-tools}/bin/cc-sandbox-rules";
 				} null (builtins.readFile ./cc-sandbox.sh);
 			};
 			default = cc-sandbox;
@@ -291,15 +294,15 @@
 		checks = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 		in {
-			netfilter-tests = pkgs.stdenv.mkDerivation {
-				pname = "cc-sandbox-netfilter-tests";
+			zig-tests = pkgs.stdenv.mkDerivation {
+				pname = "cc-sandbox-zig-tests";
 				version = "0.1.0";
 				src = lib.cleanSourceWith {
 					filter = name: type: !(
 						lib.hasSuffix ".nix" (toString name)
 						|| lib.hasSuffix ".lock" (toString name)
 					);
-					src = lib.cleanSource ./netfilter;
+					src = lib.cleanSource ./zig;
 				};
 				nativeBuildInputs = [ pkgs.zig ];
 				dontConfigure = true;

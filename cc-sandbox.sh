@@ -53,9 +53,8 @@ FLAG_MEM=""
 FLAG_NETWORK=""
 INSTANCE_NAME=""
 LIST_INSTANCES=0
-RULES_CMD=""
-RULES_ACTION=""
-RULES_ARG=""
+RULES_MODE=0
+RULES_ARGS=()
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--init-only) INIT_ONLY=1 ;;
@@ -72,34 +71,26 @@ while [ $# -gt 0 ]; do
 		--list) LIST_INSTANCES=1 ;;
 		--help) usage ;;
 		rules)
-			if [ $# -lt 2 ]; then
-				echo "Error: rules requires a subcommand (list, add, del, set)."
-				exit 1
-			fi
-			RULES_CMD="$2"; shift
-			case "$RULES_CMD" in
-				add)
-					if [ $# -lt 3 ]; then
-						echo "Error: rules add requires ACTION CIDR (e.g., rules add allow 10.0.0.0/8)."
-						exit 1
-					fi
-					RULES_ACTION="$2"; RULES_ARG="$3"; shift 3
-					RULES_POS=""
-					if [ $# -ge 2 ] && [ "$1" = "--at" ]; then
-						RULES_POS="$2"; shift 2
-					fi
-					;;
-				del)
-					if [ $# -lt 2 ]; then
-						echo "Error: rules del requires INDEX."
-						exit 1
-					fi
-					RULES_ARG="$2"; shift 2
-					;;
-				list|set) shift ;;
-				*) echo "Error: unknown rules subcommand \"$RULES_CMD\"."; exit 1 ;;
-			esac
-			continue
+			RULES_MODE=1
+			shift
+			# Capture remaining args verbatim for cc-sandbox-rules. Pull
+			# --name <NAME> out so the shell can resolve the instance dir;
+			# everything else passes through to the Zig binary.
+			while [ $# -gt 0 ]; do
+				case "$1" in
+					--name)
+						if [ $# -lt 2 ]; then
+							echo "Error: --name requires a value."
+							exit 1
+						fi
+						INSTANCE_NAME="$2"; shift 2
+						;;
+					*)
+						RULES_ARGS+=("$1"); shift
+						;;
+				esac
+			done
+			break
 			;;
 	esac
 	shift
@@ -194,85 +185,16 @@ if [ "$LIST_INSTANCES" -eq 1 ]; then
 fi
 
 # -- Rules subcommand ----------------------------------------------
-if [ -n "$RULES_CMD" ]; then
+if [ "$RULES_MODE" -eq 1 ]; then
 	ACTIVE_CONFIG="$INSTANCE_CONFIG_DIR/config.json"
 	if [ ! -f "$ACTIVE_CONFIG" ]; then
 		echo "Error: no config found at $ACTIVE_CONFIG"
 		exit 1
 	fi
-
-	# Verify it's in rules mode
-	NETWORK_RAW=$(jq -c '.network // "full"' "$ACTIVE_CONFIG")
-	if [ "$NETWORK_RAW" = '"full"' ] || [ "$NETWORK_RAW" = '"none"' ]; then
-		echo "Error: instance is not in rules mode (network is $(echo "$NETWORK_RAW" | tr -d '"'))."
-		echo "Set network to rules mode first: edit $ACTIVE_CONFIG or reinit with --network rules."
-		exit 1
-	fi
-
-	case "$RULES_CMD" in
-		list)
-			jq -r '.network.rules | to_entries[] | "\(.key + 1): \(if .value.allow then "allow \(.value.allow)" elif .value.deny then "deny \(.value.deny)" else "unknown" end)\(if .value.comment then "  # \(.value.comment)" else "" end)"' "$ACTIVE_CONFIG"
-			;;
-		add)
-			if [ "$RULES_ACTION" != "allow" ] && [ "$RULES_ACTION" != "deny" ]; then
-				echo "Error: action must be \"allow\" or \"deny\"."
-				exit 1
-			fi
-			if [ -n "$RULES_POS" ]; then
-				idx=$((RULES_POS - 1))
-				jq --tab --arg action "$RULES_ACTION" --arg cidr "$RULES_ARG" --argjson idx "$idx" \
-					'.network.rules |= (.[0:$idx] + [{($action): $cidr}] + .[$idx:])' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
-					&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
-				echo "Added: $RULES_ACTION $RULES_ARG at position $RULES_POS"
-			else
-				jq --tab --arg action "$RULES_ACTION" --arg cidr "$RULES_ARG" \
-					'.network.rules += [{($action): $cidr}]' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
-					&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
-				echo "Added: $RULES_ACTION $RULES_ARG"
-			fi
-			;;
-		del)
-			idx=$((RULES_ARG - 1))
-			if [ "$idx" -lt 0 ]; then
-				echo "Error: index must be >= 1."
-				exit 1
-			fi
-			jq --tab --argjson idx "$idx" \
-				'.network.rules |= (.[0:$idx] + .[$idx+1:])' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
-				&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
-			echo "Deleted rule $RULES_ARG."
-			;;
-		set)
-			# Read rules from stdin, convert to JSON array
-			RULES_JSON="[]"
-			while IFS= read -r line; do
-				trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-				[ -z "$trimmed" ] && continue
-				[[ "$trimmed" == \#* ]] && continue
-				action=$(echo "$trimmed" | cut -d' ' -f1)
-				cidr=$(echo "$trimmed" | cut -d' ' -f2)
-				if [ "$action" != "allow" ] && [ "$action" != "deny" ]; then
-					echo "Error: invalid action \"$action\" in line: $trimmed"
-					exit 1
-				fi
-				RULES_JSON=$(echo "$RULES_JSON" | jq --arg a "$action" --arg c "$cidr" '. + [{($a): $c}]')
-			done
-			jq --tab --argjson rules "$RULES_JSON" '.network.rules = $rules' "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.tmp" \
-				&& mv "$ACTIVE_CONFIG.tmp" "$ACTIVE_CONFIG"
-			echo "Rules replaced."
-			;;
-	esac
-
-	# Regenerate runtime rules file and signal passt to reload
-	if [ "$RULES_CMD" != "list" ] && [ -f "$RUNTIME/passt.pid" ] && kill -0 "$(cat "$RUNTIME/passt.pid")" 2>/dev/null; then
-		jq -r '.network.rules[] |
-			if .allow then "allow \(.allow)"
-			elif .deny then "deny \(.deny)"
-			else empty end' "$ACTIVE_CONFIG" > "$RUNTIME/netfilter-rules"
-		kill -USR1 "$(cat "$RUNTIME/passt.pid")"
-		echo "Rules reloaded."
-	fi
-	exit 0
+	exec @rules@ \
+		--config "$ACTIVE_CONFIG" \
+		--runtime "$RUNTIME" \
+		"${RULES_ARGS[@]}"
 fi
 
 # -- Auto-port assignment -----------------------------------------

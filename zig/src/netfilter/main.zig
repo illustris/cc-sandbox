@@ -1,5 +1,5 @@
 const std = @import("std");
-const filter = @import("filter.zig");
+const filter = @import("filter");
 
 const c = @cImport({
 	@cDefine("_GNU_SOURCE", "1");
