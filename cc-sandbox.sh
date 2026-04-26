@@ -41,7 +41,7 @@ Options:
   --help           Show this help message
 
 Per-instance customization:
-  Each instance has a flake.nix at ~/.config/cc-sandbox/instances/<name>/.
+  Each instance has a flake.nix at ~/.config/cc-sandbox/instances/<name>/flake/.
   Edit it to add packages or NixOS modules; the next launch rebuilds the
   microvm with your changes. cc-sandbox always overrides the user flake's
   "nixpkgs" input to its own; declare a separate input (e.g. "nixpkgs-custom")
@@ -168,6 +168,9 @@ BASE_RUNTIME="@runtimeDir@"
 
 EFFECTIVE_NAME="${INSTANCE_NAME:-default}"
 INSTANCE_CONFIG_DIR="$CONFIG_DIR/instances/$EFFECTIVE_NAME"
+# The flake lives in its own subdir so unrelated edits to config.json /
+# authorized_keys don't bust the userExtensions flake's source hash.
+INSTANCE_FLAKE_DIR="$INSTANCE_CONFIG_DIR/flake"
 REAL_DATA="$BASE_DATA/instances/$EFFECTIVE_NAME"
 if [ -n "$INSTANCE_NAME" ]; then
 	RUNTIME="${BASE_RUNTIME}-${INSTANCE_NAME}"
@@ -197,6 +200,34 @@ if [ -z "$INSTANCE_NAME" ]; then
 			echo "  mv '$BASE_DATA/claude-overlay.img' '$REAL_DATA/'"
 			echo "  [ -d '$BASE_DATA/.config' ] && mv '$BASE_DATA/.config' '$REAL_DATA/'"
 		fi
+		exit 1
+	fi
+fi
+
+# Detect pre-fix layouts where the per-instance flake.nix lived directly in
+# the instance config dir. Sharing that dir with config.json meant any edit
+# to config.json re-keyed the userExtensions flake input and busted the
+# eval cache; the flake now lives in a "flake/" subdir.
+if [ -d "$CONFIG_DIR/instances" ]; then
+	OLD_FLAKES=()
+	for dir in "$CONFIG_DIR/instances"/*/; do
+		[ -d "$dir" ] || continue
+		if [ -f "$dir/flake.nix" ] && [ ! -f "$dir/flake/flake.nix" ]; then
+			OLD_FLAKES+=("${dir%/}")
+		fi
+	done
+	if [ "${#OLD_FLAKES[@]}" -gt 0 ]; then
+		echo "Error: cc-sandbox flake layout changed. The per-instance flake now lives at:"
+		echo "  <instance>/flake/flake.nix  (was: <instance>/flake.nix)"
+		echo "Migrate with:"
+		for d in "${OLD_FLAKES[@]}"; do
+			echo "  mkdir -p '$d/flake'"
+			if [ -f "$d/flake.lock" ]; then
+				echo "  mv '$d/flake.nix' '$d/flake.lock' '$d/flake/'"
+			else
+				echo "  mv '$d/flake.nix' '$d/flake/'"
+			fi
+		done
 		exit 1
 	fi
 fi
@@ -283,8 +314,8 @@ if [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
 		ITEMS+=("$INSTANCE_CONFIG_DIR/config.json  (instance \"$INSTANCE_NAME\" settings)")
 	fi
 fi
-if [ ! -f "$INSTANCE_CONFIG_DIR/flake.nix" ]; then
-	ITEMS+=("$INSTANCE_CONFIG_DIR/flake.nix  (per-instance NixOS extensions, no-op default)")
+if [ ! -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
+	ITEMS+=("$INSTANCE_FLAKE_DIR/flake.nix  (per-instance NixOS extensions, no-op default)")
 fi
 if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then
 	ITEMS+=("$CONFIG_DIR/authorized_keys  (SSH public keys, empty)")
@@ -311,7 +342,7 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		exit 1
 	fi
 
-	mkdir -p "$INSTANCE_CONFIG_DIR" "$REAL_DATA" "$REAL_CLAUDE_CONFIG"
+	mkdir -p "$INSTANCE_CONFIG_DIR" "$INSTANCE_FLAKE_DIR" "$REAL_DATA" "$REAL_CLAUDE_CONFIG"
 
 	INIT_VCPU="${FLAG_VCPU:-16}"
 	INIT_MEM="${FLAG_MEM:-32768}"
@@ -371,8 +402,8 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		[ -n "$INSTANCE_NAME" ] && echo "Instance \"$INSTANCE_NAME\" ports: SSH=$INIT_SSH HTTP=$INIT_HTTP"
 	fi
 
-	if [ ! -f "$INSTANCE_CONFIG_DIR/flake.nix" ]; then
-		printf '%s' "$SCAFFOLD_FLAKE" > "$INSTANCE_CONFIG_DIR/flake.nix"
+	if [ ! -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
+		printf '%s' "$SCAFFOLD_FLAKE" > "$INSTANCE_FLAKE_DIR/flake.nix"
 	fi
 
 	if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then
@@ -398,7 +429,7 @@ fi
 # The user flake's "nixpkgs" input is forced to follow cc-sandbox's
 # nixpkgs by default; users can declare a separate input
 # (e.g. nixpkgs-custom) for an independent nixpkgs.
-if [ -z "${CC_SANDBOX_REEXECED:-}" ] && [ -f "$INSTANCE_CONFIG_DIR/flake.nix" ]; then
+if [ -z "${CC_SANDBOX_REEXECED:-}" ] && [ -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
 	# Skip re-exec when the user hasn't edited flake.nix from the scaffold.
 	# The scaffold's nixosModules.default is empty, so the microvm closure
 	# would be identical to the baked-in one anyway -- and re-evaluating
@@ -408,11 +439,11 @@ if [ -z "${CC_SANDBOX_REEXECED:-}" ] && [ -f "$INSTANCE_CONFIG_DIR/flake.nix" ];
 	# the re-eval (and need network on first launch to populate the cache).
 	# `cmp` is byte-exact and avoids the trailing-newline trim that command
 	# substitution does.
-	if ! printf '%s' "$SCAFFOLD_FLAKE" | cmp -s - "$INSTANCE_CONFIG_DIR/flake.nix"; then
+	if ! printf '%s' "$SCAFFOLD_FLAKE" | cmp -s - "$INSTANCE_FLAKE_DIR/flake.nix"; then
 		exec env CC_SANDBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
 			run "path:@flakeSource@" \
-			--override-input userExtensions "path:$INSTANCE_CONFIG_DIR" \
+			--override-input userExtensions "path:$INSTANCE_FLAKE_DIR" \
 			--override-input userExtensions/nixpkgs "path:@nixpkgsSource@" \
 			-- "${ORIG_ARGS[@]}"
 	fi

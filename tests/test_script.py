@@ -161,7 +161,7 @@ with subtest("Phase D: --network rules with dynamic reload"):
     stop_instance("cc-work", name="work")
 
 with subtest("Phase E: per-instance flake adds package + nix DB registers it"):
-    flake_path = "/home/testuser/.config/cc-sandbox/instances/default/flake.nix"
+    flake_path = "/home/testuser/.config/cc-sandbox/instances/default/flake/flake.nix"
 
     # Earlier phases left a scaffolded no-op flake.nix; confirm and rewrite
     # to a flake that adds pkgs.hello via both systemPackages and

@@ -248,14 +248,17 @@ reserved name `default`, so the config layout mirrors the data layout:
   instances/
     default/
       config.json              # default instance settings (sshPort 2222)
-      flake.nix                # per-instance NixOS extensions (no-op default)
+      flake/
+        flake.nix              # per-instance NixOS extensions (no-op default)
     work/
       config.json              # auto-generated with unique ports
-      flake.nix                # extend NixOS config for this instance
+      flake/
+        flake.nix              # extend NixOS config for this instance
       authorized_keys          # optional per-instance SSH keys
     personal/
       config.json
-      flake.nix
+      flake/
+        flake.nix
 ```
 
 Each instance config has the same format. SSH keys fall back to the
@@ -281,12 +284,15 @@ default guest:
 ### Per-instance NixOS extensions (flake.nix)
 
 Each instance owns a tiny flake at
-`~/.config/cc-sandbox/instances/<name>/flake.nix`. When that file differs
-from the scaffolded default, the wrapper re-execs itself via `nix run
---override-input userExtensions path:<instance-config-dir>`, so whatever
-NixOS module the user puts in that flake is folded into the microvm
-closure. An unedited scaffold matches byte-for-byte and the re-exec is
-skipped, so a default install boots without any extra `nix` evaluation.
+`~/.config/cc-sandbox/instances/<name>/flake/flake.nix`. When that file
+differs from the scaffolded default, the wrapper re-execs itself via `nix
+run --override-input userExtensions path:<instance-config-dir>/flake`, so
+whatever NixOS module the user puts in that flake is folded into the
+microvm closure. An unedited scaffold matches byte-for-byte and the
+re-exec is skipped, so a default install boots without any extra `nix`
+evaluation. The flake lives in its own subdirectory so unrelated edits to
+sibling files (`config.json`, `authorized_keys`) don't bust the flake's
+source hash.
 
 The scaffold written on first init exposes a no-op `nixosModules.default`:
 
@@ -316,7 +322,7 @@ the system closure instead, so it's registered in the guest's nix DB at
 boot and resolves locally:
 
 ```nix
-# ~/.config/cc-sandbox/instances/hbase/flake.nix
+# ~/.config/cc-sandbox/instances/hbase/flake/flake.nix
 {
     outputs = { self }: {
         nixosModules.default = { pkgs, ... }: {
@@ -339,7 +345,8 @@ the flake.
 #### Notes
 
 - The first time `nix run` evaluates a per-instance `path:` flake, it
-  writes a `flake.lock` next to the user's `flake.nix`. This is normal.
+  writes a `flake.lock` next to the user's `flake.nix` (inside the
+  `flake/` subdir). This is normal.
 - The mechanism re-execs once per launch (guarded internally so the loop
   ends after one hop). `--list` and `rules` subcommands skip the re-exec,
   as does any unedited scaffold.
