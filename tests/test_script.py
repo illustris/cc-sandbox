@@ -81,14 +81,19 @@ with subtest("Phase A: CLI / state without booting"):
     out = machine.succeed(as_user("cc-sandbox --list"))
     assert "(default)" in out and "work" in out, out
 
-    # A5: rules add / list / del on the work instance
-    machine.succeed(as_user("cc-sandbox rules add allow 10.99.0.1/32 --name work"))
-    machine.succeed(as_user("cc-sandbox rules add deny 0.0.0.0/0 --name work"))
+    # A5: rules add / list / del on the work instance.
+    # Use --at to land the new rules at known positions; otherwise they
+    # append after the seeded bogon-deny ruleset and del 1 would remove
+    # a seeded rule instead of the test rule. Use 8.8.8.8/32 instead of
+    # 0.0.0.0/0 for the second rule so its substring check doesn't
+    # collide with the seeded `allow 0.0.0.0/0`.
+    machine.succeed(as_user("cc-sandbox rules add allow 10.99.0.1/32 --at 1 --name work"))
+    machine.succeed(as_user("cc-sandbox rules add deny 8.8.8.8/32 --at 2 --name work"))
     out = machine.succeed(as_user("cc-sandbox rules list --name work"))
-    assert "10.99.0.1/32" in out and "0.0.0.0/0" in out, out
+    assert "10.99.0.1/32" in out and "8.8.8.8/32" in out, out
     machine.succeed(as_user("cc-sandbox rules del 1 --name work"))
     out = machine.succeed(as_user("cc-sandbox rules list --name work"))
-    assert "10.99.0.1/32" not in out and "0.0.0.0/0" in out, out
+    assert "10.99.0.1/32" not in out and "8.8.8.8/32" in out, out
 
     # A6: rules add fails on a non-rules instance (default is network=none)
     machine.fail(as_user("cc-sandbox rules add allow 1.1.1.1/32"))
@@ -125,7 +130,9 @@ with subtest("Phase C: --network full allows outbound"):
     stop_instance("cc-default")
 
 with subtest("Phase D: --network rules with dynamic reload"):
-    # work instance currently has [deny 0.0.0.0/0]; prepend the .1 allow.
+    # work instance carries the seeded bogon-deny ruleset; 10.99.0.0/8
+    # falls inside `deny 10.0.0.0/8`, so we need an explicit allow at the
+    # front for 10.99.0.1/32 to be reachable.
     machine.succeed(as_user("cc-sandbox rules add allow 10.99.0.1/32 --at 1 --name work"))
     boot_and_wait("cc-work", "--name work", ssh_port=2223)
 
