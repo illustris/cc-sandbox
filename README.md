@@ -32,7 +32,7 @@ Run multiple isolated VMs simultaneously, like Wine prefixes. Each named
 instance gets its own data directory, overlay image, and network ports.
 
 ```sh
-# Default instance (unchanged behavior)
+# Default instance
 nix run github:illustris/cc-sandbox
 
 # Create and start a named instance
@@ -73,7 +73,7 @@ that run only.
 | Subcommand | Description |
 |---|---|
 | `rules list [--name NAME]` | List current rules with 1-based indices |
-| `rules add allow\|deny CIDR [--at N] [--name NAME]` | Add a rule (append, or insert at position N) |
+| `rules add allow\|deny CIDR [--at N] [--name NAME]` | Add a rule. Appends by default; `--at N` inserts at 1-based position N. See ["How rules are evaluated and edited"](#how-rules-are-evaluated-and-edited) for why position matters. |
 | `rules del INDEX [--name NAME]` | Delete a rule by index |
 | `rules set [--name NAME]` | Replace all rules from stdin |
 
@@ -93,10 +93,10 @@ nix run github:illustris/cc-sandbox -- --name work --init-only
 # Launch with no outbound network
 nix run github:illustris/cc-sandbox -- --network none
 
-# Init with rules mode, then add rules
-nix run github:illustris/cc-sandbox -- --name secure --network rules --init-only
-cc-sandbox rules add deny 10.0.0.0/8 --name secure
-cc-sandbox rules add allow 0.0.0.0/0 --name secure
+# Init in rules mode (gets the seeded bogon-deny ruleset by default).
+# To allow a specific LAN host, insert an allow before the matching deny;
+# see the "rules" network mode section for the full pattern.
+nix run github:illustris/cc-sandbox -- --name secure --init-only
 ```
 
 ## Network modes
@@ -157,21 +157,39 @@ shown by `rules list` but ignored by the filter.
 }
 ```
 
-To poke a hole for a specific LAN host, insert a more-specific allow
-ahead of the matching deny:
+#### How rules are evaluated and edited
 
-```sh
-# Allow the NAS at 192.168.1.50 while keeping the rest of 192.168/16 denied
-cc-sandbox rules add allow 192.168.1.50/32 --at 8
-```
+Rules are evaluated top-to-bottom on every outbound packet; the first
+matching rule wins, and a packet that matches no rule is denied.
+**Position matters**: a rule only fires if no earlier rule matches the
+same address first.
 
-Rules can be managed dynamically (updates take effect immediately on
-running instances via SIGUSR1):
+The `rules add` command **appends by default** -- the new rule lands at
+the bottom of the list, after the seeded `allow 0.0.0.0/0` catch-all.
+That position is almost always wrong: the catch-all matches everything
+public, so an appended `deny` or `allow` for a public address is
+unreachable. Pass `--at N` to insert at 1-based position `N`, shifting
+existing rules down. To see current positions, run `rules list`.
+
+Two practical patterns:
+
+**Allow a specific LAN host** -- insert the allow ahead of the matching
+deny. Use `rules list` to find the right index for the deny:
 
 ```sh
 cc-sandbox rules list
+# ...
+# 8: deny 192.168.0.0/16  # RFC1918 private
+# ...
+cc-sandbox rules add allow 192.168.1.50/32 --at 8
+```
+
+**Block a specific public address** -- insert the deny ahead of the
+trailing `allow 0.0.0.0/0`. Easiest is `--at 1` so it runs before all
+existing rules:
+
+```sh
 cc-sandbox rules add deny 8.8.8.8/32 --at 1
-cc-sandbox rules del 1
 ```
 
 Implicit rules (applied before user rules, not configurable):
@@ -301,6 +319,14 @@ connections receive `ENETUNREACH`. The library initializes via
 completes before passt activates its seccomp-bpf sandbox. Rules can be
 hot-reloaded at runtime via `SIGUSR1` to the passt process.
 
+The `cc-sandbox rules` subcommands (`list`, `add`, `del`, `set`) are
+implemented by `cc-sandbox-rules`, a small Zig CLI shipped from the same
+project as the filter library. It edits `config.json`, regenerates the
+runtime rules file, and signals the running passt -- so rule changes
+take effect without restarting the VM. Both binaries share the on-disk
+rule format parser, so anything `cc-sandbox-rules` accepts the runtime
+filter accepts.
+
 ## Defaults
 
 | Resource | Value |
@@ -314,12 +340,17 @@ hot-reloaded at runtime via `SIGUSR1` to the passt process.
 | Network | rules (private/bogon denied, public allowed) |
 | Docker | enabled |
 
-Pre-installed tools: `claude-code`, `git`, `curl`, `jq`, `vim`, `ncdu`,
-`tmux`, `htop`, `bpftrace`, `nix-mcp`, `nixfs`.
+Pre-installed tools: `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`,
+`nixfs`. Architecture-conditional: `claude-code` and the `c` launcher
+(x86_64, aarch64), `bpftrace` (x86_64, aarch64), `nix-mcp` (where the
+`nix-mcp` flake publishes a build).
 
 ## Limitations
 
-- x86_64-linux only (QEMU with KVM)
+- Linux host with KVM. Build targets: `x86_64-linux`, `aarch64-linux`,
+  `riscv64-linux`. The pre-built `claude-code` and `c` launcher are
+  shipped only on `x86_64-linux` and `aarch64-linux`; on `riscv64-linux`
+  you'll need to install Claude Code manually inside the VM
 - One instance per name at a time (PID lock per runtime directory).
   Multiple differently-named instances can run simultaneously.
 - The writable nix store overlay is a tmpfs -- installed packages do not
