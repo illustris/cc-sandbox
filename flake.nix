@@ -22,6 +22,7 @@
 			inputs.nixpkgs.follows = "nixpkgs";
 			inputs.illustris-lib.follows = "illustris-lib";
 		};
+		userExtensions.url = "path:./userExtensions";
 	};
 
 	outputs = { self, nixpkgs, microvm, nix-mcp, ... }@inputs: let
@@ -90,11 +91,17 @@
 			] ++ extraModules;
 		};
 
-		ccSandboxModules = system: let
+		# `userExt` defaults to the no-op userExtensions input but can be
+		# overridden by tests to inject a known module in the same list
+		# position the runtime override-input would, so the resulting
+		# microvm runner has a deterministic .drvPath that matches what
+		# `nix run --override-input userExtensions ...` produces.
+		ccSandboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default }: let
 			hasClaude = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
 			inputs.nixfs.nixosModules.nixfs
+			userExt
 			({ pkgs, lib, ... }: let
 				claude-code-bin =
 					if hasClaude
@@ -251,6 +258,18 @@
 		packages = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
+			mkCcSandbox = runner': pkgs.writeShellApplication {
+				name = "cc-sandbox";
+				runtimeInputs = with pkgs; [ coreutils gnused gnugrep jq diffutils nix ] ++ [ self.packages.${system}.passt-cc ];
+				text = illustris-lib.replaceVarsInString {
+					runtimeDir = runtimeDir;
+					runner = "${runner'}";
+					netfilter = "${self.packages.${system}.cc-sandbox-tools}/lib/libnetfilter.so";
+					rules = "${self.packages.${system}.cc-sandbox-tools}/bin/cc-sandbox-rules";
+					flakeSource = "${self}";
+					nixpkgsSource = "${nixpkgs}";
+				} null (builtins.readFile ./cc-sandbox.sh);
+			};
 		in rec {
 			cc-sandbox-tools = pkgs.stdenv.mkDerivation {
 				pname = "cc-sandbox-tools";
@@ -278,17 +297,17 @@
 				# under passt's seccomp filter (needed for SIGUSR1 rule reload)
 				makeFlags = (old.makeFlags or []) ++ [ "EXTRA_SYSCALLS=rt_sigreturn" ];
 			});
-			cc-sandbox = pkgs.writeShellApplication {
-				name = "cc-sandbox";
-				runtimeInputs = with pkgs; [ coreutils gnused gnugrep jq ] ++ [ passt-cc ];
-				text = illustris-lib.replaceVarsInString {
-					runtimeDir = runtimeDir;
-					runner = "${runner}";
-					netfilter = "${cc-sandbox-tools}/lib/libnetfilter.so";
-					rules = "${cc-sandbox-tools}/bin/cc-sandbox-rules";
-				} null (builtins.readFile ./cc-sandbox.sh);
-			};
+			cc-sandbox = mkCcSandbox runner;
 			default = cc-sandbox;
+		} // lib.optionalAttrs (system == "x86_64-linux") {
+			# Test fixture: a cc-sandbox wrapper baked against the
+			# pre-built test-hello runner. Used by tests/cc-sandbox.nix
+			# Phase E to make the offline NixOS test machine's
+			# `nix run --override-input userExtensions ...` resolve as a
+			# cache hit instead of building the transitive .drv graph
+			# (which would fail with no network).
+			cc-sandbox-test-hello = mkCcSandbox
+				self.nixosConfigurations.cc-sandbox-x86_64-test-hello.config.microvm.declaredRunner;
 		});
 
 		checks = forAllSystems (system: let
@@ -324,8 +343,27 @@
 			value = mkMicrovm system "cc-sandbox" {
 				vcpu = 16;
 				mem = 32768;
-				extraModules = ccSandboxModules system;
+				extraModules = ccSandboxModules system {};
 			};
-		}) supportedSystems);
+		}) supportedSystems) // {
+			# Test fixture used by tests/cc-sandbox.nix Phase E. Pre-builds
+			# a runner whose closure includes pkgs.hello, so the offline
+			# NixOS test machine has the cached output of the
+			# user-customised runner that Phase E reconstructs at runtime
+			# via `nix run --override-input userExtensions ...`. The
+			# `userExt` parameter inserts the hello-adding module in the
+			# same list position userExtensions normally occupies, so the
+			# resulting .drvPath is byte-identical to the runtime path.
+			cc-sandbox-x86_64-test-hello = mkMicrovm "x86_64-linux" "cc-sandbox" {
+				vcpu = 16;
+				mem = 32768;
+				extraModules = ccSandboxModules "x86_64-linux" {
+					userExt = { pkgs, ... }: {
+						environment.systemPackages = [ pkgs.hello ];
+						system.extraDependencies = [ pkgs.hello ];
+					};
+				};
+			};
+		};
 	};
 }

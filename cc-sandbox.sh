@@ -1,3 +1,29 @@
+ORIG_ARGS=("$@")
+
+# Scaffold written into each instance's config dir on first init. Also used
+# by the re-exec check below: if the user hasn't edited flake.nix, the
+# resulting microvm closure is identical to the baked-in default and we can
+# skip the (network-dependent) `nix run` re-eval entirely.
+# shellcheck disable=SC2016
+SCAFFOLD_FLAKE='{
+	description = "cc-sandbox per-instance extensions";
+
+	# `pkgs` in nixosModules.default below comes from cc-sandbox'\''s nixpkgs.
+	# To use a different nixpkgs, add an input here (e.g.
+	# inputs.nixpkgs-custom.url = "...";) and reference it explicitly.
+	# cc-sandbox always overrides any "nixpkgs" input you declare to its
+	# own, so use a different name (like nixpkgs-custom) to escape that.
+
+	outputs = { self }: {
+		nixosModules.default = { pkgs, lib, ... }: {
+			# Add per-instance packages and modules here. Examples:
+			#   environment.systemPackages = with pkgs; [ hbase openjdk21 ];
+			#   system.extraDependencies  = with pkgs; [ hbase openjdk21 ];
+		};
+	};
+}
+'
+
 usage() {
 	cat <<'EOF'
 Usage: cc-sandbox [OPTIONS]
@@ -13,6 +39,13 @@ Options:
   --init-only      Run all setup steps but do not start the VM
   --list           List all instances with their ports and status
   --help           Show this help message
+
+Per-instance customization:
+  Each instance has a flake.nix at ~/.config/cc-sandbox/instances/<name>/.
+  Edit it to add packages or NixOS modules; the next launch rebuilds the
+  microvm with your changes. cc-sandbox always overrides the user flake's
+  "nixpkgs" input to its own; declare a separate input (e.g. "nixpkgs-custom")
+  for a different nixpkgs.
 
 Network modes:
   "full"           Unrestricted networking
@@ -250,6 +283,9 @@ if [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
 		ITEMS+=("$INSTANCE_CONFIG_DIR/config.json  (instance \"$INSTANCE_NAME\" settings)")
 	fi
 fi
+if [ ! -f "$INSTANCE_CONFIG_DIR/flake.nix" ]; then
+	ITEMS+=("$INSTANCE_CONFIG_DIR/flake.nix  (per-instance NixOS extensions, no-op default)")
+fi
 if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then
 	ITEMS+=("$CONFIG_DIR/authorized_keys  (SSH public keys, empty)")
 fi
@@ -335,6 +371,10 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		[ -n "$INSTANCE_NAME" ] && echo "Instance \"$INSTANCE_NAME\" ports: SSH=$INIT_SSH HTTP=$INIT_HTTP"
 	fi
 
+	if [ ! -f "$INSTANCE_CONFIG_DIR/flake.nix" ]; then
+		printf '%s' "$SCAFFOLD_FLAKE" > "$INSTANCE_CONFIG_DIR/flake.nix"
+	fi
+
 	if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then
 		touch "$CONFIG_DIR/authorized_keys"
 	fi
@@ -348,6 +388,34 @@ fi
 if [ -n "${SUDO_USER:-}" ]; then
 	chown -R "$REAL_USER" "$CONFIG_DIR" "$REAL_DATA" "$REAL_CLAUDE_CONFIG"
 	chown "$REAL_USER" "$REAL_CLAUDE_AUTH"
+fi
+
+# -- Re-exec with per-instance flake overlaid ---------------------
+# Each instance owns a flake.nix that exposes nixosModules.default.
+# We re-evaluate cc-sandbox with that flake patched in via
+# --override-input, so the rebuilt microvm runner includes the user's
+# modules. CC_SANDBOX_REEXECED breaks the loop after the first hop.
+# The user flake's "nixpkgs" input is forced to follow cc-sandbox's
+# nixpkgs by default; users can declare a separate input
+# (e.g. nixpkgs-custom) for an independent nixpkgs.
+if [ -z "${CC_SANDBOX_REEXECED:-}" ] && [ -f "$INSTANCE_CONFIG_DIR/flake.nix" ]; then
+	# Skip re-exec when the user hasn't edited flake.nix from the scaffold.
+	# The scaffold's nixosModules.default is empty, so the microvm closure
+	# would be identical to the baked-in one anyway -- and re-evaluating
+	# the cc-sandbox flake requires its inputs to be fetchable, which a
+	# fresh "nix profile install" or NixOS-systemPackages setup may not have
+	# locally cached. Users who actually customize their flake.nix opt into
+	# the re-eval (and need network on first launch to populate the cache).
+	# `cmp` is byte-exact and avoids the trailing-newline trim that command
+	# substitution does.
+	if ! printf '%s' "$SCAFFOLD_FLAKE" | cmp -s - "$INSTANCE_CONFIG_DIR/flake.nix"; then
+		exec env CC_SANDBOX_REEXECED=1 nix \
+			--extra-experimental-features "nix-command flakes" \
+			run "path:@flakeSource@" \
+			--override-input userExtensions "path:$INSTANCE_CONFIG_DIR" \
+			--override-input userExtensions/nixpkgs "path:@nixpkgsSource@" \
+			-- "${ORIG_ARGS[@]}"
+	fi
 fi
 
 # -- Validate and read runtime config -----------------------------

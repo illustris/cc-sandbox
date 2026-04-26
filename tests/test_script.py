@@ -159,3 +159,52 @@ with subtest("Phase D: --network rules with dynamic reload"):
     machine.succeed(probe(2223, "10.99.0.2"))
 
     stop_instance("cc-work", name="work")
+
+with subtest("Phase E: per-instance flake adds package + nix DB registers it"):
+    flake_path = "/home/testuser/.config/cc-sandbox/instances/default/flake.nix"
+
+    # Earlier phases left a scaffolded no-op flake.nix; confirm and rewrite
+    # to a flake that adds pkgs.hello via both systemPackages and
+    # extraDependencies. No `inputs.nixpkgs` so `pkgs` flows in from the
+    # surrounding NixOS evaluation (cc-sandbox's nixpkgs).
+    machine.succeed(f"test -f {flake_path}")
+    machine.succeed(as_user("""cat > """ + flake_path + """ <<'NIX_EOF'
+{
+    description = "test-ext-hello";
+    outputs = { self }: {
+        nixosModules.default = { pkgs, ... }: {
+            environment.systemPackages = [ pkgs.hello ];
+            system.extraDependencies = [ pkgs.hello ];
+        };
+    };
+}
+NIX_EOF"""))
+
+    # Boot default (still in --network full from Phase C). The wrapper
+    # detects the edited flake.nix, re-execs via nix run with the override,
+    # rebuilds the microvm runner with hello in the closure.
+    boot_and_wait("cc-default", "", ssh_port=2222)
+    hello_path = machine.succeed(
+        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 'readlink -f $(command -v hello)'")
+    ).strip()
+    assert hello_path.startswith("/nix/store/") and "hello-" in hello_path, hello_path
+    # nix-store --check-validity succeeds only if the path is in the guest's
+    # /nix/var/nix/db -- proving it's a registered store object, not just
+    # a file dropped in via the 9p ro-store share.
+    machine.succeed(
+        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 'nix-store --check-validity {hello_path}'")
+    )
+    stop_instance("cc-default")
+
+    # Revert to the byte-exact scaffold so the next boot skips re-exec
+    # again (the wrapper compares the on-disk flake.nix to its built-in
+    # scaffold and skips the re-eval when they match).
+    machine.succeed(f"rm {flake_path}")
+    # Re-running --init-only repopulates the scaffold without prompting
+    # since everything else exists.
+    machine.succeed(as_user("yes y | cc-sandbox --init-only --network full"))
+    boot_and_wait("cc-default", "", ssh_port=2222)
+    machine.fail(
+        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 'command -v hello'")
+    )
+    stop_instance("cc-default")

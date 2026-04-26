@@ -138,7 +138,8 @@
         "nix-mcp": "nix-mcp",
         "nixfs": "nixfs",
         "nixpkgs": "nixpkgs",
-        "nixpkgs-master": "nixpkgs-master"
+        "nixpkgs-master": "nixpkgs-master",
+        "userExtensions": "userExtensions"
       }
     },
     "spectrum": {
@@ -171,6 +172,17 @@
         "repo": "default",
         "type": "github"
       }
+    },
+    "userExtensions": {
+      "locked": {
+        "path": "./userExtensions",
+        "type": "path"
+      },
+      "original": {
+        "path": "./userExtensions",
+        "type": "path"
+      },
+      "parent": []
     }
   },
   "root": "root",
