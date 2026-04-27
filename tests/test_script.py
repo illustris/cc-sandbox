@@ -8,10 +8,10 @@ def as_user(cmd):
     return "su - testuser -c " + shlex.quote(cmd)
 
 
-def probe(ssh_port, ip):
+def probe(name, ip):
     remote = f"timeout 3 bash -c 'exec 3<>/dev/tcp/{ip}/9000'"
-    ssh_cmd = f"ssh {SSH_OPTS} -p {ssh_port} root@127.0.0.1 {shlex.quote(remote)}"
-    return as_user(ssh_cmd)
+    name_arg = f"--name {name} " if name else ""
+    return as_user(f"cc-sandbox ssh {name_arg}{shlex.quote(remote)}")
 
 
 def boot_and_wait(unit, args, ssh_port):
@@ -115,12 +115,10 @@ with subtest("Phase B: --network none blocks all outbound"):
     boot_and_wait("cc-default", "", ssh_port=2222)
     out = machine.succeed(as_user("cc-sandbox --list"))
     assert "(running)" in out, out
-    hostname = machine.succeed(
-        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 hostname")
-    ).strip()
+    hostname = machine.succeed(as_user("cc-sandbox ssh hostname")).strip()
     assert hostname == "cc-sandbox", f"unexpected inner hostname {hostname!r}"
-    machine.fail(probe(2222, "10.99.0.1"))
-    machine.fail(probe(2222, "10.99.0.2"))
+    machine.fail(probe(None, "10.99.0.1"))
+    machine.fail(probe(None, "10.99.0.2"))
     stop_instance("cc-default")
 
 with subtest("Phase C: --network full allows outbound"):
@@ -132,8 +130,8 @@ with subtest("Phase C: --network full allows outbound"):
         "/home/testuser/.config/cc-sandbox/authorized_keys"
     )
     boot_and_wait("cc-default", "", ssh_port=2222)
-    machine.succeed(probe(2222, "10.99.0.1"))
-    machine.succeed(probe(2222, "10.99.0.2"))
+    machine.succeed(probe(None, "10.99.0.1"))
+    machine.succeed(probe(None, "10.99.0.2"))
     stop_instance("cc-default")
 
 with subtest("Phase D: --network rules with dynamic reload"):
@@ -144,19 +142,19 @@ with subtest("Phase D: --network rules with dynamic reload"):
     boot_and_wait("cc-work", "--name work", ssh_port=2223)
 
     # Initial policy: .1 allowed, .2 denied
-    machine.succeed(probe(2223, "10.99.0.1"))
-    machine.fail(probe(2223, "10.99.0.2"))
+    machine.succeed(probe("work", "10.99.0.1"))
+    machine.fail(probe("work", "10.99.0.2"))
 
     # Dynamic add: insert allow 10.99.0.2/32 BEFORE the catch-all deny
     out = machine.succeed(as_user("cc-sandbox rules add allow 10.99.0.2/32 --at 2 --name work"))
     assert "Rules reloaded" in out, out
-    machine.succeed(probe(2223, "10.99.0.2"))
+    machine.succeed(probe("work", "10.99.0.2"))
 
     # Dynamic delete: drop the .1 allow at position 1
     out = machine.succeed(as_user("cc-sandbox rules del 1 --name work"))
     assert "Rules reloaded" in out, out
-    machine.fail(probe(2223, "10.99.0.1"))
-    machine.succeed(probe(2223, "10.99.0.2"))
+    machine.fail(probe("work", "10.99.0.1"))
+    machine.succeed(probe("work", "10.99.0.2"))
 
     stop_instance("cc-work", name="work")
 
@@ -185,14 +183,14 @@ NIX_EOF"""))
     # rebuilds the microvm runner with hello in the closure.
     boot_and_wait("cc-default", "", ssh_port=2222)
     hello_path = machine.succeed(
-        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 'readlink -f $(command -v hello)'")
+        as_user("cc-sandbox ssh 'readlink -f $(command -v hello)'")
     ).strip()
     assert hello_path.startswith("/nix/store/") and "hello-" in hello_path, hello_path
     # nix-store --check-validity succeeds only if the path is in the guest's
     # /nix/var/nix/db -- proving it's a registered store object, not just
     # a file dropped in via the 9p ro-store share.
     machine.succeed(
-        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 'nix-store --check-validity {hello_path}'")
+        as_user(f"cc-sandbox ssh 'nix-store --check-validity {hello_path}'")
     )
     stop_instance("cc-default")
 
@@ -205,6 +203,6 @@ NIX_EOF"""))
     machine.succeed(as_user("yes y | cc-sandbox --init-only --network full"))
     boot_and_wait("cc-default", "", ssh_port=2222)
     machine.fail(
-        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 'command -v hello'")
+        as_user("cc-sandbox ssh 'command -v hello'")
     )
     stop_instance("cc-default")

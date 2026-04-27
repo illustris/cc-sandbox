@@ -28,6 +28,7 @@ usage() {
 	cat <<'EOF'
 Usage: cc-sandbox [OPTIONS]
        cc-sandbox rules COMMAND [--name NAME]
+       cc-sandbox ssh [--name NAME] [REMOTE_COMMAND...]
 
 Run Claude Code in an isolated QEMU microvm.
 
@@ -63,6 +64,13 @@ Rules subcommands:
   rules del INDEX                     Delete a rule by index (1-based)
   rules set                           Replace all rules from stdin
 
+Ssh subcommand:
+  ssh [--name NAME] [REMOTE_COMMAND...]
+                   Connect to the running instance over SSH. Resolves the
+                   live port/host from the runtime directory, so it works
+                   without remembering auto-assigned ports. Disables host
+                   key checking since the guest's root disk is ephemeral.
+
 Environment variables:
   CC_SANDBOX_DATA           Persistent data root (default: ~/.local/share/cc-sandbox).
                             Each instance lives at $CC_SANDBOX_DATA/instances/<name>;
@@ -78,6 +86,8 @@ Examples:
   cc-sandbox --network full           Override default rules mode for unrestricted net
   cc-sandbox rules add allow 10.0.0.0/8 --name work
   cc-sandbox rules list --name work
+  cc-sandbox ssh                      SSH into the default instance
+  cc-sandbox ssh --name work htop     Run htop on the "work" instance
   cc-sandbox --list                   Show all instances
   cc-sandbox --init-only              Set up without booting
 EOF
@@ -92,6 +102,8 @@ INSTANCE_NAME=""
 LIST_INSTANCES=0
 RULES_MODE=0
 RULES_ARGS=()
+SSH_MODE=0
+SSH_ARGS=()
 AUTO_KEYS=1
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -126,6 +138,28 @@ while [ $# -gt 0 ]; do
 						;;
 					*)
 						RULES_ARGS+=("$1"); shift
+						;;
+				esac
+			done
+			break
+			;;
+		ssh)
+			SSH_MODE=1
+			shift
+			# Capture remaining args verbatim as the ssh remote command.
+			# Pull --name <NAME> out so the shell can resolve the runtime
+			# dir; everything else is appended to the ssh invocation.
+			while [ $# -gt 0 ]; do
+				case "$1" in
+					--name)
+						if [ $# -lt 2 ]; then
+							echo "Error: --name requires a value."
+							exit 1
+						fi
+						INSTANCE_NAME="$2"; shift 2
+						;;
+					*)
+						SSH_ARGS+=("$1"); shift
 						;;
 				esac
 			done
@@ -285,6 +319,35 @@ if [ "$RULES_MODE" -eq 1 ]; then
 		--config "$ACTIVE_CONFIG" \
 		--runtime "$RUNTIME" \
 		"${RULES_ARGS[@]}"
+fi
+
+# -- SSH subcommand ------------------------------------------------
+# Read the live port/host from the runtime dir written by the launch
+# path below. Reading config.json instead would risk connecting on a
+# stale port if the user edited it after boot. The VM's root disk is
+# ephemeral, so its host keys regenerate on every reboot -- pin
+# UserKnownHostsFile=/dev/null and disable strict checking to skip the
+# spurious MITM warning. LogLevel=ERROR suppresses the "Permanently
+# added ..." chatter that would otherwise accompany every connection.
+if [ "$SSH_MODE" -eq 1 ]; then
+	if [ ! -f "$RUNTIME/pid" ] || ! kill -0 "$(cat "$RUNTIME/pid")" 2>/dev/null; then
+		echo "Error: instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is not running."
+		echo "Start it first with: cc-sandbox${INSTANCE_NAME:+ --name $INSTANCE_NAME}"
+		exit 1
+	fi
+	if [ ! -f "$RUNTIME/ssh-endpoint" ]; then
+		echo "Error: missing $RUNTIME/ssh-endpoint (instance launched by an older cc-sandbox?)."
+		echo "Restart the instance to repopulate it."
+		exit 1
+	fi
+	read -r SSH_PORT BIND_ADDR < "$RUNTIME/ssh-endpoint"
+	exec ssh \
+		-o StrictHostKeyChecking=no \
+		-o UserKnownHostsFile=/dev/null \
+		-o LogLevel=ERROR \
+		-p "$SSH_PORT" \
+		"root@$BIND_ADDR" \
+		"${SSH_ARGS[@]}"
 fi
 
 # -- Auto-port assignment -----------------------------------------
@@ -522,6 +585,10 @@ if [ -e "$RUNTIME" ]; then
 fi
 mkdir -p "$RUNTIME"
 echo "$$" > "$RUNTIME/pid"
+# Snapshot the active SSH endpoint for the `ssh` subcommand to read.
+# Bound to runtime, not config, so post-boot edits to config.json don't
+# misdirect connections to a port the VM isn't listening on.
+echo "$SSH_PORT $BIND_ADDR" > "$RUNTIME/ssh-endpoint"
 PASST_PID=""
 trap 'kill "$PASST_PID" 2>/dev/null || true; rm -rf "'"$RUNTIME"'"' EXIT
 

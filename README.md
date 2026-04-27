@@ -81,6 +81,12 @@ that run only.
 If the instance is running, rule changes take effect immediately (the
 runtime rules file is regenerated and passt receives `SIGUSR1` to reload).
 
+### Ssh subcommand
+
+| Subcommand | Description |
+|---|---|
+| `ssh [--name NAME] [REMOTE_COMMAND...]` | Connect to the running instance over SSH. Resolves the live port and bind address from the runtime directory, so it works without remembering auto-assigned ports. Disables host key checking since the guest's root disk is ephemeral and host keys regenerate on every boot. |
+
 ```sh
 # Prepare runtime directory without booting
 nix run github:illustris/cc-sandbox -- --init-only
@@ -367,6 +373,13 @@ instance's data dir, where the VM reads it at boot.
 ```sh
 # Add another key after init
 cp ~/.ssh/id_ed25519.pub ~/.config/cc-sandbox/authorized_keys
+
+# Connect via the ssh subcommand (resolves port/host automatically)
+cc-sandbox ssh                          # default instance
+cc-sandbox ssh --name work              # named instance
+cc-sandbox ssh --name work htop         # one-off remote command
+
+# Or use ssh directly if you prefer
 ssh -p 2222 root@localhost
 ```
 
