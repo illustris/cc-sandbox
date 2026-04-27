@@ -71,10 +71,15 @@ Ssh subcommand:
                    without remembering auto-assigned ports. Disables host
                    key checking since the guest's root disk is ephemeral.
 
+Paths (XDG basedir spec):
+  Config:  $XDG_CONFIG_HOME/cc-sandbox        (default: ~/.config/cc-sandbox)
+  Data:    $XDG_DATA_HOME/cc-sandbox          (default: ~/.local/share/cc-sandbox)
+  Runtime: $XDG_RUNTIME_DIR/cc-sandbox        (default: /run/user/$UID/cc-sandbox)
+
 Environment variables:
-  CC_SANDBOX_DATA           Persistent data root (default: ~/.local/share/cc-sandbox).
-                            Each instance lives at $CC_SANDBOX_DATA/instances/<name>;
-                            the default instance uses the reserved name "default".
+  CC_SANDBOX_DATA           Override the data root. Each instance lives at
+                            $CC_SANDBOX_DATA/instances/<name>; the default
+                            instance uses the reserved name "default".
   CC_SANDBOX_CLAUDE_CONFIG  Host Claude config dir (default: ~/.claude)
   CC_SANDBOX_CLAUDE_AUTH    Auth token file (default: ~/.claude.json)
 
@@ -192,17 +197,39 @@ fi
 if [ -n "${SUDO_USER:-}" ]; then
 	REAL_USER="$SUDO_USER"
 	REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+	REAL_UID=$(getent passwd "$SUDO_USER" | cut -d: -f3)
 else
 	REAL_USER="$(id -un)"
 	REAL_HOME="$HOME"
+	REAL_UID="$(id -u)"
 fi
 
-# -- Paths ---------------------------------------------------------
+# -- Paths (XDG basedir spec) --------------------------------------
 CONFIG_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cc-sandbox"
-BASE_DATA="${CC_SANDBOX_DATA:-$REAL_HOME/.local/share/cc-sandbox}"
+BASE_DATA="${CC_SANDBOX_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cc-sandbox}"
 REAL_CLAUDE_CONFIG="${CC_SANDBOX_CLAUDE_CONFIG:-$REAL_HOME/.claude}"
 REAL_CLAUDE_AUTH="${CC_SANDBOX_CLAUDE_AUTH:-$REAL_HOME/.claude.json}"
-BASE_RUNTIME="@runtimeDir@"
+
+# Microvm runner has runtime paths baked in at flake build time using this
+# sentinel; the sed substitution below rewrites them to BASE_RUNTIME.
+RUNTIME_TEMPLATE="@runtimeDir@"
+
+# Per-user runtime dir per the XDG basedir spec. Under sudo, XDG_RUNTIME_DIR
+# typically points at root's tree (or is unset); use the invoking user's
+# /run/user/$UID instead. If that doesn't exist (no active logind session),
+# fall back to /tmp/cc-sandbox-runtime-$UID per the spec's "replacement
+# directory with similar capabilities" guidance.
+if [ -n "${SUDO_USER:-}" ] || [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+	XDG_RUNTIME_BASE="/run/user/$REAL_UID"
+else
+	XDG_RUNTIME_BASE="$XDG_RUNTIME_DIR"
+fi
+if [ ! -d "$XDG_RUNTIME_BASE" ]; then
+	XDG_RUNTIME_BASE="/tmp/cc-sandbox-runtime-$REAL_UID"
+	mkdir -p "$XDG_RUNTIME_BASE"
+	chmod 700 "$XDG_RUNTIME_BASE"
+fi
+BASE_RUNTIME="$XDG_RUNTIME_BASE/cc-sandbox"
 
 EFFECTIVE_NAME="${INSTANCE_NAME:-default}"
 INSTANCE_CONFIG_DIR="$CONFIG_DIR/instances/$EFFECTIVE_NAME"
@@ -610,7 +637,7 @@ SED_ARGS=(
 	-e "s/( )-smp [0-9]+/\1-smp $VCPU/"
 	-e "s/( )-m [0-9]+/\1-m $MEM/"
 	-e "s/(memory-backend-memfd,id=mem,size=)[0-9]+(M)/\1${MEM}\2/"
-	-e "s|${BASE_RUNTIME}/|${RUNTIME}/|g"
+	-e "s|${RUNTIME_TEMPLATE}/|${RUNTIME}/|g"
 )
 if [ "$NETWORK_MODE" = "none" ]; then
 	# SLIRP with restrict=on -- blocks all outbound, keeps port forwards

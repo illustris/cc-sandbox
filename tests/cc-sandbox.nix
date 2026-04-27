@@ -56,10 +56,19 @@ in {
 
 		users.users.testuser = {
 			isNormalUser = true;
+			uid = 1000;
 			home = "/home/testuser";
 			password = "";
 			extraGroups = [ "kvm" ];
 		};
+
+		# `systemd-run --uid=testuser` in the test script runs without a
+		# logind session, so /run/user/1000 is never created. Pre-create
+		# it so cc-sandbox's XDG runtime path resolves to /run/user/1000
+		# (matching a real interactive setup) instead of the /tmp fallback.
+		systemd.tmpfiles.rules = [
+			"d /run/user/1000 0700 testuser users -"
+		];
 
 		security.sudo.wheelNeedsPassword = false;
 

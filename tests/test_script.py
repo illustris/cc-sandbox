@@ -31,7 +31,7 @@ def boot_and_wait(unit, args, ssh_port):
 
 def stop_instance(unit, name=None):
     machine.succeed(f"systemctl stop {unit} || true")
-    runtime = "/tmp/cc-sandbox" + (("-" + name) if name else "")
+    runtime = "/run/user/1000/cc-sandbox" + (("-" + name) if name else "")
     machine.wait_until_fails(f"test -e {runtime}/pid", timeout=30)
 
 

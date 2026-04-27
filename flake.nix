@@ -34,8 +34,13 @@
 		archSuffix = system: builtins.head (lib.splitString "-" system);
 		configName = system: "cc-sandbox-${archSuffix system}";
 
-		# Runtime symlink directory -- QEMU references these fixed paths;
-		# the wrapper populates them with symlinks to user-specific locations.
+		# Sentinel placeholder baked into the microvm runner's QEMU args
+		# (9p share sources, fw_cfg file paths). At launch the wrapper
+		# sed-rewrites this prefix to the resolved per-user XDG runtime
+		# dir ($XDG_RUNTIME_DIR/cc-sandbox), then populates it with
+		# symlinks to the user's data/config locations. The literal
+		# value here is irrelevant beyond being a unique, stable string
+		# for the substitution to find.
 		runtimeDir = "/tmp/cc-sandbox";
 		dataDir = "${runtimeDir}/data";
 		claudeConfigDir = "${runtimeDir}/claude-config";

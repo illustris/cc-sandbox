@@ -392,7 +392,7 @@ Override where data lives on the host with environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `CC_SANDBOX_DATA` | `$HOME/.local/share/cc-sandbox` | Persistent data root. Each instance lives at `$CC_SANDBOX_DATA/instances/<name>/`; the default uses the reserved name `default`. |
+| `CC_SANDBOX_DATA` | `$XDG_DATA_HOME/cc-sandbox` (i.e. `~/.local/share/cc-sandbox`) | Persistent data root. Each instance lives at `$CC_SANDBOX_DATA/instances/<name>/`; the default uses the reserved name `default`. |
 | `CC_SANDBOX_CLAUDE_CONFIG` | `$HOME/.claude` | Host Claude config (read-only in VM) |
 | `CC_SANDBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | Auth token for the VM |
 
@@ -404,16 +404,21 @@ CC_SANDBOX_DATA=/mnt/fast/cc-sandbox nix run .
 
 QEMU's 9p share sources must be absolute paths known at build time. The
 wrapper creates a per-instance symlink directory pointing to the user's
-actual paths, so the built VM image works for any user. The default
-instance uses `/tmp/cc-sandbox/`; named instances use
-`/tmp/cc-sandbox-<name>/`. Each has its own symlinks and PID lock:
+actual paths, so the built VM image works for any user. Runtime state
+lives under `$XDG_RUNTIME_DIR/cc-sandbox` (typically
+`/run/user/$UID/cc-sandbox`); named instances append a `-<name>`
+suffix. Each has its own symlinks and PID lock:
 
 ```
-/tmp/cc-sandbox[-<name>]/
+$XDG_RUNTIME_DIR/cc-sandbox[-<name>]/
   data/            -> $CC_SANDBOX_DATA/instances/<name>
   claude-config/   -> $CC_SANDBOX_CLAUDE_CONFIG
   claude-auth.json -> $CC_SANDBOX_CLAUDE_AUTH
 ```
+
+If `$XDG_RUNTIME_DIR` is unset and `/run/user/$UID` doesn't exist (no
+active logind session), the wrapper falls back to
+`/tmp/cc-sandbox-runtime-$UID/` per the XDG spec.
 
 Runtime settings (vcpu, memory, ports) are applied by patching the microvm
 runner script's QEMU arguments at launch time. Settings that affect the
