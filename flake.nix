@@ -103,12 +103,12 @@
 			inputs.nixfs.nixosModules.nixfs
 			userExt
 			({ pkgs, lib, ... }: let
-				claude-code-bin =
+				claude-code =
 					if hasClaude
 					then (import inputs.nixpkgs-master {
 						inherit system;
 						config.allowUnfree = true;
-					}).claude-code-bin
+					}).claude-code
 					else null;
 			in {
 				nixpkgs.config.allowUnfree = true;
@@ -146,8 +146,8 @@
 					htop
 				]
 				++ lib.optionals hasClaude [
-					claude-code-bin
-					(writeScriptBin "c" ''IS_SANDBOX=1 exec ${lib.getExe claude-code-bin} --dangerously-skip-permissions "$@"'')
+					claude-code
+					(writeScriptBin "c" ''IS_SANDBOX=1 exec ${lib.getExe claude-code} --dangerously-skip-permissions "$@"'')
 				]
 				++ lib.optionals hasNixMcp [
 					nix-mcp.packages.${system}.default
