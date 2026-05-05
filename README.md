@@ -1,8 +1,9 @@
 # cc-sandbox
 
 A NixOS [microvm](https://github.com/microvm-nix/microvm.nix) for running
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) in an isolated
-QEMU sandbox with `--dangerously-skip-permissions`.
+coding-agent harnesses ([Claude Code](https://docs.anthropic.com/en/docs/claude-code),
+[opencode](https://github.com/sst/opencode)) in an isolated QEMU sandbox with
+`--dangerously-skip-permissions` semantics.
 
 ## Quick start
 
@@ -10,21 +11,36 @@ QEMU sandbox with `--dangerously-skip-permissions`.
 nix run github:illustris/cc-sandbox
 ```
 
-On first run, the wrapper creates a config directory and prompts before
-touching anything:
+On first run, the wrapper asks which harnesses to set up (only the ones
+you pick get host-side config dirs created -- a pure opencode user does
+not get `~/.claude/` materialized, and vice versa) and then prompts
+before touching anything:
 
 ```
+No harness state detected. Set up which?
+  [1] claude-code     (creates ~/.claude/, ~/.claude.json)
+  [2] opencode        (creates ~/.config/opencode/, ~/.local/share/opencode/)
+  [3] both
+Choice [1-3]:
+
 The following paths will be created:
   ~/.config/cc-sandbox/instances/default/config.json  (default settings)
   ~/.config/cc-sandbox/authorized_keys  (SSH public keys; seeded from ~/.ssh/*.pub + ssh-add -L)
   ~/.local/share/cc-sandbox/instances/default/  (VM data)
-  ~/.claude/  (Claude config)
-  ~/.claude.json  (Claude auth)
+  ~/.claude/  (claude-code config)
+  ~/.claude.json  (claude-code auth)
+  ~/.config/opencode/  (opencode config)
+  ~/.local/share/opencode/  (opencode data)
 
 Continue? [y/N]
 ```
 
-Once the VM boots, run `c` to launch Claude Code.
+Once the VM boots, run `c` to launch Claude Code or `oc` to launch opencode.
+
+If a harness's host state already exists when you run cc-sandbox for the
+first time, the harness selection prompt is skipped and only those
+harnesses are activated -- so existing single-harness installs are
+unaffected.
 
 ## Named instances
 
@@ -47,10 +63,15 @@ Ports are auto-assigned when an instance is first created (default starts
 at SSH 2222 / HTTP 8080; each new instance increments by one). You can
 override ports by editing the instance config.
 
-Claude authentication (`~/.claude.json`) and base Claude config (`~/.claude/`)
-are shared across all instances. Each instance gets its own overlay on
-top of the shared config, so per-instance Claude settings persist
-independently.
+Harness authentication and base config are shared across all instances:
+
+| Harness | Host config | Host auth/data |
+|---|---|---|
+| claude-code | `~/.claude/` | `~/.claude.json` |
+| opencode | `~/.config/opencode/` | `~/.local/share/opencode/` (includes `auth.json`) |
+
+Each instance gets its own overlay on top of the shared config, so
+per-instance harness settings persist independently.
 
 ## Flags
 
@@ -123,8 +144,9 @@ QEMU's SLIRP `restrict=on` blocks all outbound traffic from the guest.
 SSH and HTTP port forwards from the host still work. No extra privileges
 needed.
 
-Note: Claude Code requires access to the Anthropic API. In `none` mode,
-Claude Code will not function unless API access is provided through another
+Note: harnesses generally need access to a model provider's API
+(Anthropic for `c`, the configured provider for `oc`). In `none` mode
+they won't function unless API access is provided through another
 channel (e.g., SSH port forwarding).
 
 ### rules (default)
@@ -236,7 +258,7 @@ Edit them and restart the VM -- no rebuild needed.
 | `mem` | int | 32768 | RAM in megabytes |
 | `sshPort` | int | 2222 | Host port forwarded to guest SSH (22) |
 | `httpPort` | int | 8080 | Host port forwarded to guest 8080 |
-| `overlaySize` | string | `128M` | Persistent Claude config overlay image |
+| `overlaySize` | string | `128M` | Persistent harness overlay image (shared across all harnesses; per-harness subdirs inside) |
 | `storeOverlaySize` | string | `16G` | Writable nix store tmpfs |
 | `bindAddr` | string | `127.0.0.1` | Host bind address for port forwards |
 | `network` | string/object | seeded `rules` | Network mode: `"full"`, `"none"`, or `{"rules":[...]}` |
@@ -281,11 +303,12 @@ default guest:
 ~/.local/share/cc-sandbox/
   instances/
     default/                   # default instance data
-      claude-overlay.img
+      harness-overlay.img      # shared across claude-code, opencode
+      .config/active-harnesses # newline-separated list of active harnesses
     work/                      # named instance data
-      claude-overlay.img
+      harness-overlay.img
     personal/
-      claude-overlay.img
+      harness-overlay.img
 ```
 
 ### Per-instance NixOS extensions (flake.nix)
@@ -393,8 +416,10 @@ Override where data lives on the host with environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `CC_SANDBOX_DATA` | `$XDG_DATA_HOME/cc-sandbox` (i.e. `~/.local/share/cc-sandbox`) | Persistent data root. Each instance lives at `$CC_SANDBOX_DATA/instances/<name>/`; the default uses the reserved name `default`. |
-| `CC_SANDBOX_CLAUDE_CONFIG` | `$HOME/.claude` | Host Claude config (read-only in VM) |
-| `CC_SANDBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | Auth token for the VM |
+| `CC_SANDBOX_CLAUDE_CONFIG` | `$HOME/.claude` | Host claude-code config (overlay lower in VM) |
+| `CC_SANDBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | claude-code auth token for the VM |
+| `CC_SANDBOX_OPENCODE_CONFIG` | `$XDG_CONFIG_HOME/opencode` | Host opencode config (overlay lower in VM) |
+| `CC_SANDBOX_OPENCODE_DATA` | `$XDG_DATA_HOME/opencode` | Host opencode data (auth lives here as `auth.json`) |
 
 ```sh
 CC_SANDBOX_DATA=/mnt/fast/cc-sandbox nix run .
@@ -411,9 +436,14 @@ suffix. Each has its own symlinks and PID lock:
 
 ```
 $XDG_RUNTIME_DIR/cc-sandbox[-<name>]/
-  data/            -> $CC_SANDBOX_DATA/instances/<name>
-  claude-config/   -> $CC_SANDBOX_CLAUDE_CONFIG
-  claude-auth.json -> $CC_SANDBOX_CLAUDE_AUTH
+  data/                  -> $CC_SANDBOX_DATA/instances/<name>
+  claude-code-config     -> $CC_SANDBOX_CLAUDE_CONFIG
+  claude-code-auth       -> $CC_SANDBOX_CLAUDE_AUTH
+  opencode-config        -> $CC_SANDBOX_OPENCODE_CONFIG
+  opencode-data          -> $CC_SANDBOX_OPENCODE_DATA
+  .harness-stubs/        # empty stubs for inactive harnesses (so QEMU
+                         # 9p sources resolve even when the host has no
+                         # state for a given harness)
 ```
 
 If `$XDG_RUNTIME_DIR` is unset and `/run/user/$UID` doesn't exist (no
@@ -452,16 +482,59 @@ filter accepts.
 | vCPUs | 16 |
 | RAM | 32 GB |
 | Writable nix store | 16 GB tmpfs overlay |
-| Claude config overlay | 128 MB ext4 image |
+| Harness overlay (shared) | 128 MB ext4 image, per-harness subdirs |
 | SSH | 127.0.0.1:2222 -> 22 |
 | HTTP | 127.0.0.1:8080 -> 8080 |
 | Network | rules (private/bogon denied, public allowed) |
 | Docker | enabled |
 
 Pre-installed tools: `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`,
-`nixfs`. Architecture-conditional: `claude-code` and the `c` launcher
-(x86_64, aarch64), `bpftrace` (x86_64, aarch64), `nix-mcp` (where the
-`nix-mcp` flake publishes a build).
+`nixfs`, `opencode` (with the `oc` launcher).
+Architecture-conditional: `claude-code` and the `c` launcher (x86_64,
+aarch64), `bpftrace` (x86_64, aarch64), `nix-mcp` (where the `nix-mcp`
+flake publishes a build).
+
+## Harnesses
+
+A *harness* is a coding-agent CLI that cc-sandbox installs in the guest
+and mounts host state for. The currently-supported harnesses are
+`claude-code` (launcher: `c`) and `opencode` (launcher: `oc`).
+
+The harness model is symmetric and opt-in:
+
+- **Both binaries are always installed** in the guest (subject to
+  per-architecture availability), so any active VM has both launchers
+  on `$PATH`.
+- **Host state is created only for harnesses you actually use.** On
+  first init, the wrapper checks for any pre-existing harness config
+  on the host and treats those harnesses as active. If none are found,
+  it prompts you to choose. The active list is recorded at
+  `<datadir>/.config/active-harnesses`.
+- **A single overlay image** (`harness-overlay.img`) backs persistent
+  state for all harnesses, with per-harness subdirectories inside
+  (`/var/lib/harness-rw/<harness>/<pathkey>/{upper,work}` and
+  `/var/lib/harness-rw/<harness>/{cache,state}` for ephemeral paths).
+  Resizing `overlaySize` covers all harnesses at once.
+
+To add a harness after init, either create its host config dir
+manually and re-launch, or set `CC_SANDBOX_<HARNESS>_<KEY>` to point at
+an existing dir.
+
+A note about `node_modules/`: if a host harness config dir contains a
+`node_modules/` tree, it is exposed read-only into the VM via the 9p
+lowerdir share. To avoid streaming hundreds of megabytes through 9p on
+every boot, keep heavy package installs out of harness config dirs.
+
+How "full auto" is wired per harness:
+- `c` (claude-code) sets `IS_SANDBOX=1` and passes `--dangerously-skip-permissions`.
+- `oc` (opencode) sets `OPENCODE_PERMISSION='"allow"'`. Opencode
+  `JSON.parse`s that env var and merges it into `config.permission`;
+  the string shorthand normalises to `{"*": "allow"}`, which expands
+  to a single rule that matches every tool and pattern at evaluation
+  time. opencode's own `--dangerously-skip-permissions` flag exists
+  only on the `run` subcommand (one-shot mode) and is rejected by the
+  default TUI command's strict yargs parser, so the env-var path is
+  the universal bypass.
 
 ## Limitations
 

@@ -30,7 +30,7 @@ Usage: cc-sandbox [OPTIONS]
        cc-sandbox rules COMMAND [--name NAME]
        cc-sandbox ssh [--name NAME] [REMOTE_COMMAND...]
 
-Run Claude Code in an isolated QEMU microvm.
+Run coding-agent harnesses (Claude Code, opencode) in an isolated QEMU microvm.
 
 Options:
   --name NAME      Use a named instance (creates it on first run)
@@ -77,11 +77,16 @@ Paths (XDG basedir spec):
   Runtime: $XDG_RUNTIME_DIR/cc-sandbox        (default: /run/user/$UID/cc-sandbox)
 
 Environment variables:
-  CC_SANDBOX_DATA           Override the data root. Each instance lives at
-                            $CC_SANDBOX_DATA/instances/<name>; the default
-                            instance uses the reserved name "default".
-  CC_SANDBOX_CLAUDE_CONFIG  Host Claude config dir (default: ~/.claude)
-  CC_SANDBOX_CLAUDE_AUTH    Auth token file (default: ~/.claude.json)
+  CC_SANDBOX_DATA              Override the data root. Each instance lives at
+                               $CC_SANDBOX_DATA/instances/<name>; the default
+                               instance uses the reserved name "default".
+  CC_SANDBOX_CLAUDE_CONFIG     Host claude-code config dir (default: ~/.claude)
+  CC_SANDBOX_CLAUDE_AUTH       claude-code auth token file
+                               (default: ~/.claude.json)
+  CC_SANDBOX_OPENCODE_CONFIG   Host opencode config dir
+                               (default: $XDG_CONFIG_HOME/opencode)
+  CC_SANDBOX_OPENCODE_DATA     Host opencode data dir, includes auth.json
+                               (default: $XDG_DATA_HOME/opencode)
 
 Examples:
   cc-sandbox                          Start the default instance
@@ -207,8 +212,60 @@ fi
 # -- Paths (XDG basedir spec) --------------------------------------
 CONFIG_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cc-sandbox"
 BASE_DATA="${CC_SANDBOX_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cc-sandbox}"
-REAL_CLAUDE_CONFIG="${CC_SANDBOX_CLAUDE_CONFIG:-$REAL_HOME/.claude}"
-REAL_CLAUDE_AUTH="${CC_SANDBOX_CLAUDE_AUTH:-$REAL_HOME/.claude.json}"
+
+# -- Harness shape -------------------------------------------------
+# Mirror of the harness attrset in flake.nix. Both sides must agree on
+# names (used as 9p tags, fw_cfg keys, and runtime symlinks). When
+# adding or changing a harness, edit BOTH this section and the
+# `mkHarnesses` attrset in flake.nix.
+#
+# Path kinds:
+#   overlay   - 9p RO lowerdir from host + persistent upperdir in the
+#               shared harness overlay image. Host path must exist.
+#   fw_cfg    - single host file copied into the guest at boot via
+#               QEMU's fw_cfg device. Host path must exist (a stub
+#               with default content is created if absent).
+#   ephemeral - sandbox-only; bind-mounted from the harness overlay
+#               image. No host source.
+HARNESSES=(claude-code opencode)
+declare -A H_KIND
+declare -A H_HOST
+declare -A H_FW_DEFAULT
+declare -A H_FW_MODE
+
+H_KIND[claude-code:config]=overlay
+H_HOST[claude-code:config]="${CC_SANDBOX_CLAUDE_CONFIG:-$REAL_HOME/.claude}"
+
+H_KIND[claude-code:auth]=fw_cfg
+H_HOST[claude-code:auth]="${CC_SANDBOX_CLAUDE_AUTH:-$REAL_HOME/.claude.json}"
+H_FW_DEFAULT[claude-code:auth]='{}'
+H_FW_MODE[claude-code:auth]=600
+
+H_KIND[opencode:config]=overlay
+H_HOST[opencode:config]="${CC_SANDBOX_OPENCODE_CONFIG:-${XDG_CONFIG_HOME:-$REAL_HOME/.config}/opencode}"
+
+H_KIND[opencode:data]=overlay
+H_HOST[opencode:data]="${CC_SANDBOX_OPENCODE_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/opencode}"
+
+H_KIND[opencode:cache]=ephemeral
+H_KIND[opencode:state]=ephemeral
+
+# Path keys per harness, in declared order.
+harness_pathkeys() {
+	case "$1" in
+		claude-code) printf '%s\n' config auth ;;
+		opencode) printf '%s\n' config data cache state ;;
+	esac
+}
+
+# Human-readable summary of what creating a harness's host state will
+# do, used in the "set up which?" prompt.
+harness_summary() {
+	case "$1" in
+		claude-code) echo "creates ~/.claude/, ~/.claude.json" ;;
+		opencode)    echo "creates ~/.config/opencode/, ~/.local/share/opencode/" ;;
+	esac
+}
 
 # Microvm runner has runtime paths baked in at flake build time using this
 # sentinel; the sed substitution below rewrites them to BASE_RUNTIME.
@@ -295,6 +352,14 @@ if [ -d "$CONFIG_DIR/instances" ]; then
 		done
 		exit 1
 	fi
+fi
+
+# Multi-harness migration: rename the per-instance overlay image from
+# the old single-harness name. The image's content is preserved
+# verbatim; the in-image upper/work shuffle into claude-code/config/
+# is handled by harness-setup-dirs.service inside the guest.
+if [ -d "$REAL_DATA" ] && [ -f "$REAL_DATA/claude-overlay.img" ] && [ ! -f "$REAL_DATA/harness-overlay.img" ]; then
+	mv "$REAL_DATA/claude-overlay.img" "$REAL_DATA/harness-overlay.img"
 fi
 
 # -- List instances ------------------------------------------------
@@ -399,6 +464,39 @@ next_available_ports() {
 	echo "$(( max_ssh + 1 )) $(( max_http + 1 ))"
 }
 
+# -- Harness state detection (D3) ----------------------------------
+# Active harnesses are those whose host state already exists. If none
+# exist (fresh install), prompt the user to choose. The chosen list
+# governs which harnesses' host paths get created during init.
+ACTIVE_HARNESSES_FILE="$REAL_DATA/.config/active-harnesses"
+ACTIVE_HARNESSES=()
+
+# Detect harnesses that already have *any* host-side state (overlay or
+# fw_cfg path present on disk, or already-active per a prior init).
+for h in "${HARNESSES[@]}"; do
+	active=0
+	if [ -f "$ACTIVE_HARNESSES_FILE" ] && grep -qx "$h" "$ACTIVE_HARNESSES_FILE"; then
+		active=1
+	fi
+	if [ "$active" -eq 0 ]; then
+		while IFS= read -r k; do
+			[ -z "$k" ] && continue
+			kind=${H_KIND[$h:$k]}
+			[ "$kind" = "ephemeral" ] && continue
+			host=${H_HOST[$h:$k]}
+			if [ "$kind" = "overlay" ] && [ -d "$host" ]; then
+				active=1; break
+			fi
+			if [ "$kind" = "fw_cfg" ] && [ -e "$host" ]; then
+				active=1; break
+			fi
+		done < <(harness_pathkeys "$h")
+	fi
+	if [ "$active" -eq 1 ]; then
+		ACTIVE_HARNESSES+=("$h")
+	fi
+done
+
 # -- First-time init: collect missing items, prompt once -----------
 ITEMS=()
 if [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
@@ -421,12 +519,53 @@ fi
 if [ ! -d "$REAL_DATA" ]; then
 	ITEMS+=("$REAL_DATA/  (VM data${INSTANCE_NAME:+ for \"$INSTANCE_NAME\"})")
 fi
-if [ ! -d "$REAL_CLAUDE_CONFIG" ]; then
-	ITEMS+=("$REAL_CLAUDE_CONFIG/  (Claude config)")
+
+# If no harness has host state yet, prompt the user to pick which to
+# set up. This avoids polluting $HOME with config dirs for tools the
+# user doesn't use (D3). Under a non-interactive stdin we can't safely
+# prompt, so default to all harnesses.
+if [ "${#ACTIVE_HARNESSES[@]}" -eq 0 ]; then
+	if [ -t 0 ]; then
+		echo "No harness state detected. Set up which?"
+		idx=1
+		for h in "${HARNESSES[@]}"; do
+			echo "  [$idx] $h     ($(harness_summary "$h"))"
+			idx=$((idx + 1))
+		done
+		echo "  [$idx] both"
+		read -rp "Choice [1-$idx]: " choice
+		case "$choice" in
+			1) ACTIVE_HARNESSES=("${HARNESSES[0]}") ;;
+			2) ACTIVE_HARNESSES=("${HARNESSES[1]}") ;;
+			3) ACTIVE_HARNESSES=("${HARNESSES[@]}") ;;
+			*) echo "Invalid choice."; exit 1 ;;
+		esac
+	else
+		ACTIVE_HARNESSES=("${HARNESSES[@]}")
+	fi
 fi
-if [ ! -f "$REAL_CLAUDE_AUTH" ]; then
-	ITEMS+=("$REAL_CLAUDE_AUTH  (Claude auth)")
-fi
+
+# Collect host paths to be created for active harnesses.
+for h in "${ACTIVE_HARNESSES[@]}"; do
+	while IFS= read -r k; do
+		[ -z "$k" ] && continue
+		kind=${H_KIND[$h:$k]}
+		[ "$kind" = "ephemeral" ] && continue
+		host=${H_HOST[$h:$k]}
+		case "$kind" in
+			overlay)
+				if [ ! -d "$host" ]; then
+					ITEMS+=("$host/  ($h $k)")
+				fi
+				;;
+			fw_cfg)
+				if [ ! -e "$host" ]; then
+					ITEMS+=("$host  ($h $k)")
+				fi
+				;;
+		esac
+	done < <(harness_pathkeys "$h")
+done
 
 if [ "${#ITEMS[@]}" -gt 0 ]; then
 	echo "The following paths will be created:"
@@ -440,7 +579,18 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		exit 1
 	fi
 
-	mkdir -p "$INSTANCE_CONFIG_DIR" "$INSTANCE_FLAKE_DIR" "$REAL_DATA" "$REAL_CLAUDE_CONFIG"
+	mkdir -p "$INSTANCE_CONFIG_DIR" "$INSTANCE_FLAKE_DIR" "$REAL_DATA"
+
+	# Create host-side directories for active harnesses' overlay paths.
+	for h in "${ACTIVE_HARNESSES[@]}"; do
+		while IFS= read -r k; do
+			[ -z "$k" ] && continue
+			kind=${H_KIND[$h:$k]}
+			[ "$kind" = "overlay" ] || continue
+			host=${H_HOST[$h:$k]}
+			[ -d "$host" ] || mkdir -p "$host"
+		done < <(harness_pathkeys "$h")
+	done
 
 	INIT_VCPU="${FLAG_VCPU:-16}"
 	INIT_MEM="${FLAG_MEM:-32768}"
@@ -525,16 +675,40 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 			touch "$CONFIG_DIR/authorized_keys"
 		fi
 	fi
-	if [ ! -f "$REAL_CLAUDE_AUTH" ]; then
-		echo '{}' > "$REAL_CLAUDE_AUTH"
-		chmod 600 "$REAL_CLAUDE_AUTH"
-	fi
+	# Seed default content for fw_cfg paths (e.g. ~/.claude.json = '{}').
+	for h in "${ACTIVE_HARNESSES[@]}"; do
+		while IFS= read -r k; do
+			[ -z "$k" ] && continue
+			[ "${H_KIND[$h:$k]}" = "fw_cfg" ] || continue
+			host=${H_HOST[$h:$k]}
+			[ -e "$host" ] && continue
+			printf '%s' "${H_FW_DEFAULT[$h:$k]}" > "$host"
+			chmod "${H_FW_MODE[$h:$k]}" "$host"
+		done < <(harness_pathkeys "$h")
+	done
 fi
+
+# Persist the active-harness list so subsequent runs don't re-prompt.
+mkdir -p "$REAL_DATA/.config"
+printf '%s\n' "${ACTIVE_HARNESSES[@]}" > "$ACTIVE_HARNESSES_FILE"
 
 # -- Fix file ownership after init under sudo ----------------------
 if [ -n "${SUDO_USER:-}" ]; then
-	chown -R "$REAL_USER" "$CONFIG_DIR" "$REAL_DATA" "$REAL_CLAUDE_CONFIG"
-	chown "$REAL_USER" "$REAL_CLAUDE_AUTH"
+	chown -R "$REAL_USER" "$CONFIG_DIR" "$REAL_DATA"
+	for h in "${ACTIVE_HARNESSES[@]}"; do
+		while IFS= read -r k; do
+			[ -z "$k" ] && continue
+			kind=${H_KIND[$h:$k]}
+			[ "$kind" = "ephemeral" ] && continue
+			host=${H_HOST[$h:$k]}
+			[ -e "$host" ] || continue
+			if [ -d "$host" ]; then
+				chown -R "$REAL_USER" "$host"
+			else
+				chown "$REAL_USER" "$host"
+			fi
+		done < <(harness_pathkeys "$h")
+	done
 fi
 
 # -- Re-exec with per-instance flake overlaid ---------------------
@@ -620,8 +794,49 @@ PASST_PID=""
 trap 'kill "$PASST_PID" 2>/dev/null || true; rm -rf "'"$RUNTIME"'"' EXIT
 
 ln -sfn "$REAL_DATA" "$RUNTIME/data"
-ln -sfn "$REAL_CLAUDE_CONFIG" "$RUNTIME/claude-config"
-ln -sfn "$REAL_CLAUDE_AUTH" "$RUNTIME/claude-auth.json"
+
+# -- Per-harness runtime sources -----------------------------------
+# The QEMU runner expects a 9p source path or fw_cfg file at
+# $RUNTIME/<harness>-<pathkey> for every overlay/fw_cfg path declared
+# in the harness shape. For active harnesses, we symlink to the host
+# state. For inactive harnesses, we materialize an empty stub so the
+# QEMU runner doesn't fail to start (the binary is installed in the
+# guest unconditionally per D4, but inactive harnesses just see empty
+# config dirs / default-content auth files).
+HARNESS_STUBS="$RUNTIME/.harness-stubs"
+mkdir -p "$HARNESS_STUBS"
+is_active() {
+	for active in "${ACTIVE_HARNESSES[@]}"; do
+		[ "$active" = "$1" ] && return 0
+	done
+	return 1
+}
+for h in "${HARNESSES[@]}"; do
+	while IFS= read -r k; do
+		[ -z "$k" ] && continue
+		kind=${H_KIND[$h:$k]}
+		[ "$kind" = "ephemeral" ] && continue
+		target="$RUNTIME/${h}-${k}"
+		if is_active "$h"; then
+			host=${H_HOST[$h:$k]}
+			ln -sfn "$host" "$target"
+		else
+			stub="$HARNESS_STUBS/${h}-${k}"
+			case "$kind" in
+				overlay)
+					mkdir -p "$stub"
+					;;
+				fw_cfg)
+					if [ ! -e "$stub" ]; then
+						printf '%s' "${H_FW_DEFAULT[$h:$k]}" > "$stub"
+						chmod "${H_FW_MODE[$h:$k]}" "$stub"
+					fi
+					;;
+			esac
+			ln -sfn "$stub" "$target"
+		fi
+	done < <(harness_pathkeys "$h")
+done
 
 # -- Generate rules file for LD_PRELOAD filter ---------------------
 if [ "$NETWORK_MODE" = "rules" ]; then

@@ -43,8 +43,91 @@
 		# for the substitution to find.
 		runtimeDir = "/tmp/cc-sandbox";
 		dataDir = "${runtimeDir}/data";
-		claudeConfigDir = "${runtimeDir}/claude-config";
-		claudeAuthFile = "${runtimeDir}/claude-auth.json";
+
+		# --- Harness configuration --------------------------------------
+		# Single source of truth for how each coding-agent harness is
+		# wired into the VM. Iterated below to emit systemPackages,
+		# microvm.shares, qemu.extraArgs, systemd services, and
+		# fileSystems. The cc-sandbox.sh wrapper iterates the same shape
+		# (re-declared in bash) to seed host state and create the runtime
+		# symlinks the QEMU runner expects.
+		#
+		# Path kinds:
+		#   overlay   - 9p RO lowerdir from host + persistent upperdir
+		#               in the shared harness overlay image
+		#   fw_cfg    - single host file copied into the guest at boot
+		#               via QEMU's fw_cfg device
+		#   ephemeral - sandbox-only; bind-mounted from the harness
+		#               overlay image (no host source)
+		mkHarnesses = system: pkgs: lib.filterAttrs (_: h: h.enable) {
+			claude-code = {
+				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				package = (import inputs.nixpkgs-master {
+					inherit system;
+					config.allowUnfree = true;
+				}).claude-code;
+				launcher = {
+					name = "c";
+					flags = [ "--dangerously-skip-permissions" ];
+					env = { IS_SANDBOX = "1"; };
+				};
+				paths = {
+					config = {
+						guest = "/root/.claude";
+						kind = "overlay";
+					};
+					auth = {
+						guest = "/root/.claude.json";
+						kind = "fw_cfg";
+						mode = "0600";
+					};
+				};
+			};
+
+			opencode = {
+				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
+				package = pkgs.opencode;
+				launcher = {
+					name = "oc";
+					# `--dangerously-skip-permissions` exists only on the
+					# `run` subcommand (one-shot mode); the default TUI
+					# command parses with yargs `.strict()` and would
+					# reject it. `OPENCODE_PERMISSION` is the universal
+					# bypass: opencode JSON.parses it and merges it into
+					# `config.permission`. The string shorthand `"allow"`
+					# normalizes to `{"*": "allow"}`, which `fromConfig`
+					# expands to a single `{permission:"*", pattern:"*",
+					# action:"allow"}` rule -- matching every tool/pattern
+					# at evaluate time so opencode never raises a prompt.
+					flags = [];
+					env = {
+						IS_SANDBOX = "1";
+						OPENCODE_PERMISSION = ''"allow"'';
+					};
+				};
+				paths = {
+					config = {
+						guest = "/root/.config/opencode";
+						kind = "overlay";
+					};
+					# Includes auth.json, mcp-auth.json, log/, project/.
+					# Single mount covers auth + state because opencode
+					# keeps them together under XDG_DATA_HOME.
+					data = {
+						guest = "/root/.local/share/opencode";
+						kind = "overlay";
+					};
+					cache = {
+						guest = "/root/.cache/opencode";
+						kind = "ephemeral";
+					};
+					state = {
+						guest = "/root/.local/state/opencode";
+						kind = "ephemeral";
+					};
+				};
+			};
+		};
 
 		macFromName = name: let
 			hash = builtins.hashString "sha256" name;
@@ -102,44 +185,49 @@
 		# microvm runner has a deterministic .drvPath that matches what
 		# `nix run --override-input userExtensions ...` produces.
 		ccSandboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default }: let
-			hasClaude = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
 			inputs.nixfs.nixosModules.nixfs
 			userExt
-			({ pkgs, lib, ... }: let
-				claude-code =
-					if hasClaude
-					then (import inputs.nixpkgs-master {
-						inherit system;
-						config.allowUnfree = true;
-					}).claude-code
-					else null;
+			({ pkgs, lib, utils, ... }: let
+				harnesses = mkHarnesses system pkgs;
+
+				# Flatten harnesses into a list of paths annotated with
+				# their owning harness name and path key.
+				allPaths = lib.concatLists (lib.mapAttrsToList (hname: h:
+					lib.mapAttrsToList (pkey: p: p // { harness = hname; pathkey = pkey; }) h.paths
+				) harnesses);
+				pathsByKind = kind: lib.filter (p: p.kind == kind) allPaths;
+				overlayPaths = pathsByKind "overlay";
+				fwCfgPaths = pathsByKind "fw_cfg";
+				ephemeralPaths = pathsByKind "ephemeral";
+
+				# Naming conventions, used in both this flake and the
+				# wrapper. Keep them in sync.
+				sentinel = h: k: "${runtimeDir}/${h}-${k}";
+				tag = h: k: "${h}-${k}";
+				lowerMount = h: k: "/var/lib/harness-lower/${h}/${k}";
+				upperDir = h: k: "/var/lib/harness-rw/${h}/${k}/upper";
+				workDir = h: k: "/var/lib/harness-rw/${h}/${k}/work";
+				ephemeralSrc = h: k: "/var/lib/harness-rw/${h}/${k}";
+
+				mkLauncher = h: pkgs.writeScriptBin h.launcher.name (
+					let
+						envParts = lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") h.launcher.env;
+						envStr = lib.concatStringsSep " " envParts;
+						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
+					in ''exec env ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
+				);
+
+				# All harness mount units (overlay + ephemeral). Used to
+				# wire harness-setup-dirs.service in front of every per-
+				# path mount.
+				harnessMountUnits = map (p: "${utils.escapeSystemdPath p.guest}.mount")
+					(overlayPaths ++ ephemeralPaths);
 			in {
 				nixpkgs.config.allowUnfree = true;
 
 				services.openssh.enable = true;
-
-				systemd.services.load-ssh-keys = {
-					description = "Load SSH authorized keys from shared config";
-					wantedBy = [ "multi-user.target" ];
-					before = [ "sshd.service" ];
-					after = [ "var-lib-cc\\x2dsandbox.mount" ];
-					requires = [ "var-lib-cc\\x2dsandbox.mount" ];
-					serviceConfig = {
-						Type = "oneshot";
-						RemainAfterExit = true;
-						ExecStart = pkgs.writeShellScript "load-ssh-keys" ''
-							keyfile=/var/lib/cc-sandbox/.config/authorized_keys
-							if [ -f "$keyfile" ] && [ -s "$keyfile" ]; then
-								mkdir -p /root/.ssh
-								chmod 700 /root/.ssh
-								cp "$keyfile" /root/.ssh/authorized_keys
-								chmod 600 /root/.ssh/authorized_keys
-							fi
-						'';
-					};
-				};
 
 				environment.systemPackages = with pkgs; [
 					git
@@ -150,10 +238,7 @@
 					tmux
 					htop
 				]
-				++ lib.optionals hasClaude [
-					claude-code
-					(writeScriptBin "c" ''IS_SANDBOX=1 exec ${lib.getExe claude-code} --dangerously-skip-permissions "$@"'')
-				]
+				++ lib.concatMap (h: [ h.package (mkLauncher h) ]) (lib.attrValues harnesses)
 				++ lib.optionals hasNixMcp [
 					nix-mcp.packages.${system}.default
 				]
@@ -167,72 +252,136 @@
 						{ from = "host"; host.port = 2222; host.address = "127.0.0.1"; guest.port = 22; }
 						{ from = "host"; host.port = 8080; host.address = "127.0.0.1"; guest.port = 8080; }
 					];
-					shares = [
-						{
-							proto = "9p";
-							tag = "claude-config";
-							source = claudeConfigDir;
-							mountPoint = "/var/lib/claude-lower";
-							readOnly = true;
-						}
-					];
-					qemu.extraArgs = [
+					shares = map (p: {
+						proto = "9p";
+						tag = tag p.harness p.pathkey;
+						source = sentinel p.harness p.pathkey;
+						mountPoint = lowerMount p.harness p.pathkey;
+						readOnly = true;
+					}) overlayPaths;
+					qemu.extraArgs = lib.concatMap (p: [
 						"-fw_cfg"
-						"name=opt/claude-auth,file=${claudeAuthFile}"
-					];
+						"name=opt/${tag p.harness p.pathkey},file=${sentinel p.harness p.pathkey}"
+					]) fwCfgPaths;
 				};
 
-				systemd.services.claude-auth = {
-					description = "Copy Claude auth token from fw_cfg";
-					wantedBy = [ "multi-user.target" ];
-					before = [ "multi-user.target" ];
-					serviceConfig = {
-						Type = "oneshot";
-						ExecStart = "/bin/sh -c 'cp /sys/firmware/qemu_fw_cfg/by_name/opt/claude-auth/raw /root/.claude.json && chmod 600 /root/.claude.json'";
-						RemainAfterExit = true;
+				# Per-fw_cfg copy services. Each one materializes a single
+				# host file (auth token, etc.) into its guest path at boot.
+				systemd.services = lib.listToAttrs (map (p:
+					lib.nameValuePair "${p.harness}-${p.pathkey}" {
+						description = "Copy ${p.harness}/${p.pathkey} from fw_cfg";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "multi-user.target" ];
+						serviceConfig = {
+							Type = "oneshot";
+							ExecStart = "/bin/sh -c 'cp /sys/firmware/qemu_fw_cfg/by_name/opt/${tag p.harness p.pathkey}/raw ${p.guest} && chmod ${p.mode} ${p.guest}'";
+							RemainAfterExit = true;
+						};
+					}
+				) fwCfgPaths) // {
+					load-ssh-keys = {
+						description = "Load SSH authorized keys from shared config";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "sshd.service" ];
+						after = [ "var-lib-cc\\x2dsandbox.mount" ];
+						requires = [ "var-lib-cc\\x2dsandbox.mount" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = pkgs.writeShellScript "load-ssh-keys" ''
+								keyfile=/var/lib/cc-sandbox/.config/authorized_keys
+								if [ -f "$keyfile" ] && [ -s "$keyfile" ]; then
+									mkdir -p /root/.ssh
+									chmod 700 /root/.ssh
+									cp "$keyfile" /root/.ssh/authorized_keys
+									chmod 600 /root/.ssh/authorized_keys
+								fi
+							'';
+						};
 					};
-				};
+					harness-overlay-img = {
+						description = "Create ext4 image for harness overlay";
+						wantedBy = [ "var-lib-harness\\x2drw.mount" ];
+						before = [ "var-lib-harness\\x2drw.mount" ];
+						after = [ "var-lib-cc\\x2dsandbox.mount" ];
+						requires = [ "var-lib-cc\\x2dsandbox.mount" ];
+						unitConfig.DefaultDependencies = false;
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = pkgs.writeShellScript "harness-overlay-img" ''
+								img=/var/lib/cc-sandbox/harness-overlay.img
+								old_img=/var/lib/cc-sandbox/claude-overlay.img
+								# Migration: pre-multi-harness installs had
+								# the image named after the only harness.
+								# The wrapper renames host-side at launch,
+								# but cover the case where the guest is
+								# booted by something else.
+								if [ ! -f "$img" ] && [ -f "$old_img" ]; then
+									mv "$old_img" "$img"
+								fi
+								if [ ! -f "$img" ]; then
+									size="128M"
+									sizefile=/var/lib/cc-sandbox/.config/overlay-size
+									if [ -f "$sizefile" ]; then
+										size=$(cat "$sizefile")
+									fi
+									${pkgs.coreutils}/bin/truncate -s "$size" "$img"
+									${pkgs.e2fsprogs}/bin/mkfs.ext4 -q "$img"
+								fi
+							'';
+						};
+					};
 
-				systemd.services.claude-overlay-img = {
-					description = "Create ext4 image for Claude overlay";
-					wantedBy = [ "var-lib-claude\\x2drw.mount" ];
-					before = [ "var-lib-claude\\x2drw.mount" ];
-					after = [ "var-lib-cc\\x2dsandbox.mount" ];
-					requires = [ "var-lib-cc\\x2dsandbox.mount" ];
-					unitConfig.DefaultDependencies = false;
-					serviceConfig = {
-						Type = "oneshot";
-						RemainAfterExit = true;
-						ExecStart = pkgs.writeShellScript "claude-overlay-img" ''
-							img=/var/lib/cc-sandbox/claude-overlay.img
-							if [ ! -f "$img" ]; then
-								size="128M"
-								sizefile=/var/lib/cc-sandbox/.config/overlay-size
+					harness-setup-dirs = {
+						description = "Create per-harness subdirs in harness overlay";
+						wantedBy = harnessMountUnits;
+						before = harnessMountUnits;
+						after = [ "var-lib-harness\\x2drw.mount" ];
+						requires = [ "var-lib-harness\\x2drw.mount" ];
+						unitConfig.DefaultDependencies = false;
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = pkgs.writeShellScript "harness-setup-dirs" ''
+								base=/var/lib/harness-rw
+
+								# Migration: pre-multi-harness images had
+								# upper/ and work/ at the root (single
+								# Claude overlay). Move into the new
+								# claude-code/config/ subdir layout.
+								if [ -d "$base/upper" ] && [ ! -d "$base/claude-code/config/upper" ]; then
+									mkdir -p "$base/claude-code/config"
+									mv "$base/upper" "$base/claude-code/config/upper"
+									[ -d "$base/work" ] && mv "$base/work" "$base/claude-code/config/work"
+								fi
+
+								${lib.concatMapStringsSep "\n" (p: ''
+									mkdir -p ${upperDir p.harness p.pathkey} ${workDir p.harness p.pathkey}
+								'') overlayPaths}
+								${lib.concatMapStringsSep "\n" (p: ''
+									mkdir -p ${ephemeralSrc p.harness p.pathkey}
+								'') ephemeralPaths}
+							'';
+						};
+					};
+
+					resize-store-overlay = {
+						description = "Resize writable nix store overlay from config";
+						wantedBy = [ "multi-user.target" ];
+						after = [ "var-lib-cc\\x2dsandbox.mount" ];
+						requires = [ "var-lib-cc\\x2dsandbox.mount" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = pkgs.writeShellScript "resize-store-overlay" ''
+								sizefile=/var/lib/cc-sandbox/.config/store-overlay-size
 								if [ -f "$sizefile" ]; then
 									size=$(cat "$sizefile")
+									${pkgs.util-linux}/bin/mount -o "remount,size=$size" /nix/.rw-store
 								fi
-								${pkgs.coreutils}/bin/truncate -s "$size" "$img"
-								${pkgs.e2fsprogs}/bin/mkfs.ext4 -q "$img"
-							fi
-						'';
-					};
-				};
-
-				systemd.services.resize-store-overlay = {
-					description = "Resize writable nix store overlay from config";
-					wantedBy = [ "multi-user.target" ];
-					after = [ "var-lib-cc\\x2dsandbox.mount" ];
-					requires = [ "var-lib-cc\\x2dsandbox.mount" ];
-					serviceConfig = {
-						Type = "oneshot";
-						RemainAfterExit = true;
-						ExecStart = pkgs.writeShellScript "resize-store-overlay" ''
-							sizefile=/var/lib/cc-sandbox/.config/store-overlay-size
-							if [ -f "$sizefile" ]; then
-								size=$(cat "$sizefile")
-								${pkgs.util-linux}/bin/mount -o "remount,size=$size" /nix/.rw-store
-							fi
-						'';
+							'';
+						};
 					};
 				};
 
@@ -245,18 +394,25 @@
 						neededForBoot = true;
 					};
 
-					"/var/lib/claude-rw" = {
-						device = "/var/lib/cc-sandbox/claude-overlay.img";
+					"/var/lib/harness-rw" = {
+						device = "/var/lib/cc-sandbox/harness-overlay.img";
 						fsType = "ext4";
 						options = [ "loop" ];
 					};
-
-					"/root/.claude".overlay = {
-						lowerdir = [ "/var/lib/claude-lower" ];
-						upperdir = "/var/lib/claude-rw/upper";
-						workdir = "/var/lib/claude-rw/work";
-					};
-				};
+				} // lib.listToAttrs (
+					(map (p: lib.nameValuePair p.guest {
+						overlay = {
+							lowerdir = [ (lowerMount p.harness p.pathkey) ];
+							upperdir = upperDir p.harness p.pathkey;
+							workdir = workDir p.harness p.pathkey;
+						};
+					}) overlayPaths)
+					++ (map (p: lib.nameValuePair p.guest {
+						device = ephemeralSrc p.harness p.pathkey;
+						fsType = "none";
+						options = [ "bind" ];
+					}) ephemeralPaths)
+				);
 			})
 		];
 	in {

@@ -33,6 +33,16 @@ def stop_instance(unit, name=None):
     machine.succeed(f"systemctl stop {unit} || true")
     runtime = "/run/user/1000/cc-sandbox" + (("-" + name) if name else "")
     machine.wait_until_fails(f"test -e {runtime}/pid", timeout=30)
+    # Transient units linger in systemd's state briefly after stopping;
+    # without this dance a follow-up systemd-run with the same unit
+    # name fails as "already loaded". `show -p LoadState` reports
+    # "stub" (or "not-found") when the unit is fully gone, vs.
+    # "loaded" while systemd still holds it in memory.
+    machine.succeed(f"systemctl reset-failed {unit} 2>/dev/null || true")
+    machine.wait_until_succeeds(
+        f"[ \"$(systemctl show -p LoadState --value {unit} 2>/dev/null)\" != loaded ]",
+        timeout=15,
+    )
 
 
 machine.wait_for_unit("multi-user.target")
@@ -49,12 +59,24 @@ machine.succeed("systemd-run --unit=test-listener --collect nc -l -k -p 9000")
 machine.wait_for_open_port(9000)
 
 with subtest("Phase A: CLI / state without booting"):
-    # A1: first-run init for the default instance, network=none
+    # A1: first-run init for the default instance, network=none.
+    # A non-interactive stdin auto-selects all harnesses, so both
+    # claude-code and opencode host paths are seeded.
     machine.succeed(as_user("yes y | cc-sandbox --init-only --network none"))
     machine.succeed("test -f /home/testuser/.config/cc-sandbox/instances/default/config.json")
     machine.succeed("test -f /home/testuser/.config/cc-sandbox/authorized_keys")
     machine.succeed("test -d /home/testuser/.local/share/cc-sandbox/instances/default")
     machine.succeed("test -f /home/testuser/.claude.json")
+    machine.succeed("test -d /home/testuser/.claude")
+    machine.succeed("test -d /home/testuser/.config/opencode")
+    machine.succeed("test -d /home/testuser/.local/share/opencode")
+    machine.succeed(
+        "test -f /home/testuser/.local/share/cc-sandbox/instances/default/.config/active-harnesses"
+    )
+    active = machine.succeed(
+        "cat /home/testuser/.local/share/cc-sandbox/instances/default/.config/active-harnesses"
+    ).strip().splitlines()
+    assert "claude-code" in active and "opencode" in active, active
     # Old top-level default config must NOT be created any more.
     machine.fail("test -e /home/testuser/.config/cc-sandbox/config.json")
     net = machine.succeed(
@@ -205,4 +227,52 @@ NIX_EOF"""))
     machine.fail(
         as_user("cc-sandbox ssh 'command -v hello'")
     )
+    stop_instance("cc-default")
+
+with subtest("Phase F: opencode harness wired into the VM"):
+    boot_and_wait("cc-default", "", ssh_port=2222)
+    # Both harness launchers are on $PATH inside the VM unconditionally
+    # (D4: binaries always installed regardless of which harness has
+    # active host state).
+    c_path = machine.succeed(as_user("cc-sandbox ssh 'command -v c'")).strip()
+    oc_path = machine.succeed(as_user("cc-sandbox ssh 'command -v oc'")).strip()
+    assert c_path and oc_path, (c_path, oc_path)
+
+    # Per-harness config dirs are mounted at the expected guest paths.
+    machine.succeed(as_user(
+        "cc-sandbox ssh 'mountpoint -q /root/.config/opencode'"
+    ))
+    machine.succeed(as_user(
+        "cc-sandbox ssh 'mountpoint -q /root/.local/share/opencode'"
+    ))
+    # Ephemeral paths (cache + state) bind from the harness overlay.
+    machine.succeed(as_user(
+        "cc-sandbox ssh 'mountpoint -q /root/.cache/opencode'"
+    ))
+    machine.succeed(as_user(
+        "cc-sandbox ssh 'mountpoint -q /root/.local/state/opencode'"
+    ))
+
+    # Single-image overlay layout: claude-code/config and opencode/{config,data}
+    # live under the shared harness-rw mount.
+    machine.succeed(as_user(
+        "cc-sandbox ssh 'test -d /var/lib/harness-rw/claude-code/config/upper'"
+    ))
+    machine.succeed(as_user(
+        "cc-sandbox ssh 'test -d /var/lib/harness-rw/opencode/config/upper'"
+    ))
+
+    # Persistence: write a file under opencode's config overlay, reboot,
+    # verify it survives. The sync flushes the write through overlayfs
+    # to the ext4 overlay image; without it, SIGTERM-killed QEMU loses
+    # uncommitted journal entries.
+    machine.succeed(as_user(
+        "cc-sandbox ssh 'echo persisted > /root/.config/opencode/marker && sync'"
+    ))
+    stop_instance("cc-default")
+    boot_and_wait("cc-default", "", ssh_port=2222)
+    out = machine.succeed(as_user(
+        "cc-sandbox ssh 'cat /root/.config/opencode/marker'"
+    )).strip()
+    assert out == "persisted", out
     stop_instance("cc-default")
