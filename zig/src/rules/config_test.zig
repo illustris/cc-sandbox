@@ -1,6 +1,6 @@
 // Round-trip tests for the jq --tab compatible serializer. The seed string
 // here is the exact byte sequence produced by `jq -n --tab '...'` for a
-// representative cc-sandbox config -- matching it byte-for-byte means a
+// representative cogbox config -- matching it byte-for-byte means a
 // no-op edit produces no diff against existing user files.
 
 const std = @import("std");

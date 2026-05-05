@@ -1,20 +1,31 @@
-# cc-sandbox
+<h1 align="center">
+  <img src="cogbox-icon.svg" width="120" alt=""><br>
+  cogbox
+</h1>
 
-A NixOS [microvm](https://github.com/microvm-nix/microvm.nix) for running
-coding-agent harnesses ([Claude Code](https://docs.anthropic.com/en/docs/claude-code),
-[opencode](https://github.com/sst/opencode)) in an isolated QEMU sandbox with
-`--dangerously-skip-permissions` semantics.
+<p align="center">
+  A NixOS <a href="https://github.com/microvm-nix/microvm.nix">microvm</a> sandbox for running coding-agent harnesses with permission prompts disabled.
+</p>
+
+Each harness's host config and auth tokens are mounted into an isolated
+QEMU guest where the agent can read, write, and run commands without
+prompting -- without that blast radius reaching the host.
+
+Currently supported harnesses: `claude-code`
+([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) and
+`opencode` ([opencode](https://github.com/sst/opencode)). The
+architecture is harness-agnostic; adding more is a matter of declaring
+their host paths and launcher in `flake.nix`.
 
 ## Quick start
 
 ```
-nix run github:illustris/cc-sandbox
+nix run github:illustris/cogbox
 ```
 
 On first run, the wrapper asks which harnesses to set up (only the ones
-you pick get host-side config dirs created -- a pure opencode user does
-not get `~/.claude/` materialized, and vice versa) and then prompts
-before touching anything:
+you pick get host-side config dirs created) and then prompts before
+touching anything:
 
 ```
 No harness state detected. Set up which?
@@ -24,9 +35,9 @@ No harness state detected. Set up which?
 Choice [1-3]:
 
 The following paths will be created:
-  ~/.config/cc-sandbox/instances/default/config.json  (default settings)
-  ~/.config/cc-sandbox/authorized_keys  (SSH public keys; seeded from ~/.ssh/*.pub + ssh-add -L)
-  ~/.local/share/cc-sandbox/instances/default/  (VM data)
+  ~/.config/cogbox/instances/default/config.json  (default settings)
+  ~/.config/cogbox/authorized_keys  (SSH public keys; seeded from ~/.ssh/*.pub + ssh-add -L)
+  ~/.local/share/cogbox/instances/default/  (VM data)
   ~/.claude/  (claude-code config)
   ~/.claude.json  (claude-code auth)
   ~/.config/opencode/  (opencode config)
@@ -35,9 +46,12 @@ The following paths will be created:
 Continue? [y/N]
 ```
 
-Once the VM boots, run `c` to launch Claude Code or `oc` to launch opencode.
+Each enabled harness ships a launcher inside the VM: `c` for
+`claude-code`, `oc` for `opencode`. Both binaries are installed
+unconditionally (subject to per-architecture availability), so once the
+VM boots either is on `$PATH`.
 
-If a harness's host state already exists when you run cc-sandbox for the
+If a harness's host state already exists when you run cogbox for the
 first time, the harness selection prompt is skipped and only those
 harnesses are activated -- so existing single-harness installs are
 unaffected.
@@ -49,14 +63,14 @@ instance gets its own data directory, overlay image, and network ports.
 
 ```sh
 # Default instance
-nix run github:illustris/cc-sandbox
+nix run github:illustris/cogbox
 
 # Create and start a named instance
-nix run github:illustris/cc-sandbox -- --name work
-nix run github:illustris/cc-sandbox -- --name personal --vcpu 8 --mem 16384
+nix run github:illustris/cogbox -- --name work
+nix run github:illustris/cogbox -- --name personal --vcpu 8 --mem 16384
 
 # List all instances and their ports
-nix run github:illustris/cc-sandbox -- --list
+nix run github:illustris/cogbox -- --list
 ```
 
 Ports are auto-assigned when an instance is first created (default starts
@@ -110,21 +124,21 @@ runtime rules file is regenerated and passt receives `SIGUSR1` to reload).
 
 ```sh
 # Prepare runtime directory without booting
-nix run github:illustris/cc-sandbox -- --init-only
+nix run github:illustris/cogbox -- --init-only
 
 # Launch with 8 cores and 16 GB RAM
-nix run github:illustris/cc-sandbox -- --vcpu 8 --mem 16384
+nix run github:illustris/cogbox -- --vcpu 8 --mem 16384
 
 # Create a named instance without starting it
-nix run github:illustris/cc-sandbox -- --name work --init-only
+nix run github:illustris/cogbox -- --name work --init-only
 
 # Launch with no outbound network
-nix run github:illustris/cc-sandbox -- --network none
+nix run github:illustris/cogbox -- --network none
 
 # Init in rules mode (gets the seeded bogon-deny ruleset by default).
 # To allow a specific LAN host, insert an allow before the matching deny;
 # see the "rules" network mode section for the full pattern.
-nix run github:illustris/cc-sandbox -- --name secure --init-only
+nix run github:illustris/cogbox -- --name secure --init-only
 ```
 
 ## Network modes
@@ -144,10 +158,10 @@ QEMU's SLIRP `restrict=on` blocks all outbound traffic from the guest.
 SSH and HTTP port forwards from the host still work. No extra privileges
 needed.
 
-Note: harnesses generally need access to a model provider's API
-(Anthropic for `c`, the configured provider for `oc`). In `none` mode
-they won't function unless API access is provided through another
-channel (e.g., SSH port forwarding).
+Note: every supported harness needs access to a model provider's API
+(`claude-code` -> Anthropic; `opencode` -> the configured provider).
+In `none` mode they won't function unless API access is provided
+through another channel (e.g., SSH port forwarding).
 
 ### rules (default)
 
@@ -206,11 +220,11 @@ Two practical patterns:
 deny. Use `rules list` to find the right index for the deny:
 
 ```sh
-cc-sandbox rules list
+cogbox rules list
 # ...
 # 8: deny 192.168.0.0/16  # RFC1918 private
 # ...
-cc-sandbox rules add allow 192.168.1.50/32 --at 8
+cogbox rules add allow 192.168.1.50/32 --at 8
 ```
 
 **Block a specific public address** -- insert the deny ahead of the
@@ -218,7 +232,7 @@ trailing `allow 0.0.0.0/0`. Easiest is `--at 1` so it runs before all
 existing rules:
 
 ```sh
-cc-sandbox rules add deny 8.8.8.8/32 --at 1
+cogbox rules add deny 8.8.8.8/32 --at 1
 ```
 
 Implicit rules (applied before user rules, not configurable):
@@ -234,7 +248,7 @@ initialization runs before passt enables its seccomp sandbox.
 
 ## Configuration
 
-All settings are in `~/.config/cc-sandbox/` (or `$XDG_CONFIG_HOME/cc-sandbox/`).
+All settings are in `~/.config/cogbox/` (or `$XDG_CONFIG_HOME/cogbox/`).
 Edit them and restart the VM -- no rebuild needed.
 
 ### config.json
@@ -268,11 +282,11 @@ Only include the keys you want to change -- missing keys use the defaults.
 ### Per-instance configuration
 
 Each instance has its own config dir under
-`~/.config/cc-sandbox/instances/<name>/`. The default instance uses the
+`~/.config/cogbox/instances/<name>/`. The default instance uses the
 reserved name `default`, so the config layout mirrors the data layout:
 
 ```
-~/.config/cc-sandbox/
+~/.config/cogbox/
   authorized_keys              # shared SSH keys (fallback for all instances)
   instances/
     default/
@@ -294,13 +308,13 @@ Each instance config has the same format. SSH keys fall back to the
 shared top-level `authorized_keys` unless a per-instance file exists.
 
 Data (VM state, overlays) is stored per-instance under
-`~/.local/share/cc-sandbox/instances/<name>/`. The default instance uses
+`~/.local/share/cogbox/instances/<name>/`. The default instance uses
 the reserved name `default`, so all instances are siblings and a
 default-instance boot does not 9p-share named-instance state into the
 default guest:
 
 ```
-~/.local/share/cc-sandbox/
+~/.local/share/cogbox/
   instances/
     default/                   # default instance data
       harness-overlay.img      # shared across claude-code, opencode
@@ -314,7 +328,7 @@ default guest:
 ### Per-instance NixOS extensions (flake.nix)
 
 Each instance owns a tiny flake at
-`~/.config/cc-sandbox/instances/<name>/flake/flake.nix`. When that file
+`~/.config/cogbox/instances/<name>/flake/flake.nix`. When that file
 differs from the scaffolded default, the wrapper re-execs itself via `nix
 run --override-input userExtensions path:<instance-config-dir>/flake`, so
 whatever NixOS module the user puts in that flake is folded into the
@@ -328,7 +342,7 @@ The scaffold written on first init exposes a no-op `nixosModules.default`:
 
 ```nix
 {
-    description = "cc-sandbox per-instance extensions";
+    description = "cogbox per-instance extensions";
 
     outputs = { self }: {
         nixosModules.default = { pkgs, lib, ... }: {
@@ -338,9 +352,9 @@ The scaffold written on first init exposes a no-op `nixosModules.default`:
 }
 ```
 
-`pkgs` here resolves to cc-sandbox's nixpkgs -- the wrapper passes
+`pkgs` here resolves to cogbox's nixpkgs -- the wrapper passes
 `--override-input userExtensions/nixpkgs` so any `nixpkgs` input the user
-declares is replaced by cc-sandbox's. To use a *different* nixpkgs in one
+declares is replaced by cogbox's. To use a *different* nixpkgs in one
 instance, declare a separately-named input (e.g. `nixpkgs-custom`) and
 reference it explicitly in the module.
 
@@ -352,7 +366,7 @@ the system closure instead, so it's registered in the guest's nix DB at
 boot and resolves locally:
 
 ```nix
-# ~/.config/cc-sandbox/instances/hbase/flake/flake.nix
+# ~/.config/cogbox/instances/hbase/flake/flake.nix
 {
     outputs = { self }: {
         nixosModules.default = { pkgs, ... }: {
@@ -381,7 +395,7 @@ the flake.
   ends after one hop). `--list` and `rules` subcommands skip the re-exec,
   as does any unedited scaffold.
 - The first launch *with* a customized flake fetches and caches every
-  cc-sandbox flake input (microvm.nix, nixfs, nix-mcp, etc.) -- it needs
+  cogbox flake input (microvm.nix, nixfs, nix-mcp, etc.) -- it needs
   network access on that one launch. Subsequent launches reuse the cache.
 
 ### authorized_keys
@@ -395,12 +409,12 @@ instance's data dir, where the VM reads it at boot.
 
 ```sh
 # Add another key after init
-cp ~/.ssh/id_ed25519.pub ~/.config/cc-sandbox/authorized_keys
+cp ~/.ssh/id_ed25519.pub ~/.config/cogbox/authorized_keys
 
 # Connect via the ssh subcommand (resolves port/host automatically)
-cc-sandbox ssh                          # default instance
-cc-sandbox ssh --name work              # named instance
-cc-sandbox ssh --name work htop         # one-off remote command
+cogbox ssh                          # default instance
+cogbox ssh --name work              # named instance
+cogbox ssh --name work htop         # one-off remote command
 
 # Or use ssh directly if you prefer
 ssh -p 2222 root@localhost
@@ -415,14 +429,14 @@ Override where data lives on the host with environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `CC_SANDBOX_DATA` | `$XDG_DATA_HOME/cc-sandbox` (i.e. `~/.local/share/cc-sandbox`) | Persistent data root. Each instance lives at `$CC_SANDBOX_DATA/instances/<name>/`; the default uses the reserved name `default`. |
-| `CC_SANDBOX_CLAUDE_CONFIG` | `$HOME/.claude` | Host claude-code config (overlay lower in VM) |
-| `CC_SANDBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | claude-code auth token for the VM |
-| `CC_SANDBOX_OPENCODE_CONFIG` | `$XDG_CONFIG_HOME/opencode` | Host opencode config (overlay lower in VM) |
-| `CC_SANDBOX_OPENCODE_DATA` | `$XDG_DATA_HOME/opencode` | Host opencode data (auth lives here as `auth.json`) |
+| `COGBOX_DATA` | `$XDG_DATA_HOME/cogbox` (i.e. `~/.local/share/cogbox`) | Persistent data root. Each instance lives at `$COGBOX_DATA/instances/<name>/`; the default uses the reserved name `default`. |
+| `COGBOX_CLAUDE_CONFIG` | `$HOME/.claude` | Host claude-code config (overlay lower in VM) |
+| `COGBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | claude-code auth token for the VM |
+| `COGBOX_OPENCODE_CONFIG` | `$XDG_CONFIG_HOME/opencode` | Host opencode config (overlay lower in VM) |
+| `COGBOX_OPENCODE_DATA` | `$XDG_DATA_HOME/opencode` | Host opencode data (auth lives here as `auth.json`) |
 
 ```sh
-CC_SANDBOX_DATA=/mnt/fast/cc-sandbox nix run .
+COGBOX_DATA=/mnt/fast/cogbox nix run .
 ```
 
 ## How it works
@@ -430,17 +444,17 @@ CC_SANDBOX_DATA=/mnt/fast/cc-sandbox nix run .
 QEMU's 9p share sources must be absolute paths known at build time. The
 wrapper creates a per-instance symlink directory pointing to the user's
 actual paths, so the built VM image works for any user. Runtime state
-lives under `$XDG_RUNTIME_DIR/cc-sandbox` (typically
-`/run/user/$UID/cc-sandbox`); named instances append a `-<name>`
+lives under `$XDG_RUNTIME_DIR/cogbox` (typically
+`/run/user/$UID/cogbox`); named instances append a `-<name>`
 suffix. Each has its own symlinks and PID lock:
 
 ```
-$XDG_RUNTIME_DIR/cc-sandbox[-<name>]/
-  data/                  -> $CC_SANDBOX_DATA/instances/<name>
-  claude-code-config     -> $CC_SANDBOX_CLAUDE_CONFIG
-  claude-code-auth       -> $CC_SANDBOX_CLAUDE_AUTH
-  opencode-config        -> $CC_SANDBOX_OPENCODE_CONFIG
-  opencode-data          -> $CC_SANDBOX_OPENCODE_DATA
+$XDG_RUNTIME_DIR/cogbox[-<name>]/
+  data/                  -> $COGBOX_DATA/instances/<name>
+  claude-code-config     -> $COGBOX_CLAUDE_CONFIG
+  claude-code-auth       -> $COGBOX_CLAUDE_AUTH
+  opencode-config        -> $COGBOX_OPENCODE_CONFIG
+  opencode-data          -> $COGBOX_OPENCODE_DATA
   .harness-stubs/        # empty stubs for inactive harnesses (so QEMU
                          # 9p sources resolve even when the host has no
                          # state for a given harness)
@@ -448,7 +462,7 @@ $XDG_RUNTIME_DIR/cc-sandbox[-<name>]/
 
 If `$XDG_RUNTIME_DIR` is unset and `/run/user/$UID` doesn't exist (no
 active logind session), the wrapper falls back to
-`/tmp/cc-sandbox-runtime-$UID/` per the XDG spec.
+`/tmp/cogbox-runtime-$UID/` per the XDG spec.
 
 Runtime settings (vcpu, memory, ports) are applied by patching the microvm
 runner script's QEMU arguments at launch time. Settings that affect the
@@ -467,12 +481,12 @@ connections receive `ENETUNREACH`. The library initializes via
 completes before passt activates its seccomp-bpf sandbox. Rules can be
 hot-reloaded at runtime via `SIGUSR1` to the passt process.
 
-The `cc-sandbox rules` subcommands (`list`, `add`, `del`, `set`) are
-implemented by `cc-sandbox-rules`, a small Zig CLI shipped from the same
+The `cogbox rules` subcommands (`list`, `add`, `del`, `set`) are
+implemented by `cogbox-rules`, a small Zig CLI shipped from the same
 project as the filter library. It edits `config.json`, regenerates the
 runtime rules file, and signals the running passt -- so rule changes
 take effect without restarting the VM. Both binaries share the on-disk
-rule format parser, so anything `cc-sandbox-rules` accepts the runtime
+rule format parser, so anything `cogbox-rules` accepts the runtime
 filter accepts.
 
 ## Defaults
@@ -489,14 +503,15 @@ filter accepts.
 | Docker | enabled |
 
 Pre-installed tools: `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`,
-`nixfs`, `opencode` (with the `oc` launcher).
-Architecture-conditional: `claude-code` and the `c` launcher (x86_64,
-aarch64), `bpftrace` (x86_64, aarch64), `nix-mcp` (where the `nix-mcp`
-flake publishes a build).
+`nixfs`.
+Harness binaries (with launchers): `claude-code` (`c`, on `x86_64-linux`
+and `aarch64-linux`), `opencode` (`oc`, all supported architectures).
+Architecture-conditional extras: `bpftrace` (x86_64, aarch64), `nix-mcp`
+(where the `nix-mcp` flake publishes a build).
 
 ## Harnesses
 
-A *harness* is a coding-agent CLI that cc-sandbox installs in the guest
+A *harness* is a coding-agent CLI that cogbox installs in the guest
 and mounts host state for. The currently-supported harnesses are
 `claude-code` (launcher: `c`) and `opencode` (launcher: `oc`).
 
@@ -517,7 +532,7 @@ The harness model is symmetric and opt-in:
   Resizing `overlaySize` covers all harnesses at once.
 
 To add a harness after init, either create its host config dir
-manually and re-launch, or set `CC_SANDBOX_<HARNESS>_<KEY>` to point at
+manually and re-launch, or set `COGBOX_<HARNESS>_<KEY>` to point at
 an existing dir.
 
 A note about `node_modules/`: if a host harness config dir contains a
@@ -539,9 +554,11 @@ How "full auto" is wired per harness:
 ## Limitations
 
 - Linux host with KVM. Build targets: `x86_64-linux`, `aarch64-linux`,
-  `riscv64-linux`. The pre-built `claude-code` and `c` launcher are
-  shipped only on `x86_64-linux` and `aarch64-linux`; on `riscv64-linux`
-  you'll need to install Claude Code manually inside the VM
+  `riscv64-linux`.
+- Per-harness platform availability varies. `claude-code` is pre-built
+  on `x86_64-linux` and `aarch64-linux` only; on `riscv64-linux` only
+  `opencode` ships out of the box, and `claude-code` would have to be
+  installed manually inside the VM.
 - One instance per name at a time (PID lock per runtime directory).
   Multiple differently-named instances can run simultaneously.
 - The writable nix store overlay is a tmpfs -- installed packages do not

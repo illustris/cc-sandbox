@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 	rules_mod.addImport("filter", filter_mod);
 
 	const rules_exe = b.addExecutable(.{
-		.name = "cc-sandbox-rules",
+		.name = "cogbox-rules",
 		.root_module = rules_mod,
 	});
 	b.installArtifact(rules_exe);

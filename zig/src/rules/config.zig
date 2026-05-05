@@ -1,4 +1,4 @@
-// Load and save cc-sandbox config.json files. Preserves arbitrary fields on
+// Load and save cogbox config.json files. Preserves arbitrary fields on
 // rule objects (specifically `comment`) by keeping the document as a
 // std.json.Value tree and serializing it back with a jq --tab compatible
 // pretty printer.

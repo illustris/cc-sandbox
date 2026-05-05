@@ -1,5 +1,5 @@
 {
-	description = "cc-sandbox no-op user extensions placeholder";
+	description = "cogbox no-op user extensions placeholder";
 
 	outputs = { self }: {
 		nixosModules.default = { ... }: {};

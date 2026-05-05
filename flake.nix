@@ -1,5 +1,5 @@
 {
-	description = "cc-sandbox MicroVM";
+	description = "cogbox MicroVM";
 
 	inputs = {
 		nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -32,23 +32,23 @@
 		forAllSystems = f: lib.genAttrs supportedSystems f;
 
 		archSuffix = system: builtins.head (lib.splitString "-" system);
-		configName = system: "cc-sandbox-${archSuffix system}";
+		configName = system: "cogbox-${archSuffix system}";
 
 		# Sentinel placeholder baked into the microvm runner's QEMU args
 		# (9p share sources, fw_cfg file paths). At launch the wrapper
 		# sed-rewrites this prefix to the resolved per-user XDG runtime
-		# dir ($XDG_RUNTIME_DIR/cc-sandbox), then populates it with
+		# dir ($XDG_RUNTIME_DIR/cogbox), then populates it with
 		# symlinks to the user's data/config locations. The literal
 		# value here is irrelevant beyond being a unique, stable string
 		# for the substitution to find.
-		runtimeDir = "/tmp/cc-sandbox";
+		runtimeDir = "/tmp/cogbox";
 		dataDir = "${runtimeDir}/data";
 
 		# --- Harness configuration --------------------------------------
 		# Single source of truth for how each coding-agent harness is
 		# wired into the VM. Iterated below to emit systemPackages,
 		# microvm.shares, qemu.extraArgs, systemd services, and
-		# fileSystems. The cc-sandbox.sh wrapper iterates the same shape
+		# fileSystems. The cogbox.sh wrapper iterates the same shape
 		# (re-declared in bash) to seed host state and create the runtime
 		# symlinks the QEMU runner expects.
 		#
@@ -184,7 +184,7 @@
 		# position the runtime override-input would, so the resulting
 		# microvm runner has a deterministic .drvPath that matches what
 		# `nix run --override-input userExtensions ...` produces.
-		ccSandboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default }: let
+		cogboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default }: let
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
 			inputs.nixfs.nixosModules.nixfs
@@ -283,13 +283,13 @@
 						description = "Load SSH authorized keys from shared config";
 						wantedBy = [ "multi-user.target" ];
 						before = [ "sshd.service" ];
-						after = [ "var-lib-cc\\x2dsandbox.mount" ];
-						requires = [ "var-lib-cc\\x2dsandbox.mount" ];
+						after = [ "var-lib-cogbox.mount" ];
+						requires = [ "var-lib-cogbox.mount" ];
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
 							ExecStart = pkgs.writeShellScript "load-ssh-keys" ''
-								keyfile=/var/lib/cc-sandbox/.config/authorized_keys
+								keyfile=/var/lib/cogbox/.config/authorized_keys
 								if [ -f "$keyfile" ] && [ -s "$keyfile" ]; then
 									mkdir -p /root/.ssh
 									chmod 700 /root/.ssh
@@ -303,15 +303,15 @@
 						description = "Create ext4 image for harness overlay";
 						wantedBy = [ "var-lib-harness\\x2drw.mount" ];
 						before = [ "var-lib-harness\\x2drw.mount" ];
-						after = [ "var-lib-cc\\x2dsandbox.mount" ];
-						requires = [ "var-lib-cc\\x2dsandbox.mount" ];
+						after = [ "var-lib-cogbox.mount" ];
+						requires = [ "var-lib-cogbox.mount" ];
 						unitConfig.DefaultDependencies = false;
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
 							ExecStart = pkgs.writeShellScript "harness-overlay-img" ''
-								img=/var/lib/cc-sandbox/harness-overlay.img
-								old_img=/var/lib/cc-sandbox/claude-overlay.img
+								img=/var/lib/cogbox/harness-overlay.img
+								old_img=/var/lib/cogbox/claude-overlay.img
 								# Migration: pre-multi-harness installs had
 								# the image named after the only harness.
 								# The wrapper renames host-side at launch,
@@ -322,7 +322,7 @@
 								fi
 								if [ ! -f "$img" ]; then
 									size="128M"
-									sizefile=/var/lib/cc-sandbox/.config/overlay-size
+									sizefile=/var/lib/cogbox/.config/overlay-size
 									if [ -f "$sizefile" ]; then
 										size=$(cat "$sizefile")
 									fi
@@ -369,13 +369,13 @@
 					resize-store-overlay = {
 						description = "Resize writable nix store overlay from config";
 						wantedBy = [ "multi-user.target" ];
-						after = [ "var-lib-cc\\x2dsandbox.mount" ];
-						requires = [ "var-lib-cc\\x2dsandbox.mount" ];
+						after = [ "var-lib-cogbox.mount" ];
+						requires = [ "var-lib-cogbox.mount" ];
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
 							ExecStart = pkgs.writeShellScript "resize-store-overlay" ''
-								sizefile=/var/lib/cc-sandbox/.config/store-overlay-size
+								sizefile=/var/lib/cogbox/.config/store-overlay-size
 								if [ -f "$sizefile" ]; then
 									size=$(cat "$sizefile")
 									${pkgs.util-linux}/bin/mount -o "remount,size=$size" /nix/.rw-store
@@ -395,7 +395,7 @@
 					};
 
 					"/var/lib/harness-rw" = {
-						device = "/var/lib/cc-sandbox/harness-overlay.img";
+						device = "/var/lib/cogbox/harness-overlay.img";
 						fsType = "ext4";
 						options = [ "loop" ];
 					};
@@ -419,21 +419,21 @@
 		packages = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
-			mkCcSandbox = runner': pkgs.writeShellApplication {
-				name = "cc-sandbox";
+			mkCogbox = runner': pkgs.writeShellApplication {
+				name = "cogbox";
 				runtimeInputs = with pkgs; [ coreutils gnused gnugrep jq diffutils nix ] ++ [ self.packages.${system}.passt-cc ];
 				text = illustris-lib.replaceVarsInString {
 					runtimeDir = runtimeDir;
 					runner = "${runner'}";
-					netfilter = "${self.packages.${system}.cc-sandbox-tools}/lib/libnetfilter.so";
-					rules = "${self.packages.${system}.cc-sandbox-tools}/bin/cc-sandbox-rules";
+					netfilter = "${self.packages.${system}.cogbox-tools}/lib/libnetfilter.so";
+					rules = "${self.packages.${system}.cogbox-tools}/bin/cogbox-rules";
 					flakeSource = "${self}";
 					nixpkgsSource = "${nixpkgs}";
-				} null (builtins.readFile ./cc-sandbox.sh);
+				} null (builtins.readFile ./cogbox.sh);
 			};
 		in rec {
-			cc-sandbox-tools = pkgs.stdenv.mkDerivation {
-				pname = "cc-sandbox-tools";
+			cogbox-tools = pkgs.stdenv.mkDerivation {
+				pname = "cogbox-tools";
 				version = "0.1.0";
 				src = lib.cleanSourceWith {
 					filter = name: type: !(
@@ -452,30 +452,30 @@
 				'';
 			};
 			# Backwards-compatible alias
-			netfilter = cc-sandbox-tools;
+			netfilter = cogbox-tools;
 			passt-cc = pkgs.passt.overrideAttrs (old: {
 				# Allow rt_sigreturn so LD_PRELOAD signal handlers work
 				# under passt's seccomp filter (needed for SIGUSR1 rule reload)
 				makeFlags = (old.makeFlags or []) ++ [ "EXTRA_SYSCALLS=rt_sigreturn" ];
 			});
-			cc-sandbox = mkCcSandbox runner;
-			default = cc-sandbox;
+			cogbox = mkCogbox runner;
+			default = cogbox;
 		} // lib.optionalAttrs (system == "x86_64-linux") {
-			# Test fixture: a cc-sandbox wrapper baked against the
-			# pre-built test-hello runner. Used by tests/cc-sandbox.nix
+			# Test fixture: a cogbox wrapper baked against the
+			# pre-built test-hello runner. Used by tests/cogbox.nix
 			# Phase E to make the offline NixOS test machine's
 			# `nix run --override-input userExtensions ...` resolve as a
 			# cache hit instead of building the transitive .drv graph
 			# (which would fail with no network).
-			cc-sandbox-test-hello = mkCcSandbox
-				self.nixosConfigurations.cc-sandbox-x86_64-test-hello.config.microvm.declaredRunner;
+			cogbox-test-hello = mkCogbox
+				self.nixosConfigurations.cogbox-x86_64-test-hello.config.microvm.declaredRunner;
 		});
 
 		checks = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 		in {
 			zig-tests = pkgs.stdenv.mkDerivation {
-				pname = "cc-sandbox-zig-tests";
+				pname = "cogbox-zig-tests";
 				version = "0.1.0";
 				src = lib.cleanSourceWith {
 					filter = name: type: !(
@@ -494,20 +494,20 @@
 				'';
 			};
 		} // lib.optionalAttrs (system == "x86_64-linux") {
-			cc-sandbox-vm = pkgs.testers.runNixOSTest (import ./tests/cc-sandbox.nix {
+			cogbox-vm = pkgs.testers.runNixOSTest (import ./tests/cogbox.nix {
 				inherit self pkgs system;
 			});
 		});
 
 		nixosConfigurations = lib.listToAttrs (map (system: {
 			name = configName system;
-			value = mkMicrovm system "cc-sandbox" {
+			value = mkMicrovm system "cogbox" {
 				vcpu = 16;
 				mem = 32768;
-				extraModules = ccSandboxModules system {};
+				extraModules = cogboxModules system {};
 			};
 		}) supportedSystems) // {
-			# Test fixture used by tests/cc-sandbox.nix Phase E. Pre-builds
+			# Test fixture used by tests/cogbox.nix Phase E. Pre-builds
 			# a runner whose closure includes pkgs.hello, so the offline
 			# NixOS test machine has the cached output of the
 			# user-customised runner that Phase E reconstructs at runtime
@@ -515,10 +515,10 @@
 			# `userExt` parameter inserts the hello-adding module in the
 			# same list position userExtensions normally occupies, so the
 			# resulting .drvPath is byte-identical to the runtime path.
-			cc-sandbox-x86_64-test-hello = mkMicrovm "x86_64-linux" "cc-sandbox" {
+			cogbox-x86_64-test-hello = mkMicrovm "x86_64-linux" "cogbox" {
 				vcpu = 16;
 				mem = 32768;
-				extraModules = ccSandboxModules "x86_64-linux" {
+				extraModules = cogboxModules "x86_64-linux" {
 					userExt = { pkgs, ... }: {
 						environment.systemPackages = [ pkgs.hello ];
 						system.extraDependencies = [ pkgs.hello ];

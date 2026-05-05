@@ -2,7 +2,7 @@
 
 let
 	# Recursively collect every transitive flake input source path. Phase E
-	# triggers cc-sandbox's wrapper to re-eval its own flake on the test
+	# triggers cogbox's wrapper to re-eval its own flake on the test
 	# machine; nix resolves locked inputs by checking /nix/store for a path
 	# whose narHash matches the lock entry, so pinning every input (direct
 	# and transitive) into the system closure is enough to make the eval
@@ -16,7 +16,7 @@ let
 		);
 	in inputs: builtins.concatMap walk (builtins.attrValues inputs);
 in {
-	name = "cc-sandbox-vm";
+	name = "cogbox-vm";
 
 	nodes.machine = { config, lib, ... }: {
 		virtualisation = {
@@ -29,7 +29,7 @@ in {
 		boot.kernelModules = [ "kvm-intel" "kvm-amd" ];
 
 		environment.systemPackages = with pkgs; [
-			self.packages.${system}.cc-sandbox
+			self.packages.${system}.cogbox
 			openssh
 			jq
 			netcat-openbsd
@@ -50,8 +50,8 @@ in {
 		system.extraDependencies =
 			(collectFlakeInputs self.inputs)
 			++ [
-				self.nixosConfigurations.cc-sandbox-x86_64-test-hello.config.microvm.declaredRunner
-				self.packages.x86_64-linux.cc-sandbox-test-hello
+				self.nixosConfigurations.cogbox-x86_64-test-hello.config.microvm.declaredRunner
+				self.packages.x86_64-linux.cogbox-test-hello
 			];
 
 		users.users.testuser = {
@@ -64,7 +64,7 @@ in {
 
 		# `systemd-run --uid=testuser` in the test script runs without a
 		# logind session, so /run/user/1000 is never created. Pre-create
-		# it so cc-sandbox's XDG runtime path resolves to /run/user/1000
+		# it so cogbox's XDG runtime path resolves to /run/user/1000
 		# (matching a real interactive setup) instead of the /tmp fallback.
 		systemd.tmpfiles.rules = [
 			"d /run/user/1000 0700 testuser users -"

@@ -1,6 +1,6 @@
 // Regenerate the runtime rules file (read by the LD_PRELOAD filter) and
-// signal a running passt to re-read it. Mirrors the shell behavior at
-// cc-sandbox.sh:264-271.
+// signal a running passt to re-read it. Mirrors the shell behavior in
+// cogbox.sh.
 
 const std = @import("std");
 const rule = @import("rule.zig");

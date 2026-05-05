@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <linearGradient id="cogGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#38bdf8;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0284c7;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Outer box -->
+  <rect x="45" y="45" width="110" height="110" rx="12" ry="12"
+        fill="none" stroke="url(#cogGrad)" stroke-width="4"/>
+
+  <!-- Dark plate with glowing border matching outer frame -->
+  <rect x="58" y="58" width="84" height="84" rx="6" ry="6"
+        fill="#0f172a" stroke="url(#cogGrad)" stroke-width="2"/>
+
+  <!-- Cog gear centered on plate -->
+  <g transform="translate(100, 100)">
+    <path d="M-4,-28 L4,-28 L5,-20 L-5,-20 Z" fill="url(#cogGrad)" transform="rotate(0)"/>
+    <path d="M-4,-28 L4,-28 L5,-20 L-5,-20 Z" fill="url(#cogGrad)" transform="rotate(45)"/>
+    <path d="M-4,-28 L4,-28 L5,-20 L-5,-20 Z" fill="url(#cogGrad)" transform="rotate(90)"/>
+    <path d="M-4,-28 L4,-28 L5,-20 L-5,-20 Z" fill="url(#cogGrad)" transform="rotate(135)"/>
+    <path d="M-4,-28 L4,-28 L5,-20 L-5,-20 Z" fill="url(#cogGrad)" transform="rotate(180)"/>
+    <path d="M-4,-28 L4,-28 L5,-20 L-5,-20 Z" fill="url(#cogGrad)" transform="rotate(225)"/>
+    <path d="M-4,-28 L4,-28 L5,-20 L-5,-20 Z" fill="url(#cogGrad)" transform="rotate(270)"/>
+    <path d="M-4,-28 L4,-28 L5,-20 L-5,-20 Z" fill="url(#cogGrad)" transform="rotate(315)"/>
+
+    <circle r="16" fill="none" stroke="url(#cogGrad)" stroke-width="4"/>
+    <path d="M-10,0 Q0,-10 10,0 Q0,10 -10,0 Z" fill="none" stroke="url(#cogGrad)" stroke-width="1.5"/>
+    <circle cx="0" cy="0" r="2.5" fill="url(#cogGrad)"/>
+  </g>
+
+  <!-- Corner accents (between outer and inner box) -->
+  <line x1="45" y1="65" x2="58" y2="65" stroke="#0ea5e9" stroke-width="2" opacity="0.7"/>
+  <line x1="45" y1="135" x2="58" y2="135" stroke="#0ea5e9" stroke-width="2" opacity="0.7"/>
+  <line x1="142" y1="65" x2="155" y2="65" stroke="#0ea5e9" stroke-width="2" opacity="0.7"/>
+  <line x1="142" y1="135" x2="155" y2="135" stroke="#0ea5e9" stroke-width="2" opacity="0.7"/>
+</svg>

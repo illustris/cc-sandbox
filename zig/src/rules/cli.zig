@@ -1,8 +1,8 @@
-// Argument parsing for cc-sandbox-rules. Shape:
-//   cc-sandbox-rules --config CFG --runtime RT list
-//   cc-sandbox-rules --config CFG --runtime RT add allow|deny CIDR [--at N]
-//   cc-sandbox-rules --config CFG --runtime RT del INDEX
-//   cc-sandbox-rules --config CFG --runtime RT set       # reads stdin
+// Argument parsing for cogbox-rules. Shape:
+//   cogbox-rules --config CFG --runtime RT list
+//   cogbox-rules --config CFG --runtime RT add allow|deny CIDR [--at N]
+//   cogbox-rules --config CFG --runtime RT del INDEX
+//   cogbox-rules --config CFG --runtime RT set       # reads stdin
 
 const std = @import("std");
 const rule = @import("rule.zig");

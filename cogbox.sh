@@ -6,12 +6,12 @@ ORIG_ARGS=("$@")
 # skip the (network-dependent) `nix run` re-eval entirely.
 # shellcheck disable=SC2016
 SCAFFOLD_FLAKE='{
-	description = "cc-sandbox per-instance extensions";
+	description = "cogbox per-instance extensions";
 
-	# `pkgs` in nixosModules.default below comes from cc-sandbox'\''s nixpkgs.
+	# `pkgs` in nixosModules.default below comes from cogbox'\''s nixpkgs.
 	# To use a different nixpkgs, add an input here (e.g.
 	# inputs.nixpkgs-custom.url = "...";) and reference it explicitly.
-	# cc-sandbox always overrides any "nixpkgs" input you declare to its
+	# cogbox always overrides any "nixpkgs" input you declare to its
 	# own, so use a different name (like nixpkgs-custom) to escape that.
 
 	outputs = { self }: {
@@ -26,11 +26,11 @@ SCAFFOLD_FLAKE='{
 
 usage() {
 	cat <<'EOF'
-Usage: cc-sandbox [OPTIONS]
-       cc-sandbox rules COMMAND [--name NAME]
-       cc-sandbox ssh [--name NAME] [REMOTE_COMMAND...]
+Usage: cogbox [OPTIONS]
+       cogbox rules COMMAND [--name NAME]
+       cogbox ssh [--name NAME] [REMOTE_COMMAND...]
 
-Run coding-agent harnesses (Claude Code, opencode) in an isolated QEMU microvm.
+Run coding-agent harnesses (claude-code, opencode) in an isolated QEMU microvm.
 
 Options:
   --name NAME      Use a named instance (creates it on first run)
@@ -44,9 +44,9 @@ Options:
   --help           Show this help message
 
 Per-instance customization:
-  Each instance has a flake.nix at ~/.config/cc-sandbox/instances/<name>/flake/.
+  Each instance has a flake.nix at ~/.config/cogbox/instances/<name>/flake/.
   Edit it to add packages or NixOS modules; the next launch rebuilds the
-  microvm with your changes. cc-sandbox always overrides the user flake's
+  microvm with your changes. cogbox always overrides the user flake's
   "nixpkgs" input to its own; declare a separate input (e.g. "nixpkgs-custom")
   for a different nixpkgs.
 
@@ -72,34 +72,34 @@ Ssh subcommand:
                    key checking since the guest's root disk is ephemeral.
 
 Paths (XDG basedir spec):
-  Config:  $XDG_CONFIG_HOME/cc-sandbox        (default: ~/.config/cc-sandbox)
-  Data:    $XDG_DATA_HOME/cc-sandbox          (default: ~/.local/share/cc-sandbox)
-  Runtime: $XDG_RUNTIME_DIR/cc-sandbox        (default: /run/user/$UID/cc-sandbox)
+  Config:  $XDG_CONFIG_HOME/cogbox        (default: ~/.config/cogbox)
+  Data:    $XDG_DATA_HOME/cogbox          (default: ~/.local/share/cogbox)
+  Runtime: $XDG_RUNTIME_DIR/cogbox        (default: /run/user/$UID/cogbox)
 
 Environment variables:
-  CC_SANDBOX_DATA              Override the data root. Each instance lives at
-                               $CC_SANDBOX_DATA/instances/<name>; the default
-                               instance uses the reserved name "default".
-  CC_SANDBOX_CLAUDE_CONFIG     Host claude-code config dir (default: ~/.claude)
-  CC_SANDBOX_CLAUDE_AUTH       claude-code auth token file
-                               (default: ~/.claude.json)
-  CC_SANDBOX_OPENCODE_CONFIG   Host opencode config dir
-                               (default: $XDG_CONFIG_HOME/opencode)
-  CC_SANDBOX_OPENCODE_DATA     Host opencode data dir, includes auth.json
-                               (default: $XDG_DATA_HOME/opencode)
+  COGBOX_DATA              Override the data root. Each instance lives at
+                           $COGBOX_DATA/instances/<name>; the default
+                           instance uses the reserved name "default".
+  COGBOX_CLAUDE_CONFIG     Host claude-code config dir (default: ~/.claude)
+  COGBOX_CLAUDE_AUTH       claude-code auth token file
+                           (default: ~/.claude.json)
+  COGBOX_OPENCODE_CONFIG   Host opencode config dir
+                           (default: $XDG_CONFIG_HOME/opencode)
+  COGBOX_OPENCODE_DATA     Host opencode data dir, includes auth.json
+                           (default: $XDG_DATA_HOME/opencode)
 
 Examples:
-  cc-sandbox                          Start the default instance
-  cc-sandbox --name work              Start a named instance
-  cc-sandbox --name work --vcpu 8     Named instance with 8 cores
-  cc-sandbox --network none           Start fully isolated
-  cc-sandbox --network full           Override default rules mode for unrestricted net
-  cc-sandbox rules add allow 10.0.0.0/8 --name work
-  cc-sandbox rules list --name work
-  cc-sandbox ssh                      SSH into the default instance
-  cc-sandbox ssh --name work htop     Run htop on the "work" instance
-  cc-sandbox --list                   Show all instances
-  cc-sandbox --init-only              Set up without booting
+  cogbox                          Start the default instance
+  cogbox --name work              Start a named instance
+  cogbox --name work --vcpu 8     Named instance with 8 cores
+  cogbox --network none           Start fully isolated
+  cogbox --network full           Override default rules mode for unrestricted net
+  cogbox rules add allow 10.0.0.0/8 --name work
+  cogbox rules list --name work
+  cogbox ssh                      SSH into the default instance
+  cogbox ssh --name work htop     Run htop on the "work" instance
+  cogbox --list                   Show all instances
+  cogbox --init-only              Set up without booting
 EOF
 	exit 0
 }
@@ -134,7 +134,7 @@ while [ $# -gt 0 ]; do
 		rules)
 			RULES_MODE=1
 			shift
-			# Capture remaining args verbatim for cc-sandbox-rules. Pull
+			# Capture remaining args verbatim for cogbox-rules. Pull
 			# --name <NAME> out so the shell can resolve the instance dir;
 			# everything else passes through to the Zig binary.
 			while [ $# -gt 0 ]; do
@@ -210,8 +210,32 @@ else
 fi
 
 # -- Paths (XDG basedir spec) --------------------------------------
-CONFIG_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cc-sandbox"
-BASE_DATA="${CC_SANDBOX_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cc-sandbox}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cogbox"
+BASE_DATA="${COGBOX_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cogbox}"
+
+# -- Rebrand migration: legacy cc-sandbox paths and env vars -------
+# The project was renamed from cc-sandbox to cogbox. Warn on stale env
+# vars first (informational), then refuse to launch if config/data dirs
+# still live under the old name -- we don't silently mutate them.
+for legacy_var in CC_SANDBOX_DATA CC_SANDBOX_CLAUDE_CONFIG CC_SANDBOX_CLAUDE_AUTH \
+		CC_SANDBOX_OPENCODE_CONFIG CC_SANDBOX_OPENCODE_DATA; do
+	if [ -n "${!legacy_var:-}" ]; then
+		new_var="${legacy_var/CC_SANDBOX_/COGBOX_}"
+		echo "Warning: $legacy_var is set but no longer honored. Rename to $new_var." >&2
+	fi
+done
+LEGACY_CONFIG="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cc-sandbox"
+LEGACY_DATA="${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cc-sandbox"
+if [ -d "$LEGACY_CONFIG" ] && [ ! -e "$CONFIG_DIR" ]; then
+	echo "Error: cc-sandbox was renamed to cogbox. Move your config:"
+	echo "  mv '$LEGACY_CONFIG' '$CONFIG_DIR'"
+	exit 1
+fi
+if [ -d "$LEGACY_DATA" ] && [ ! -e "$BASE_DATA" ]; then
+	echo "Error: cc-sandbox was renamed to cogbox. Move your data:"
+	echo "  mv '$LEGACY_DATA' '$BASE_DATA'"
+	exit 1
+fi
 
 # -- Harness shape -------------------------------------------------
 # Mirror of the harness attrset in flake.nix. Both sides must agree on
@@ -234,18 +258,18 @@ declare -A H_FW_DEFAULT
 declare -A H_FW_MODE
 
 H_KIND[claude-code:config]=overlay
-H_HOST[claude-code:config]="${CC_SANDBOX_CLAUDE_CONFIG:-$REAL_HOME/.claude}"
+H_HOST[claude-code:config]="${COGBOX_CLAUDE_CONFIG:-$REAL_HOME/.claude}"
 
 H_KIND[claude-code:auth]=fw_cfg
-H_HOST[claude-code:auth]="${CC_SANDBOX_CLAUDE_AUTH:-$REAL_HOME/.claude.json}"
+H_HOST[claude-code:auth]="${COGBOX_CLAUDE_AUTH:-$REAL_HOME/.claude.json}"
 H_FW_DEFAULT[claude-code:auth]='{}'
 H_FW_MODE[claude-code:auth]=600
 
 H_KIND[opencode:config]=overlay
-H_HOST[opencode:config]="${CC_SANDBOX_OPENCODE_CONFIG:-${XDG_CONFIG_HOME:-$REAL_HOME/.config}/opencode}"
+H_HOST[opencode:config]="${COGBOX_OPENCODE_CONFIG:-${XDG_CONFIG_HOME:-$REAL_HOME/.config}/opencode}"
 
 H_KIND[opencode:data]=overlay
-H_HOST[opencode:data]="${CC_SANDBOX_OPENCODE_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/opencode}"
+H_HOST[opencode:data]="${COGBOX_OPENCODE_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/opencode}"
 
 H_KIND[opencode:cache]=ephemeral
 H_KIND[opencode:state]=ephemeral
@@ -274,7 +298,7 @@ RUNTIME_TEMPLATE="@runtimeDir@"
 # Per-user runtime dir per the XDG basedir spec. Under sudo, XDG_RUNTIME_DIR
 # typically points at root's tree (or is unset); use the invoking user's
 # /run/user/$UID instead. If that doesn't exist (no active logind session),
-# fall back to /tmp/cc-sandbox-runtime-$UID per the spec's "replacement
+# fall back to /tmp/cogbox-runtime-$UID per the spec's "replacement
 # directory with similar capabilities" guidance.
 if [ -n "${SUDO_USER:-}" ] || [ -z "${XDG_RUNTIME_DIR:-}" ]; then
 	XDG_RUNTIME_BASE="/run/user/$REAL_UID"
@@ -282,11 +306,26 @@ else
 	XDG_RUNTIME_BASE="$XDG_RUNTIME_DIR"
 fi
 if [ ! -d "$XDG_RUNTIME_BASE" ]; then
-	XDG_RUNTIME_BASE="/tmp/cc-sandbox-runtime-$REAL_UID"
+	XDG_RUNTIME_BASE="/tmp/cogbox-runtime-$REAL_UID"
 	mkdir -p "$XDG_RUNTIME_BASE"
 	chmod 700 "$XDG_RUNTIME_BASE"
 fi
-BASE_RUNTIME="$XDG_RUNTIME_BASE/cc-sandbox"
+BASE_RUNTIME="$XDG_RUNTIME_BASE/cogbox"
+
+# Legacy runtime cleanup hint. Stale cc-sandbox-* runtime dirs hold pid
+# locks and 9p sentinels for instances that no longer correspond to a
+# cogbox config.
+LEGACY_RUNTIMES=()
+for legacy in "$XDG_RUNTIME_BASE"/cc-sandbox*; do
+	[ -e "$legacy" ] || continue
+	LEGACY_RUNTIMES+=("$legacy")
+done
+if [ "${#LEGACY_RUNTIMES[@]}" -gt 0 ]; then
+	echo "Warning: legacy cc-sandbox runtime dirs detected. Remove them:"
+	for d in "${LEGACY_RUNTIMES[@]}"; do
+		echo "  rm -rf '$d'"
+	done
+fi
 
 EFFECTIVE_NAME="${INSTANCE_NAME:-default}"
 INSTANCE_CONFIG_DIR="$CONFIG_DIR/instances/$EFFECTIVE_NAME"
@@ -309,7 +348,7 @@ if [ -z "$INSTANCE_NAME" ]; then
 	[ -f "$CONFIG_DIR/config.json" ] && [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ] && OLD_CFG=1
 	[ -e "$BASE_DATA/claude-overlay.img" ] && [ ! -d "$REAL_DATA" ] && OLD_DATA=1
 	if [ -n "$OLD_CFG" ] || [ -n "$OLD_DATA" ]; then
-		echo "Error: cc-sandbox layout changed. The default instance now lives at:"
+		echo "Error: cogbox layout changed. The default instance now lives at:"
 		echo "  config: $INSTANCE_CONFIG_DIR/"
 		echo "  data:   $REAL_DATA/"
 		echo "Migrate with:"
@@ -339,7 +378,7 @@ if [ -d "$CONFIG_DIR/instances" ]; then
 		fi
 	done
 	if [ "${#OLD_FLAKES[@]}" -gt 0 ]; then
-		echo "Error: cc-sandbox flake layout changed. The per-instance flake now lives at:"
+		echo "Error: cogbox flake layout changed. The per-instance flake now lives at:"
 		echo "  <instance>/flake/flake.nix  (was: <instance>/flake.nix)"
 		echo "Migrate with:"
 		for d in "${OLD_FLAKES[@]}"; do
@@ -424,11 +463,11 @@ fi
 if [ "$SSH_MODE" -eq 1 ]; then
 	if [ ! -f "$RUNTIME/pid" ] || ! kill -0 "$(cat "$RUNTIME/pid")" 2>/dev/null; then
 		echo "Error: instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is not running."
-		echo "Start it first with: cc-sandbox${INSTANCE_NAME:+ --name $INSTANCE_NAME}"
+		echo "Start it first with: cogbox${INSTANCE_NAME:+ --name $INSTANCE_NAME}"
 		exit 1
 	fi
 	if [ ! -f "$RUNTIME/ssh-endpoint" ]; then
-		echo "Error: missing $RUNTIME/ssh-endpoint (instance launched by an older cc-sandbox?)."
+		echo "Error: missing $RUNTIME/ssh-endpoint (instance launched by an older cogbox?)."
 		echo "Restart the instance to repopulate it."
 		exit 1
 	fi
@@ -713,24 +752,24 @@ fi
 
 # -- Re-exec with per-instance flake overlaid ---------------------
 # Each instance owns a flake.nix that exposes nixosModules.default.
-# We re-evaluate cc-sandbox with that flake patched in via
+# We re-evaluate cogbox with that flake patched in via
 # --override-input, so the rebuilt microvm runner includes the user's
-# modules. CC_SANDBOX_REEXECED breaks the loop after the first hop.
-# The user flake's "nixpkgs" input is forced to follow cc-sandbox's
+# modules. COGBOX_REEXECED breaks the loop after the first hop.
+# The user flake's "nixpkgs" input is forced to follow cogbox's
 # nixpkgs by default; users can declare a separate input
 # (e.g. nixpkgs-custom) for an independent nixpkgs.
-if [ -z "${CC_SANDBOX_REEXECED:-}" ] && [ -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
+if [ -z "${COGBOX_REEXECED:-}" ] && [ -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
 	# Skip re-exec when the user hasn't edited flake.nix from the scaffold.
 	# The scaffold's nixosModules.default is empty, so the microvm closure
 	# would be identical to the baked-in one anyway -- and re-evaluating
-	# the cc-sandbox flake requires its inputs to be fetchable, which a
+	# the cogbox flake requires its inputs to be fetchable, which a
 	# fresh "nix profile install" or NixOS-systemPackages setup may not have
 	# locally cached. Users who actually customize their flake.nix opt into
 	# the re-eval (and need network on first launch to populate the cache).
 	# `cmp` is byte-exact and avoids the trailing-newline trim that command
 	# substitution does.
 	if ! printf '%s' "$SCAFFOLD_FLAKE" | cmp -s - "$INSTANCE_FLAKE_DIR/flake.nix"; then
-		exec env CC_SANDBOX_REEXECED=1 nix \
+		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
 			run "path:@flakeSource@" \
 			--override-input userExtensions "path:$INSTANCE_FLAKE_DIR" \
@@ -877,7 +916,8 @@ fi
 # -- Launch --------------------------------------------------------
 if [ "$NETWORK_MODE" = "none" ]; then
 	echo "Warning: network mode is \"none\" -- all outbound traffic is blocked."
-	echo "Claude Code requires API access via SSH tunnel or similar."
+	echo "Harnesses that need outbound API access (claude-code, opencode) won't"
+	echo "function unless you provide it via SSH tunnel or similar."
 fi
 
 # -- Helper: wait for passt socket ---------------------------------
