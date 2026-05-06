@@ -1,28 +1,39 @@
 const std = @import("std");
-const cli = @import("cli.zig");
+pub const cli = @import("cli.zig");
 const config = @import("config.zig");
 const rule = @import("rule.zig");
 const reload = @import("reload.zig");
 
-pub fn main(init: std.process.Init) !void {
-	const allocator = init.gpa;
-	const io = init.io;
-
-	const argv_full = try init.minimal.args.toSlice(init.arena.allocator());
-	const argv: []const []const u8 = blk: {
-		const slice = try init.arena.allocator().alloc([]const u8, argv_full.len);
-		for (argv_full, 0..) |a, i| slice[i] = a;
-		break :blk if (slice.len > 0) slice[1..] else &.{};
-	};
+/// Entry point for the rules verb. The new top-level cogbox CLI parses
+/// `--name` itself and constructs `--config`/`--runtime` from the active
+/// instance, then forwards the remaining argv (subcommand + args) here.
+///
+/// `argv` is the slice after the verb (`rules`) but BEFORE `--config`/
+/// `--runtime` are inserted; this function inserts them so the existing
+/// `cli.parse` entry point keeps working unchanged.
+pub fn dispatch(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	config_path: []const u8,
+	runtime_path: []const u8,
+	rest: []const []const u8,
+) !void {
+	var argv = try allocator.alloc([]const u8, 4 + rest.len);
+	defer allocator.free(argv);
+	argv[0] = "--config";
+	argv[1] = config_path;
+	argv[2] = "--runtime";
+	argv[3] = runtime_path;
+	for (rest, 0..) |a, i| argv[4 + i] = a;
 
 	const args = cli.parse(argv) catch |err| {
-		try writeStderr(io, try std.fmt.allocPrint(allocator, "Error: argument error: {s}\n", .{@errorName(err)}));
-		std.process.exit(2);
+		try writeStderr(io, try std.fmt.allocPrint(allocator, "cogbox rules: error: {s}\n", .{@errorName(err)}));
+		std.process.exit(64);
 	};
 
 	var loaded = config.load(allocator, io, args.config_path) catch |err| switch (err) {
-		error.FileNotFound => return die(allocator, io, "no config found at {s}", .{args.config_path}),
-		error.InvalidJson => return die(allocator, io, "invalid JSON in {s}", .{args.config_path}),
+		error.FileNotFound => return die(allocator, io, "no config found at {s}", .{args.config_path}, 66),
+		error.InvalidJson => return die(allocator, io, "invalid JSON in {s}", .{args.config_path}, 65),
 		else => return err,
 	};
 	defer loaded.deinit();
@@ -33,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
 			io,
 			"instance is not in rules mode. Set network to rules mode first: edit {s} or reinit with --network rules.",
 			.{args.config_path},
+			65,
 		),
 		else => return err,
 	};
@@ -85,13 +97,13 @@ fn cmdAdd(
 	const tree_alloc = loaded.treeAllocator();
 	if (a.pos) |p| {
 		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.cidr) catch |err| switch (err) {
-			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}),
-			error.InvalidCidr => return die(allocator, io, "invalid CIDR: {s}", .{a.cidr}),
+			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
+			error.InvalidCidr => return die(allocator, io, "invalid CIDR: {s}", .{a.cidr}, 65),
 			else => return err,
 		};
 	} else {
 		_ = rule.append(tree_alloc, rules_arr, a.action, a.cidr) catch |err| switch (err) {
-			error.InvalidCidr => return die(allocator, io, "invalid CIDR: {s}", .{a.cidr}),
+			error.InvalidCidr => return die(allocator, io, "invalid CIDR: {s}", .{a.cidr}, 65),
 			else => return err,
 		};
 	}
@@ -118,7 +130,7 @@ fn cmdDel(
 	loaded: *config.Loaded,
 ) !void {
 	rule.delete(rules_arr, d.index) catch {
-		return die(allocator, io, "index {d} out of range (1..{d})", .{ d.index, rules_arr.items.len });
+		return die(allocator, io, "index {d} out of range (1..{d})", .{ d.index, rules_arr.items.len }, 65);
 	};
 
 	try config.save(allocator, io, args.config_path, loaded.root().*);
@@ -148,7 +160,7 @@ fn cmdSet(
 		const maybe_line = try stdin_reader.interface.takeDelimiter('\n');
 		const line = maybe_line orelse break;
 		const parsed = rule.parseSetLine(line) catch {
-			return die(allocator, io, "invalid line: {s}", .{line});
+			return die(allocator, io, "invalid line: {s}", .{line}, 65);
 		};
 		if (parsed) |p| {
 			const off = owned_storage.items.len;
@@ -199,8 +211,8 @@ fn announce(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, 
 	try writeStdout(io, msg);
 }
 
-fn die(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args: anytype) noreturn {
-	const msg = std.fmt.allocPrint(allocator, "Error: " ++ fmt ++ "\n", args) catch "Error: (message too long)\n";
+fn die(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args: anytype, code: u8) noreturn {
+	const msg = std.fmt.allocPrint(allocator, "cogbox rules: error: " ++ fmt ++ "\n", args) catch "cogbox rules: error: (message too long)\n";
 	writeStderr(io, msg) catch {};
-	std.process.exit(1);
+	std.process.exit(code);
 }

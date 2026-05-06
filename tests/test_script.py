@@ -62,7 +62,7 @@ with subtest("Phase A: CLI / state without booting"):
     # A1: first-run init for the default instance, network=none.
     # A non-interactive stdin auto-selects all harnesses, so both
     # claude-code and opencode host paths are seeded.
-    machine.succeed(as_user("yes y | cogbox --init-only --network none"))
+    machine.succeed(as_user("cogbox init -y --network none"))
     machine.succeed("test -f /home/testuser/.config/cogbox/instances/default/config.json")
     machine.succeed("test -f /home/testuser/.config/cogbox/authorized_keys")
     machine.succeed("test -d /home/testuser/.local/share/cogbox/instances/default")
@@ -84,14 +84,14 @@ with subtest("Phase A: CLI / state without booting"):
     ).strip()
     assert net == "none", f"expected network=none, got {net!r}"
 
-    # A2: --list shows the default instance
-    out = machine.succeed(as_user("cogbox --list"))
+    # A2: list shows the default instance
+    out = machine.succeed(as_user("cogbox list"))
     assert "(default)" in out, out
     assert "ssh:2222" in out, out
     assert "net:none" in out, out
 
     # A3: named instance with rules mode -> auto-assigned ports
-    machine.succeed(as_user("yes y | cogbox --init-only --name work --network rules"))
+    machine.succeed(as_user("cogbox init -y --name work --network rules"))
     # Named instance data must be a sibling of the default's data dir, not
     # nested inside it. A default-instance boot 9p-shares its data dir into
     # the guest; if named instances live under it, they leak across.
@@ -106,8 +106,8 @@ with subtest("Phase A: CLI / state without booting"):
     ).strip()
     assert net_kind == "object", f"expected rules object, got {net_kind!r}"
 
-    # A4: --list shows both
-    out = machine.succeed(as_user("cogbox --list"))
+    # A4: list shows both
+    out = machine.succeed(as_user("cogbox list"))
     assert "(default)" in out and "work" in out, out
 
     # A5: rules add / list / del on the work instance.
@@ -135,7 +135,7 @@ machine.succeed(
 
 with subtest("Phase B: --network none blocks all outbound"):
     boot_and_wait("cc-default", "", ssh_port=2222)
-    out = machine.succeed(as_user("cogbox --list"))
+    out = machine.succeed(as_user("cogbox list"))
     assert "(running)" in out, out
     hostname = machine.succeed(as_user("cogbox ssh hostname")).strip()
     assert hostname == "cogbox", f"unexpected inner hostname {hostname!r}"
@@ -146,7 +146,7 @@ with subtest("Phase B: --network none blocks all outbound"):
 with subtest("Phase C: --network full allows outbound"):
     # Reinit the default instance in full mode
     machine.succeed("rm -f /home/testuser/.config/cogbox/instances/default/config.json")
-    machine.succeed(as_user("yes y | cogbox --init-only --network full"))
+    machine.succeed(as_user("cogbox init -y --network full"))
     machine.succeed(
         "cp /home/testuser/.ssh/id_ed25519.pub "
         "/home/testuser/.config/cogbox/authorized_keys"
@@ -220,9 +220,9 @@ NIX_EOF"""))
     # again (the wrapper compares the on-disk flake.nix to its built-in
     # scaffold and skips the re-eval when they match).
     machine.succeed(f"rm {flake_path}")
-    # Re-running --init-only repopulates the scaffold without prompting
+    # Re-running init repopulates the scaffold without prompting
     # since everything else exists.
-    machine.succeed(as_user("yes y | cogbox --init-only --network full"))
+    machine.succeed(as_user("cogbox init -y --network full"))
     boot_and_wait("cc-default", "", ssh_port=2222)
     machine.fail(
         as_user("cogbox ssh 'command -v hello'")
@@ -276,3 +276,47 @@ with subtest("Phase F: opencode harness wired into the VM"):
     )).strip()
     assert out == "persisted", out
     stop_instance("cc-default")
+
+with subtest("Phase G: CLI parser regressions and stub-friendly verbs"):
+    # cogbox writes errors to stderr; the test driver's machine.execute()
+    # captures only stdout, so we redirect 2>&1 to assert on the message
+    # text. Exit codes are still distinct (sysexits values).
+    def run_cli(cmd):
+        return machine.execute(as_user(cmd + " 2>&1"))
+
+    # G1: status of a not-running default instance -> exit 3, prints "stopped"
+    rc, out = run_cli("cogbox status")
+    assert rc == 3, f"expected exit 3 (stopped), got {rc}; out={out!r}"
+    assert "stopped" in out, out
+
+    # G2: --list and --init-only are removed; both must exit 64 with a
+    # redirect-style error message.
+    rc, out = run_cli("cogbox --list")
+    assert rc == 64, f"expected exit 64, got {rc}; out={out!r}"
+    assert "use 'cogbox list'" in out, out
+    rc, out = run_cli("cogbox --init-only")
+    assert rc == 64, f"expected exit 64, got {rc}; out={out!r}"
+    assert "use 'cogbox init'" in out, out
+
+    # G3: parser bug -- `--name --vcpu 8` must NOT swallow `--vcpu` as the
+    # name. Old bash parser bug; new parser exits 64 with "requires a value".
+    rc, out = run_cli("cogbox run --name --vcpu 8")
+    assert rc == 64, f"expected exit 64, got {rc}; out={out!r}"
+    assert "requires a value" in out, out
+
+    # G4: integer validation on --vcpu; must reject non-numeric with 65.
+    rc, out = run_cli("cogbox run --vcpu abc")
+    assert rc == 65, f"expected exit 65, got {rc}; out={out!r}"
+    assert "positive integer" in out, out
+
+    # G5: unknown flag for a verb -- per-verb scoping, not silent passthrough.
+    rc, out = run_cli("cogbox rules list --vcpu 8 --name work")
+    assert rc != 0, f"expected nonzero, got {rc}; out={out!r}"
+
+    # G6: list --json emits parseable JSON with one entry per instance
+    out = machine.succeed(as_user("cogbox list --json"))
+    import json as _json
+    parsed = _json.loads(out)
+    assert isinstance(parsed, list) and len(parsed) >= 2, parsed
+    names = {e["name"] for e in parsed}
+    assert "default" in names and "work" in names, names

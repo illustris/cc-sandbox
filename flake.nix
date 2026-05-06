@@ -419,18 +419,36 @@
 		packages = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
-			mkCogbox = runner': pkgs.writeShellApplication {
-				name = "cogbox";
-				runtimeInputs = with pkgs; [ coreutils gnused gnugrep jq diffutils nix ] ++ [ self.packages.${system}.passt-cc ];
-				text = illustris-lib.replaceVarsInString {
-					runtimeDir = runtimeDir;
-					runner = "${runner'}";
-					netfilter = "${self.packages.${system}.cogbox-tools}/lib/libnetfilter.so";
-					rules = "${self.packages.${system}.cogbox-tools}/bin/cogbox-rules";
-					flakeSource = "${self}";
-					nixpkgsSource = "${nixpkgs}";
-				} null (builtins.readFile ./cogbox.sh);
-			};
+			# Build a cogbox package: the Zig CLI binary at $out/bin/cogbox,
+			# the LD_PRELOAD filter at $out/lib/libnetfilter.so, and the
+			# substituted bash launch script at $out/libexec/cogbox-launch.sh.
+			# bin/cogbox is wrapped to expose runtime deps on PATH and to
+			# point COGBOX_LAUNCH_SCRIPT at its sibling libexec script.
+			mkCogbox = runner': pkgs.runCommand "cogbox" {
+				nativeBuildInputs = [ pkgs.makeWrapper ];
+				meta = { mainProgram = "cogbox"; };
+			} ''
+				mkdir -p $out/bin $out/lib $out/libexec
+				cp ${self.packages.${system}.cogbox-tools}/bin/cogbox $out/bin/cogbox
+				chmod +w $out/bin/cogbox
+				cp ${self.packages.${system}.cogbox-tools}/lib/libnetfilter.so $out/lib/libnetfilter.so
+
+				cp ${./cogbox-launch.sh} $out/libexec/cogbox-launch.sh
+				chmod +w $out/libexec/cogbox-launch.sh
+				substituteInPlace $out/libexec/cogbox-launch.sh \
+					--replace-fail "@runtimeDir@" "${runtimeDir}" \
+					--replace-fail "@runner@" "${runner'}" \
+					--replace-fail "@netfilter@" "$out/lib/libnetfilter.so" \
+					--replace-fail "@flakeSource@" "${self}" \
+					--replace-fail "@nixpkgsSource@" "${nixpkgs}"
+				chmod +x $out/libexec/cogbox-launch.sh
+
+				wrapProgram $out/bin/cogbox \
+					--set COGBOX_LAUNCH_SCRIPT $out/libexec/cogbox-launch.sh \
+					--prefix PATH : "${lib.makeBinPath (with pkgs; [
+						coreutils gnused gnugrep jq diffutils nix bashInteractive openssh
+					] ++ [ self.packages.${system}.passt-cc ])}"
+			'';
 		in rec {
 			cogbox-tools = pkgs.stdenv.mkDerivation {
 				pname = "cogbox-tools";

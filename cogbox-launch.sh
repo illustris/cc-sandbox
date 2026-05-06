@@ -1,4 +1,56 @@
-ORIG_ARGS=("$@")
+#!/usr/bin/env bash
+# Bash side of cogbox: handles VM init, on-disk migration, runtime
+# preparation, and the actual microvm launch. Invoked by the Zig
+# `cogbox` binary with already-validated arguments; see the
+# argument-parsing block below for the contract. Not meant to be invoked
+# directly by users.
+#
+# Intentionally NO `set -e`: the script's EXIT trap is the canonical
+# cleanup path (kill passt, remove runtime dir). With `set -e`, any
+# transient subshell failure during long migrations would short-circuit
+# bash before the VM gets a chance to launch -- and the original
+# cogbox.sh ran without it for the same reason.
+
+# -- Argument parsing (Zig has already validated everything) -------
+# Inputs (all optional):
+#   --name NAME           Instance name. Empty/absent = default instance.
+#   --vcpu N              vCPU count override.
+#   --mem N               Memory MB override.
+#   --network MODE        full|none|rules. If absent, fall back to config.json.
+#   --init-only           Run init steps but do not start the VM.
+#   --no-auto-keys        On first init, leave authorized_keys empty.
+#   --yes                 Skip the interactive harness-selection prompt.
+INIT_ONLY=0
+FLAG_VCPU=""
+FLAG_MEM=""
+FLAG_NETWORK=""
+INSTANCE_NAME=""
+AUTO_KEYS=1
+ASSUME_YES=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--init-only) INIT_ONLY=1; shift ;;
+		--no-auto-keys) AUTO_KEYS=0; shift ;;
+		--yes|-y) ASSUME_YES=1; shift ;;
+		--name) INSTANCE_NAME="$2"; shift 2 ;;
+		--vcpu) FLAG_VCPU="$2"; shift 2 ;;
+		--mem) FLAG_MEM="$2"; shift 2 ;;
+		--network) FLAG_NETWORK="$2"; shift 2 ;;
+		*) echo "cogbox-launch: error: unexpected argument $1 (Zig wrapper should have rejected this)" >&2; exit 70 ;;
+	esac
+done
+
+# Reconstruct the user-facing cogbox argv for the re-exec path below.
+# Only the launch-shaped flags are passed through; the verb is always
+# `run` because re-exec is only relevant when we'd otherwise launch the
+# VM (init-only, list, status, etc. don't trigger re-exec).
+ORIG_ARGS=(run)
+[ -n "$INSTANCE_NAME" ] && ORIG_ARGS+=(--name "$INSTANCE_NAME")
+[ -n "$FLAG_VCPU" ]     && ORIG_ARGS+=(--vcpu "$FLAG_VCPU")
+[ -n "$FLAG_MEM" ]      && ORIG_ARGS+=(--mem "$FLAG_MEM")
+[ -n "$FLAG_NETWORK" ]  && ORIG_ARGS+=(--network "$FLAG_NETWORK")
+[ "$AUTO_KEYS" -eq 0 ]  && ORIG_ARGS+=(--no-auto-keys)
+[ "$ASSUME_YES" -eq 1 ] && ORIG_ARGS+=(--yes)
 
 # Scaffold written into each instance's config dir on first init. Also used
 # by the re-exec check below: if the user hasn't edited flake.nix, the
@@ -24,179 +76,10 @@ SCAFFOLD_FLAKE='{
 }
 '
 
-usage() {
-	cat <<'EOF'
-Usage: cogbox [OPTIONS]
-       cogbox rules COMMAND [--name NAME]
-       cogbox ssh [--name NAME] [REMOTE_COMMAND...]
-
-Run coding-agent harnesses (claude-code, opencode) in an isolated QEMU microvm.
-
-Options:
-  --name NAME      Use a named instance (creates it on first run)
-  --vcpu N         Set vCPU count (default: config or 16)
-  --mem N          Set RAM in megabytes (default: config or 32768)
-  --network MODE   Network mode: full, none, or rules (default: config or rules)
-  --init-only      Run all setup steps but do not start the VM
-  --list           List all instances with their ports and status
-  --no-auto-keys   On first init, leave authorized_keys empty instead of
-                   seeding it from ~/.ssh/*.pub and ssh-add -L.
-  --help           Show this help message
-
-Per-instance customization:
-  Each instance has a flake.nix at ~/.config/cogbox/instances/<name>/flake/.
-  Edit it to add packages or NixOS modules; the next launch rebuilds the
-  microvm with your changes. cogbox always overrides the user flake's
-  "nixpkgs" input to its own; declare a separate input (e.g. "nixpkgs-custom")
-  for a different nixpkgs.
-
-Network modes:
-  "full"           Unrestricted networking
-  "none"           Block all outbound traffic (QEMU restrict=on)
-  "rules"          Ordered CIDR allow/deny rules (LD_PRELOAD filter on passt).
-                   Default. Seeded with denies for private (RFC1918), link-local
-                   (incl. cloud metadata 169.254.169.254), and bogon ranges,
-                   followed by allow 0.0.0.0/0 for the public internet.
-
-Rules subcommands:
-  rules list                          List current rules with indices
-  rules add allow|deny CIDR [--at N]  Add a rule (append, or insert at position N)
-  rules del INDEX                     Delete a rule by index (1-based)
-  rules set                           Replace all rules from stdin
-
-Ssh subcommand:
-  ssh [--name NAME] [REMOTE_COMMAND...]
-                   Connect to the running instance over SSH. Resolves the
-                   live port/host from the runtime directory, so it works
-                   without remembering auto-assigned ports. Disables host
-                   key checking since the guest's root disk is ephemeral.
-
-Paths (XDG basedir spec):
-  Config:  $XDG_CONFIG_HOME/cogbox        (default: ~/.config/cogbox)
-  Data:    $XDG_DATA_HOME/cogbox          (default: ~/.local/share/cogbox)
-  Runtime: $XDG_RUNTIME_DIR/cogbox        (default: /run/user/$UID/cogbox)
-
-Environment variables:
-  COGBOX_DATA              Override the data root. Each instance lives at
-                           $COGBOX_DATA/instances/<name>; the default
-                           instance uses the reserved name "default".
-  COGBOX_CLAUDE_CONFIG     Host claude-code config dir (default: ~/.claude)
-  COGBOX_CLAUDE_AUTH       claude-code auth token file
-                           (default: ~/.claude.json)
-  COGBOX_OPENCODE_CONFIG   Host opencode config dir
-                           (default: $XDG_CONFIG_HOME/opencode)
-  COGBOX_OPENCODE_DATA     Host opencode data dir, includes auth.json
-                           (default: $XDG_DATA_HOME/opencode)
-
-Examples:
-  cogbox                          Start the default instance
-  cogbox --name work              Start a named instance
-  cogbox --name work --vcpu 8     Named instance with 8 cores
-  cogbox --network none           Start fully isolated
-  cogbox --network full           Override default rules mode for unrestricted net
-  cogbox rules add allow 10.0.0.0/8 --name work
-  cogbox rules list --name work
-  cogbox ssh                      SSH into the default instance
-  cogbox ssh --name work htop     Run htop on the "work" instance
-  cogbox --list                   Show all instances
-  cogbox --init-only              Set up without booting
-EOF
-	exit 0
+die() {
+	echo "cogbox-launch: error: $*" >&2
+	exit "${2:-70}"
 }
-
-INIT_ONLY=0
-FLAG_VCPU=""
-FLAG_MEM=""
-FLAG_NETWORK=""
-INSTANCE_NAME=""
-LIST_INSTANCES=0
-RULES_MODE=0
-RULES_ARGS=()
-SSH_MODE=0
-SSH_ARGS=()
-AUTO_KEYS=1
-while [ $# -gt 0 ]; do
-	case "$1" in
-		--init-only) INIT_ONLY=1 ;;
-		--vcpu|--mem|--network|--name)
-			if [ $# -lt 2 ]; then
-				echo "Error: $1 requires a value."
-				exit 1
-			fi
-			;;&
-		--vcpu) FLAG_VCPU="$2"; shift ;;
-		--mem) FLAG_MEM="$2"; shift ;;
-		--network) FLAG_NETWORK="$2"; shift ;;
-		--name) INSTANCE_NAME="$2"; shift ;;
-		--list) LIST_INSTANCES=1 ;;
-		--no-auto-keys) AUTO_KEYS=0 ;;
-		--help) usage ;;
-		rules)
-			RULES_MODE=1
-			shift
-			# Capture remaining args verbatim for cogbox-rules. Pull
-			# --name <NAME> out so the shell can resolve the instance dir;
-			# everything else passes through to the Zig binary.
-			while [ $# -gt 0 ]; do
-				case "$1" in
-					--name)
-						if [ $# -lt 2 ]; then
-							echo "Error: --name requires a value."
-							exit 1
-						fi
-						INSTANCE_NAME="$2"; shift 2
-						;;
-					*)
-						RULES_ARGS+=("$1"); shift
-						;;
-				esac
-			done
-			break
-			;;
-		ssh)
-			SSH_MODE=1
-			shift
-			# Capture remaining args verbatim as the ssh remote command.
-			# Pull --name <NAME> out so the shell can resolve the runtime
-			# dir; everything else is appended to the ssh invocation.
-			while [ $# -gt 0 ]; do
-				case "$1" in
-					--name)
-						if [ $# -lt 2 ]; then
-							echo "Error: --name requires a value."
-							exit 1
-						fi
-						INSTANCE_NAME="$2"; shift 2
-						;;
-					*)
-						SSH_ARGS+=("$1"); shift
-						;;
-				esac
-			done
-			break
-			;;
-	esac
-	shift
-done
-
-# -- Validate instance name ---------------------------------------
-if [ -n "$INSTANCE_NAME" ]; then
-	if ! printf '%s' "$INSTANCE_NAME" | grep -qE '^[a-zA-Z][a-zA-Z0-9-]{0,63}$'; then
-		echo "Error: instance name must start with a letter, contain only"
-		echo "alphanumeric characters and hyphens, and be at most 64 characters."
-		exit 1
-	fi
-	if [ "$INSTANCE_NAME" = "default" ]; then
-		echo "Error: 'default' is reserved. Omit --name to use the default instance."
-		exit 1
-	fi
-fi
-
-# -- Validate --network CLI value ---------------------------------
-if [ -n "$FLAG_NETWORK" ] && [ "$FLAG_NETWORK" != "full" ] && [ "$FLAG_NETWORK" != "none" ] && [ "$FLAG_NETWORK" != "rules" ]; then
-	echo "Error: --network must be \"full\", \"none\", or \"rules\"."
-	exit 1
-fi
 
 # -- Resolve real user for sudo context ----------------------------
 if [ -n "${SUDO_USER:-}" ]; then
@@ -213,44 +96,11 @@ fi
 CONFIG_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cogbox"
 BASE_DATA="${COGBOX_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cogbox}"
 
-# -- Rebrand migration: legacy cc-sandbox paths and env vars -------
-# The project was renamed from cc-sandbox to cogbox. Warn on stale env
-# vars first (informational), then refuse to launch if config/data dirs
-# still live under the old name -- we don't silently mutate them.
-for legacy_var in CC_SANDBOX_DATA CC_SANDBOX_CLAUDE_CONFIG CC_SANDBOX_CLAUDE_AUTH \
-		CC_SANDBOX_OPENCODE_CONFIG CC_SANDBOX_OPENCODE_DATA; do
-	if [ -n "${!legacy_var:-}" ]; then
-		new_var="${legacy_var/CC_SANDBOX_/COGBOX_}"
-		echo "Warning: $legacy_var is set but no longer honored. Rename to $new_var." >&2
-	fi
-done
-LEGACY_CONFIG="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cc-sandbox"
-LEGACY_DATA="${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cc-sandbox"
-if [ -d "$LEGACY_CONFIG" ] && [ ! -e "$CONFIG_DIR" ]; then
-	echo "Error: cc-sandbox was renamed to cogbox. Move your config:"
-	echo "  mv '$LEGACY_CONFIG' '$CONFIG_DIR'"
-	exit 1
-fi
-if [ -d "$LEGACY_DATA" ] && [ ! -e "$BASE_DATA" ]; then
-	echo "Error: cc-sandbox was renamed to cogbox. Move your data:"
-	echo "  mv '$LEGACY_DATA' '$BASE_DATA'"
-	exit 1
-fi
-
 # -- Harness shape -------------------------------------------------
 # Mirror of the harness attrset in flake.nix. Both sides must agree on
 # names (used as 9p tags, fw_cfg keys, and runtime symlinks). When
 # adding or changing a harness, edit BOTH this section and the
 # `mkHarnesses` attrset in flake.nix.
-#
-# Path kinds:
-#   overlay   - 9p RO lowerdir from host + persistent upperdir in the
-#               shared harness overlay image. Host path must exist.
-#   fw_cfg    - single host file copied into the guest at boot via
-#               QEMU's fw_cfg device. Host path must exist (a stub
-#               with default content is created if absent).
-#   ephemeral - sandbox-only; bind-mounted from the harness overlay
-#               image. No host source.
 HARNESSES=(claude-code opencode)
 declare -A H_KIND
 declare -A H_HOST
@@ -312,21 +162,6 @@ if [ ! -d "$XDG_RUNTIME_BASE" ]; then
 fi
 BASE_RUNTIME="$XDG_RUNTIME_BASE/cogbox"
 
-# Legacy runtime cleanup hint. Stale cc-sandbox-* runtime dirs hold pid
-# locks and 9p sentinels for instances that no longer correspond to a
-# cogbox config.
-LEGACY_RUNTIMES=()
-for legacy in "$XDG_RUNTIME_BASE"/cc-sandbox*; do
-	[ -e "$legacy" ] || continue
-	LEGACY_RUNTIMES+=("$legacy")
-done
-if [ "${#LEGACY_RUNTIMES[@]}" -gt 0 ]; then
-	echo "Warning: legacy cc-sandbox runtime dirs detected. Remove them:"
-	for d in "${LEGACY_RUNTIMES[@]}"; do
-		echo "  rm -rf '$d'"
-	done
-fi
-
 EFFECTIVE_NAME="${INSTANCE_NAME:-default}"
 INSTANCE_CONFIG_DIR="$CONFIG_DIR/instances/$EFFECTIVE_NAME"
 # The flake lives in its own subdir so unrelated edits to config.json /
@@ -348,20 +183,22 @@ if [ -z "$INSTANCE_NAME" ]; then
 	[ -f "$CONFIG_DIR/config.json" ] && [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ] && OLD_CFG=1
 	[ -e "$BASE_DATA/claude-overlay.img" ] && [ ! -d "$REAL_DATA" ] && OLD_DATA=1
 	if [ -n "$OLD_CFG" ] || [ -n "$OLD_DATA" ]; then
-		echo "Error: cogbox layout changed. The default instance now lives at:"
-		echo "  config: $INSTANCE_CONFIG_DIR/"
-		echo "  data:   $REAL_DATA/"
-		echo "Migrate with:"
-		if [ -n "$OLD_CFG" ]; then
-			echo "  mkdir -p '$INSTANCE_CONFIG_DIR'"
-			echo "  mv '$CONFIG_DIR/config.json' '$INSTANCE_CONFIG_DIR/'"
-		fi
-		if [ -n "$OLD_DATA" ]; then
-			echo "  mkdir -p '$REAL_DATA'"
-			echo "  mv '$BASE_DATA/claude-overlay.img' '$REAL_DATA/'"
-			echo "  [ -d '$BASE_DATA/.config' ] && mv '$BASE_DATA/.config' '$REAL_DATA/'"
-		fi
-		exit 1
+		{
+			echo "cogbox-launch: error: cogbox layout changed. The default instance now lives at:"
+			echo "  config: $INSTANCE_CONFIG_DIR/"
+			echo "  data:   $REAL_DATA/"
+			echo "Migrate with:"
+			if [ -n "$OLD_CFG" ]; then
+				echo "  mkdir -p '$INSTANCE_CONFIG_DIR'"
+				echo "  mv '$CONFIG_DIR/config.json' '$INSTANCE_CONFIG_DIR/'"
+			fi
+			if [ -n "$OLD_DATA" ]; then
+				echo "  mkdir -p '$REAL_DATA'"
+				echo "  mv '$BASE_DATA/claude-overlay.img' '$REAL_DATA/'"
+				echo "  [ -d '$BASE_DATA/.config' ] && mv '$BASE_DATA/.config' '$REAL_DATA/'"
+			fi
+		} >&2
+		exit 70
 	fi
 fi
 
@@ -378,18 +215,20 @@ if [ -d "$CONFIG_DIR/instances" ]; then
 		fi
 	done
 	if [ "${#OLD_FLAKES[@]}" -gt 0 ]; then
-		echo "Error: cogbox flake layout changed. The per-instance flake now lives at:"
-		echo "  <instance>/flake/flake.nix  (was: <instance>/flake.nix)"
-		echo "Migrate with:"
-		for d in "${OLD_FLAKES[@]}"; do
-			echo "  mkdir -p '$d/flake'"
-			if [ -f "$d/flake.lock" ]; then
-				echo "  mv '$d/flake.nix' '$d/flake.lock' '$d/flake/'"
-			else
-				echo "  mv '$d/flake.nix' '$d/flake/'"
-			fi
-		done
-		exit 1
+		{
+			echo "cogbox-launch: error: cogbox flake layout changed. The per-instance flake now lives at:"
+			echo "  <instance>/flake/flake.nix  (was: <instance>/flake.nix)"
+			echo "Migrate with:"
+			for d in "${OLD_FLAKES[@]}"; do
+				echo "  mkdir -p '$d/flake'"
+				if [ -f "$d/flake.lock" ]; then
+					echo "  mv '$d/flake.nix' '$d/flake.lock' '$d/flake/'"
+				else
+					echo "  mv '$d/flake.nix' '$d/flake/'"
+				fi
+			done
+		} >&2
+		exit 70
 	fi
 fi
 
@@ -399,86 +238,6 @@ fi
 # is handled by harness-setup-dirs.service inside the guest.
 if [ -d "$REAL_DATA" ] && [ -f "$REAL_DATA/claude-overlay.img" ] && [ ! -f "$REAL_DATA/harness-overlay.img" ]; then
 	mv "$REAL_DATA/claude-overlay.img" "$REAL_DATA/harness-overlay.img"
-fi
-
-# -- List instances ------------------------------------------------
-if [ "$LIST_INSTANCES" -eq 1 ]; then
-	net_label() {
-		local raw
-		raw=$(jq -c '.network // "full"' "$1")
-		if [ "$raw" = '"full"' ] || [ "$raw" = '"none"' ]; then
-			echo "$raw" | tr -d '"'
-		else
-			echo "rules"
-		fi
-	}
-	echo "Instances:"
-	if [ -d "$CONFIG_DIR/instances" ]; then
-		for dir in "$CONFIG_DIR/instances"/*/; do
-			[ -d "$dir" ] || continue
-			name=$(basename "$dir")
-			cfg="$dir/config.json"
-			[ -f "$cfg" ] || continue
-			ssh_p=$(jq -r '.sshPort // 2222' "$cfg")
-			http_p=$(jq -r '.httpPort // 8080' "$cfg")
-			net=$(net_label "$cfg")
-			running=""
-			if [ "$name" = "default" ]; then
-				inst_runtime="$BASE_RUNTIME"
-				label="(default)"
-			else
-				inst_runtime="${BASE_RUNTIME}-${name}"
-				label="$name"
-			fi
-			if [ -f "$inst_runtime/pid" ] && kill -0 "$(cat "$inst_runtime/pid")" 2>/dev/null; then
-				running=" (running)"
-			fi
-			echo "  $label  ssh:$ssh_p  http:$http_p  net:$net$running"
-		done
-	fi
-	exit 0
-fi
-
-# -- Rules subcommand ----------------------------------------------
-if [ "$RULES_MODE" -eq 1 ]; then
-	ACTIVE_CONFIG="$INSTANCE_CONFIG_DIR/config.json"
-	if [ ! -f "$ACTIVE_CONFIG" ]; then
-		echo "Error: no config found at $ACTIVE_CONFIG"
-		exit 1
-	fi
-	exec @rules@ \
-		--config "$ACTIVE_CONFIG" \
-		--runtime "$RUNTIME" \
-		"${RULES_ARGS[@]}"
-fi
-
-# -- SSH subcommand ------------------------------------------------
-# Read the live port/host from the runtime dir written by the launch
-# path below. Reading config.json instead would risk connecting on a
-# stale port if the user edited it after boot. The VM's root disk is
-# ephemeral, so its host keys regenerate on every reboot -- pin
-# UserKnownHostsFile=/dev/null and disable strict checking to skip the
-# spurious MITM warning. LogLevel=ERROR suppresses the "Permanently
-# added ..." chatter that would otherwise accompany every connection.
-if [ "$SSH_MODE" -eq 1 ]; then
-	if [ ! -f "$RUNTIME/pid" ] || ! kill -0 "$(cat "$RUNTIME/pid")" 2>/dev/null; then
-		echo "Error: instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is not running."
-		echo "Start it first with: cogbox${INSTANCE_NAME:+ --name $INSTANCE_NAME}"
-		exit 1
-	fi
-	if [ ! -f "$RUNTIME/ssh-endpoint" ]; then
-		echo "Error: missing $RUNTIME/ssh-endpoint (instance launched by an older cogbox?)."
-		echo "Restart the instance to repopulate it."
-		exit 1
-	fi
-	read -r SSH_PORT BIND_ADDR < "$RUNTIME/ssh-endpoint"
-	exec ssh \
-		-o StrictHostKeyChecking=no \
-		-o UserKnownHostsFile=/dev/null \
-		-o LogLevel=ERROR \
-		-p "$SSH_PORT" \
-		"root@$BIND_ADDR" \
-		"${SSH_ARGS[@]}"
 fi
 
 # -- Auto-port assignment -----------------------------------------
@@ -503,7 +262,7 @@ next_available_ports() {
 	echo "$(( max_ssh + 1 )) $(( max_http + 1 ))"
 }
 
-# -- Harness state detection (D3) ----------------------------------
+# -- Harness state detection ---------------------------------------
 # Active harnesses are those whose host state already exists. If none
 # exist (fresh install), prompt the user to choose. The chosen list
 # governs which harnesses' host paths get created during init.
@@ -561,10 +320,10 @@ fi
 
 # If no harness has host state yet, prompt the user to pick which to
 # set up. This avoids polluting $HOME with config dirs for tools the
-# user doesn't use (D3). Under a non-interactive stdin we can't safely
-# prompt, so default to all harnesses.
+# user doesn't use. Under a non-interactive stdin or with --yes, default
+# to all harnesses.
 if [ "${#ACTIVE_HARNESSES[@]}" -eq 0 ]; then
-	if [ -t 0 ]; then
+	if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
 		echo "No harness state detected. Set up which?"
 		idx=1
 		for h in "${HARNESSES[@]}"; do
@@ -577,7 +336,7 @@ if [ "${#ACTIVE_HARNESSES[@]}" -eq 0 ]; then
 			1) ACTIVE_HARNESSES=("${HARNESSES[0]}") ;;
 			2) ACTIVE_HARNESSES=("${HARNESSES[1]}") ;;
 			3) ACTIVE_HARNESSES=("${HARNESSES[@]}") ;;
-			*) echo "Invalid choice."; exit 1 ;;
+			*) die "Invalid choice." 64 ;;
 		esac
 	else
 		ACTIVE_HARNESSES=("${HARNESSES[@]}")
@@ -612,10 +371,14 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		echo "  $item"
 	done
 	echo ""
-	read -rp "Continue? [y/N] " confirm
+	if [ "$ASSUME_YES" -eq 1 ] || [ ! -t 0 ]; then
+		confirm=y
+	else
+		read -rp "Continue? [y/N] " confirm
+	fi
 	if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
 		echo "Aborted."
-		exit 1
+		exit 70
 	fi
 
 	mkdir -p "$INSTANCE_CONFIG_DIR" "$INSTANCE_FLAKE_DIR" "$REAL_DATA"
@@ -763,11 +526,11 @@ if [ -z "${COGBOX_REEXECED:-}" ] && [ -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
 	# The scaffold's nixosModules.default is empty, so the microvm closure
 	# would be identical to the baked-in one anyway -- and re-evaluating
 	# the cogbox flake requires its inputs to be fetchable, which a
-	# fresh "nix profile install" or NixOS-systemPackages setup may not have
-	# locally cached. Users who actually customize their flake.nix opt into
-	# the re-eval (and need network on first launch to populate the cache).
-	# `cmp` is byte-exact and avoids the trailing-newline trim that command
-	# substitution does.
+	# fresh "nix profile install" or NixOS-systemPackages setup may not
+	# have locally cached. Users who actually customize their flake.nix
+	# opt into the re-eval (and need network on first launch to populate
+	# the cache). `cmp` is byte-exact and avoids the trailing-newline trim
+	# that command substitution does.
 	if ! printf '%s' "$SCAFFOLD_FLAKE" | cmp -s - "$INSTANCE_FLAKE_DIR/flake.nix"; then
 		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
@@ -781,8 +544,7 @@ fi
 # -- Validate and read runtime config -----------------------------
 ACTIVE_CONFIG="$INSTANCE_CONFIG_DIR/config.json"
 if ! jq empty "$ACTIVE_CONFIG" 2>/dev/null; then
-	echo "Error: invalid JSON in $ACTIVE_CONFIG"
-	exit 1
+	die "invalid JSON in $ACTIVE_CONFIG" 70
 fi
 
 VCPU="${FLAG_VCPU:-$(jq -r '.vcpu // 16' "$ACTIVE_CONFIG")}"
@@ -818,8 +580,7 @@ fi
 # -- Set up runtime symlink directory for QEMU ---------------------
 if [ -e "$RUNTIME" ]; then
 	if [ -f "$RUNTIME/pid" ] && kill -0 "$(cat "$RUNTIME/pid")" 2>/dev/null; then
-		echo "Instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is already running (PID $(cat "$RUNTIME/pid"))."
-		exit 1
+		die "instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is already running (PID $(cat "$RUNTIME/pid"))." 75
 	fi
 	rm -rf "$RUNTIME"
 fi
@@ -839,9 +600,7 @@ ln -sfn "$REAL_DATA" "$RUNTIME/data"
 # $RUNTIME/<harness>-<pathkey> for every overlay/fw_cfg path declared
 # in the harness shape. For active harnesses, we symlink to the host
 # state. For inactive harnesses, we materialize an empty stub so the
-# QEMU runner doesn't fail to start (the binary is installed in the
-# guest unconditionally per D4, but inactive harnesses just see empty
-# config dirs / default-content auth files).
+# QEMU runner doesn't fail to start.
 HARNESS_STUBS="$RUNTIME/.harness-stubs"
 mkdir -p "$HARNESS_STUBS"
 is_active() {
@@ -926,8 +685,7 @@ wait_for_passt() {
 		sleep 0.1
 	done
 	if [ ! -S "$PASST_SOCK" ]; then
-		echo "Error: passt failed to start."
-		exit 1
+		die "passt failed to start." 70
 	fi
 }
 

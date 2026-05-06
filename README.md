@@ -62,7 +62,7 @@ Run multiple isolated VMs simultaneously, like Wine prefixes. Each named
 instance gets its own data directory, overlay image, and network ports.
 
 ```sh
-# Default instance
+# Default instance (foreground)
 nix run github:illustris/cogbox
 
 # Create and start a named instance
@@ -70,7 +70,7 @@ nix run github:illustris/cogbox -- --name work
 nix run github:illustris/cogbox -- --name personal --vcpu 8 --mem 16384
 
 # List all instances and their ports
-nix run github:illustris/cogbox -- --list
+nix run github:illustris/cogbox -- list
 ```
 
 Ports are auto-assigned when an instance is first created (default starts
@@ -87,58 +87,99 @@ Harness authentication and base config are shared across all instances:
 Each instance gets its own overlay on top of the shared config, so
 per-instance harness settings persist independently.
 
-## Flags
+## CLI
 
-| Flag | Description |
+cogbox uses a verb-based CLI. Bare `cogbox` (no verb) is sugar for
+`cogbox run`, so the most common invocation stays short.
+
+### Verbs
+
+| Verb | Description |
 |---|---|
-| `--name NAME` | Use a named instance (creates it on first run) |
-| `--vcpu N` | Set vCPU count (default: config.json or 16) |
-| `--mem N` | Set RAM in megabytes (default: config.json or 32768) |
-| `--network MODE` | Network mode: `full`, `none`, or `rules` (default: config or rules) |
-| `--init-only` | Run all setup steps but do not start the VM |
-| `--list` | List all instances with their ports and status |
-| `--no-auto-keys` | On first init, leave `authorized_keys` empty instead of seeding it from `~/.ssh/*.pub` and `ssh-add -L` |
-| `--help` | Show usage information |
+| `run` | Init if needed, launch the VM in the foreground (default verb) |
+| `start` | Init if needed, launch the VM in the background and return |
+| `stop` | Stop a running instance (SIGTERM, then SIGKILL with `--force`) |
+| `restart` | `stop` then `start` |
+| `status` | Print whether an instance is running, plus ports/net mode |
+| `list` | List all instances. `--json` for machine-readable output |
+| `init` | Create config + host directories without launching |
+| `ssh` | Connect to a running instance via SSH |
+| `rules` | Manage netfilter rules for an instance |
+| `help` | `cogbox help VERB` ≡ `cogbox VERB --help` |
+
+Run `cogbox VERB --help` for verb-specific options.
+
+### Common options
+
+| Flag | Verbs | Description |
+|---|---|---|
+| `-n, --name NAME` | every verb that takes an instance | Instance name (default: `default`) |
+| `-h, --help` | every verb | Show help and exit |
+| `-y, --yes` | `run`, `start`, `init` | Skip the harness-selection prompt on first init |
+| `--vcpu N` | `run`, `start`, `init` | vCPU count (default: config.json or 16) |
+| `--mem N` | `run`, `start`, `init` | RAM in MB (default: config.json or 32768) |
+| `--network MODE` | `run`, `start`, `init` | `full`, `none`, or `rules` (default: rules) |
+| `--no-auto-keys` | `run`, `start`, `init` | Leave `authorized_keys` empty instead of seeding |
+| `--force` | `stop` | Send SIGKILL after 10s if SIGTERM doesn't exit the process |
+| `--json` | `list` | Emit one JSON object per instance |
 
 When an instance is first created, `--vcpu`, `--mem`, and `--network` are
 saved to its `config.json`. On subsequent runs they override the config for
 that run only.
 
-### Rules subcommand
+### Exit codes
 
-| Subcommand | Description |
+| Code | Meaning |
 |---|---|
-| `rules list [--name NAME]` | List current rules with 1-based indices |
-| `rules add allow\|deny CIDR [--at N] [--name NAME]` | Add a rule. Appends by default; `--at N` inserts at 1-based position N. See ["How rules are evaluated and edited"](#how-rules-are-evaluated-and-edited) for why position matters. |
-| `rules del INDEX [--name NAME]` | Delete a rule by index |
-| `rules set [--name NAME]` | Replace all rules from stdin |
+| 0 | success |
+| 3 | `status`: instance is stopped |
+| 64 | EX_USAGE: bad CLI args, unknown verb, unknown flag |
+| 65 | EX_DATAERR: invalid CIDR, integer, name |
+| 66 | EX_NOINPUT: missing config (instance never inited) |
+| 70 | EX_SOFTWARE: internal/system error |
+| 75 | EX_TEMPFAIL: already running, port collision |
+
+### Rules verb
+
+| Form | Description |
+|---|---|
+| `cogbox rules list [-n NAME]` | List current rules with 1-based indices |
+| `cogbox rules add allow\|deny CIDR [--at N] [-n NAME]` | Add a rule. Appends by default; `--at N` inserts at 1-based position N. See ["How rules are evaluated and edited"](#how-rules-are-evaluated-and-edited) for why position matters. |
+| `cogbox rules del INDEX [-n NAME]` | Delete a rule by index |
+| `cogbox rules set [-n NAME]` | Replace all rules from stdin |
 
 If the instance is running, rule changes take effect immediately (the
 runtime rules file is regenerated and passt receives `SIGUSR1` to reload).
 
-### Ssh subcommand
+### SSH verb
 
-| Subcommand | Description |
+| Form | Description |
 |---|---|
-| `ssh [--name NAME] [REMOTE_COMMAND...]` | Connect to the running instance over SSH. Resolves the live port and bind address from the runtime directory, so it works without remembering auto-assigned ports. Disables host key checking since the guest's root disk is ephemeral and host keys regenerate on every boot. |
+| `cogbox ssh [-n NAME] [REMOTE_COMMAND...]` | Connect to a running instance over SSH. Resolves the live port and bind address from the runtime directory. Disables host-key checking since the guest's root disk is ephemeral and host keys regenerate on every boot. Use `--` to separate cogbox flags from the remote command if it begins with a flag-shaped argument. |
 
 ```sh
 # Prepare runtime directory without booting
-nix run github:illustris/cogbox -- --init-only
+nix run github:illustris/cogbox -- init
 
 # Launch with 8 cores and 16 GB RAM
 nix run github:illustris/cogbox -- --vcpu 8 --mem 16384
 
 # Create a named instance without starting it
-nix run github:illustris/cogbox -- --name work --init-only
+nix run github:illustris/cogbox -- init --name work
 
 # Launch with no outbound network
 nix run github:illustris/cogbox -- --network none
 
+# Background lifecycle
+nix run github:illustris/cogbox -- start
+nix run github:illustris/cogbox -- status
+nix run github:illustris/cogbox -- ssh htop
+nix run github:illustris/cogbox -- stop
+
 # Init in rules mode (gets the seeded bogon-deny ruleset by default).
 # To allow a specific LAN host, insert an allow before the matching deny;
 # see the "rules" network mode section for the full pattern.
-nix run github:illustris/cogbox -- --name secure --init-only
+nix run github:illustris/cogbox -- init --name secure
 ```
 
 ## Network modes
@@ -392,8 +433,8 @@ the flake.
   writes a `flake.lock` next to the user's `flake.nix` (inside the
   `flake/` subdir). This is normal.
 - The mechanism re-execs once per launch (guarded internally so the loop
-  ends after one hop). `--list` and `rules` subcommands skip the re-exec,
-  as does any unedited scaffold.
+  ends after one hop). Non-launch verbs (`list`, `status`, `stop`,
+  `rules`, `ssh`) never re-exec; neither does an unedited scaffold.
 - The first launch *with* a customized flake fetches and caches every
   cogbox flake input (microvm.nix, nixfs, nix-mcp, etc.) -- it needs
   network access on that one launch. Subsequent launches reuse the cache.
@@ -482,12 +523,11 @@ completes before passt activates its seccomp-bpf sandbox. Rules can be
 hot-reloaded at runtime via `SIGUSR1` to the passt process.
 
 The `cogbox rules` subcommands (`list`, `add`, `del`, `set`) are
-implemented by `cogbox-rules`, a small Zig CLI shipped from the same
-project as the filter library. It edits `config.json`, regenerates the
-runtime rules file, and signals the running passt -- so rule changes
-take effect without restarting the VM. Both binaries share the on-disk
-rule format parser, so anything `cogbox-rules` accepts the runtime
-filter accepts.
+implemented inside the same Zig binary as the rest of the cogbox CLI.
+They edit `config.json`, regenerate the runtime rules file, and signal
+the running passt -- so rule changes take effect without restarting the
+VM. The CLI shares the on-disk rule format parser with the LD_PRELOAD
+filter, so the formats stay in sync.
 
 ## Defaults
 
