@@ -128,6 +128,31 @@
 					};
 				};
 			};
+
+			codex = {
+				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				package = inputs.llm-agents.packages.${system}.codex;
+				launcher = {
+					name = "cx";
+					# `--dangerously-bypass-approvals-and-sandbox` is codex's
+					# documented escape hatch: skips all confirmation prompts
+					# and runs commands without codex's own sandbox. Cogbox
+					# already provides the outer microvm sandbox, so this is
+					# the equivalent of claude-code's `--dangerously-skip-permissions`.
+					flags = [ "--dangerously-bypass-approvals-and-sandbox" ];
+					env = { IS_SANDBOX = "1"; };
+				};
+				paths = {
+					# Codex stores config, auth, sessions, helper binaries
+					# (tmp/), and rollouts together under $CODEX_HOME
+					# (default ~/.codex). A single overlay covers everything,
+					# matching opencode's auth-inside-data pattern.
+					home = {
+						guest = "/root/.codex";
+						kind = "overlay";
+					};
+				};
+			};
 		};
 
 		macFromName = name: let

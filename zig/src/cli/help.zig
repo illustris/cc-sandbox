@@ -7,7 +7,7 @@ const std = @import("std");
 const util = @import("util.zig");
 
 pub const TOP_LEVEL =
-	\\cogbox - run coding-agent harnesses (claude-code, opencode) in an isolated QEMU microvm
+	\\cogbox - run coding-agent harnesses (claude-code, opencode, codex) in an isolated QEMU microvm
 	\\
 	\\Usage:
 	\\  cogbox [VERB] [OPTIONS]
@@ -50,6 +50,7 @@ pub const TOP_LEVEL =
 	\\  COGBOX_CLAUDE_AUTH       claude-code auth token file (default: ~/.claude.json)
 	\\  COGBOX_OPENCODE_CONFIG   Host opencode config dir
 	\\  COGBOX_OPENCODE_DATA     Host opencode data dir, includes auth.json
+	\\  COGBOX_CODEX_HOME        Host codex home dir (default: ~/.codex), includes auth.json
 	\\
 	\\Exit codes:
 	\\  0   success

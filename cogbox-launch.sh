@@ -101,7 +101,7 @@ BASE_DATA="${COGBOX_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cogbox}"
 # names (used as 9p tags, fw_cfg keys, and runtime symlinks). When
 # adding or changing a harness, edit BOTH this section and the
 # `mkHarnesses` attrset in flake.nix.
-HARNESSES=(claude-code opencode)
+HARNESSES=(claude-code opencode codex)
 declare -A H_KIND
 declare -A H_HOST
 declare -A H_FW_DEFAULT
@@ -124,11 +124,15 @@ H_HOST[opencode:data]="${COGBOX_OPENCODE_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.loca
 H_KIND[opencode:cache]=ephemeral
 H_KIND[opencode:state]=ephemeral
 
+H_KIND[codex:home]=overlay
+H_HOST[codex:home]="${COGBOX_CODEX_HOME:-$REAL_HOME/.codex}"
+
 # Path keys per harness, in declared order.
 harness_pathkeys() {
 	case "$1" in
 		claude-code) printf '%s\n' config auth ;;
 		opencode) printf '%s\n' config data cache state ;;
+		codex) printf '%s\n' home ;;
 	esac
 }
 
@@ -138,6 +142,7 @@ harness_summary() {
 	case "$1" in
 		claude-code) echo "creates ~/.claude/, ~/.claude.json" ;;
 		opencode)    echo "creates ~/.config/opencode/, ~/.local/share/opencode/" ;;
+		codex)       echo "creates ~/.codex/" ;;
 	esac
 }
 
@@ -330,14 +335,33 @@ if [ "${#ACTIVE_HARNESSES[@]}" -eq 0 ]; then
 			echo "  [$idx] $h     ($(harness_summary "$h"))"
 			idx=$((idx + 1))
 		done
-		echo "  [$idx] both"
-		read -rp "Choice [1-$idx]: " choice
-		case "$choice" in
-			1) ACTIVE_HARNESSES=("${HARNESSES[0]}") ;;
-			2) ACTIVE_HARNESSES=("${HARNESSES[1]}") ;;
-			3) ACTIVE_HARNESSES=("${HARNESSES[@]}") ;;
-			*) die "Invalid choice." 64 ;;
-		esac
+		all_idx=$idx
+		echo "  [$all_idx] all"
+		num_harnesses=${#HARNESSES[@]}
+		read -rp "Choice [1-$all_idx, comma-separated for multiple]: " choice
+		# Strip whitespace.
+		choice="${choice// /}"
+		if [ -z "$choice" ]; then
+			die "Invalid choice." 64
+		fi
+		if [ "$choice" = "$all_idx" ]; then
+			ACTIVE_HARNESSES=("${HARNESSES[@]}")
+		else
+			# Comma-separated indices, deduped while preserving order.
+			IFS=',' read -ra picks <<< "$choice"
+			declare -A seen=()
+			for p in "${picks[@]}"; do
+				case "$p" in ''|*[!0-9]*) die "Invalid choice." 64 ;; esac
+				if [ "$p" -lt 1 ] || [ "$p" -gt "$num_harnesses" ]; then
+					die "Invalid choice." 64
+				fi
+				h="${HARNESSES[$((p - 1))]}"
+				if [ -z "${seen[$h]:-}" ]; then
+					ACTIVE_HARNESSES+=("$h")
+					seen[$h]=1
+				fi
+			done
+		fi
 	else
 		ACTIVE_HARNESSES=("${HARNESSES[@]}")
 	fi

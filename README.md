@@ -12,8 +12,9 @@ QEMU guest where the agent can read, write, and run commands without
 prompting -- without that blast radius reaching the host.
 
 Currently supported harnesses: `claude-code`
-([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) and
-`opencode` ([opencode](https://github.com/sst/opencode)). The
+([Claude Code](https://docs.anthropic.com/en/docs/claude-code)),
+`opencode` ([opencode](https://github.com/sst/opencode)), and
+`codex` ([OpenAI Codex CLI](https://github.com/openai/codex)). The
 architecture is harness-agnostic; adding more is a matter of declaring
 their host paths and launcher in `flake.nix`.
 
@@ -31,8 +32,9 @@ touching anything:
 No harness state detected. Set up which?
   [1] claude-code     (creates ~/.claude/, ~/.claude.json)
   [2] opencode        (creates ~/.config/opencode/, ~/.local/share/opencode/)
-  [3] both
-Choice [1-3]:
+  [3] codex           (creates ~/.codex/)
+  [4] all
+Choice [1-4, comma-separated for multiple]:
 
 The following paths will be created:
   ~/.config/cogbox/instances/default/config.json  (default settings)
@@ -42,14 +44,15 @@ The following paths will be created:
   ~/.claude.json  (claude-code auth)
   ~/.config/opencode/  (opencode config)
   ~/.local/share/opencode/  (opencode data)
+  ~/.codex/  (codex home)
 
 Continue? [y/N]
 ```
 
 Each enabled harness ships a launcher inside the VM: `c` for
-`claude-code`, `oc` for `opencode`. Both binaries are installed
-unconditionally (subject to per-architecture availability), so once the
-VM boots either is on `$PATH`.
+`claude-code`, `oc` for `opencode`, `cx` for `codex`. All three binaries
+are installed unconditionally (subject to per-architecture availability),
+so once the VM boots any of them is on `$PATH`.
 
 If a harness's host state already exists when you run cogbox for the
 first time, the harness selection prompt is skipped and only those
@@ -83,6 +86,7 @@ Harness authentication and base config are shared across all instances:
 |---|---|---|
 | claude-code | `~/.claude/` | `~/.claude.json` |
 | opencode | `~/.config/opencode/` | `~/.local/share/opencode/` (includes `auth.json`) |
+| codex | `~/.codex/` | `~/.codex/` (includes `auth.json`) |
 
 Each instance gets its own overlay on top of the shared config, so
 per-instance harness settings persist independently.
@@ -479,6 +483,7 @@ Override where data lives on the host with environment variables:
 | `COGBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | claude-code auth token for the VM |
 | `COGBOX_OPENCODE_CONFIG` | `$XDG_CONFIG_HOME/opencode` | Host opencode config (overlay lower in VM) |
 | `COGBOX_OPENCODE_DATA` | `$XDG_DATA_HOME/opencode` | Host opencode data (auth lives here as `auth.json`) |
+| `COGBOX_CODEX_HOME` | `$HOME/.codex` | Host codex home (config, auth, sessions; overlay lower in VM) |
 
 ```sh
 COGBOX_DATA=/mnt/fast/cogbox nix run .
@@ -500,6 +505,7 @@ $XDG_RUNTIME_DIR/cogbox[-<name>]/
   claude-code-auth       -> $COGBOX_CLAUDE_AUTH
   opencode-config        -> $COGBOX_OPENCODE_CONFIG
   opencode-data          -> $COGBOX_OPENCODE_DATA
+  codex-home             -> $COGBOX_CODEX_HOME
   .harness-stubs/        # empty stubs for inactive harnesses (so QEMU
                          # 9p sources resolve even when the host has no
                          # state for a given harness)
@@ -548,9 +554,9 @@ filter, so the formats stay in sync.
 
 Pre-installed tools: `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`,
 `nixfs`.
-Harness binaries (with launchers): `claude-code` (`c`) and `opencode`
-(`oc`), both on `x86_64-linux` and `aarch64-linux` only (sourced from
-`numtide/llm-agents.nix`).
+Harness binaries (with launchers): `claude-code` (`c`), `opencode`
+(`oc`), and `codex` (`cx`), all on `x86_64-linux` and `aarch64-linux`
+only (sourced from `numtide/llm-agents.nix`).
 Architecture-conditional extras: `bpftrace` (x86_64, aarch64), `nix-mcp`
 (where the `nix-mcp` flake publishes a build).
 
@@ -558,13 +564,14 @@ Architecture-conditional extras: `bpftrace` (x86_64, aarch64), `nix-mcp`
 
 A *harness* is a coding-agent CLI that cogbox installs in the guest
 and mounts host state for. The currently-supported harnesses are
-`claude-code` (launcher: `c`) and `opencode` (launcher: `oc`).
+`claude-code` (launcher: `c`), `opencode` (launcher: `oc`), and
+`codex` (launcher: `cx`).
 
 The harness model is symmetric and opt-in:
 
-- **Both binaries are always installed** in the guest (subject to
-  per-architecture availability), so any active VM has both launchers
-  on `$PATH`.
+- **All harness binaries are always installed** in the guest (subject
+  to per-architecture availability), so any active VM has every
+  launcher on `$PATH`.
 - **Host state is created only for harnesses you actually use.** On
   first init, the wrapper checks for any pre-existing harness config
   on the host and treats those harnesses as active. If none are found,
@@ -595,16 +602,20 @@ How "full auto" is wired per harness:
   only on the `run` subcommand (one-shot mode) and is rejected by the
   default TUI command's strict yargs parser, so the env-var path is
   the universal bypass.
+- `cx` (codex) sets `IS_SANDBOX=1` and passes
+  `--dangerously-bypass-approvals-and-sandbox`, codex's documented escape
+  hatch that skips all confirmation prompts and disables codex's own
+  command sandbox. The outer microvm provides the actual sandbox.
 
 ## Limitations
 
 - Linux host with KVM. Build targets: `x86_64-linux`, `aarch64-linux`,
   `riscv64-linux`.
-- Per-harness platform availability varies. Both `claude-code` and
-  `opencode` come from `numtide/llm-agents.nix`, which builds them for
-  `x86_64-linux` and `aarch64-linux` only. On `riscv64-linux` neither
-  harness ships out of the box and would have to be installed manually
-  inside the VM.
+- Per-harness platform availability varies. `claude-code`, `opencode`,
+  and `codex` all come from `numtide/llm-agents.nix`, which builds them
+  for `x86_64-linux` and `aarch64-linux` only. On `riscv64-linux` none
+  of these harnesses ship out of the box and would have to be installed
+  manually inside the VM.
 - One instance per name at a time (PID lock per runtime directory).
   Multiple differently-named instances can run simultaneously.
 - The writable nix store overlay is a tmpfs -- installed packages do not
