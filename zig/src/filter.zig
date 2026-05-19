@@ -17,10 +17,35 @@ pub const Rule = struct {
 };
 
 pub const max_rules = 256;
+pub const max_dns_rules = 256;
+pub const max_dns_pattern_len: u8 = 253; // RFC 1035 FQDN length cap
+
+pub const DnsPatternKind = enum { exact, left_wildcard, any };
+
+pub const DnsPattern = struct {
+	kind: DnsPatternKind,
+	buf: [max_dns_pattern_len]u8 = undefined,
+	len: u8 = 0,
+
+	pub fn slice(self: *const DnsPattern) []const u8 {
+		return self.buf[0..self.len];
+	}
+};
+
+pub const DnsRule = struct {
+	pattern: DnsPattern,
+	action: Action,
+};
 
 pub const RuleSet = struct {
 	rules: [max_rules]Rule = undefined,
 	len: usize = 0,
+
+	// DNS rules consulted by the libc-resolver wrappers in the shim.
+	// Independent of CIDR rules: a DNS allow does not imply IP allow.
+	dns_rules: [max_dns_rules]DnsRule = undefined,
+	dns_len: usize = 0,
+	dns_default: Action = .allow,
 
 	/// Evaluate a destination address and port against the ruleset.
 	pub fn evaluate(self: *const RuleSet, addr: IpAddr, port: u16) Action {
@@ -60,7 +85,120 @@ pub const RuleSet = struct {
 		// Default: deny
 		return .deny;
 	}
+
+	/// Evaluate a hostname against the DNS rule table. The host may carry a
+	/// trailing `.` (root label) -- it is stripped before matching.
+	pub fn evaluateDns(self: *const RuleSet, host: []const u8) Action {
+		var h = host;
+		if (h.len > 0 and h[h.len - 1] == '.') h = h[0 .. h.len - 1];
+		for (self.dns_rules[0..self.dns_len]) |r| {
+			if (matchDnsPattern(r.pattern, h)) return r.action;
+		}
+		return self.dns_default;
+	}
 };
+
+fn matchDnsPattern(p: DnsPattern, host: []const u8) bool {
+	switch (p.kind) {
+		.any => return true,
+		.exact => return std.ascii.eqlIgnoreCase(p.slice(), host),
+		.left_wildcard => {
+			const suffix = p.slice();
+			// `*.example.com` must match >=1 subdomain label, so the host
+			// needs at least one char and a `.` before the suffix.
+			if (host.len <= suffix.len + 1) return false;
+			const sep_idx = host.len - suffix.len - 1;
+			if (host[sep_idx] != '.') return false;
+			return std.ascii.eqlIgnoreCase(host[sep_idx + 1 ..], suffix);
+		},
+	}
+}
+
+/// Validate a hostname-shaped string. Permissive enough for real-world
+/// names (LDH labels), strict enough to reject empty labels, leading/
+/// trailing dots, and stray punctuation.
+fn isValidHostName(s: []const u8) bool {
+	if (s.len == 0 or s.len > max_dns_pattern_len) return false;
+	if (s[0] == '.' or s[s.len - 1] == '.') return false;
+	var prev_dot = true;
+	for (s) |c| {
+		switch (c) {
+			'a'...'z', 'A'...'Z', '0'...'9', '_' => prev_dot = false,
+			'-' => {
+				if (prev_dot) return false; // label can't start with hyphen
+				prev_dot = false;
+			},
+			'.' => {
+				if (prev_dot) return false; // empty label
+				prev_dot = true;
+			},
+			else => return false,
+		}
+	}
+	return true;
+}
+
+/// Parse a DNS pattern. Returns null for malformed input.
+///   `*`             -> .any
+///   `*.example.com` -> .left_wildcard("example.com")
+///   `example.com`   -> .exact("example.com")
+///   anything with `*` not at the leftmost position is rejected.
+pub fn parseDnsPattern(s: []const u8) ?DnsPattern {
+	const t = std.mem.trim(u8, s, " \t");
+	if (t.len == 0) return null;
+	if (std.mem.eql(u8, t, "*")) {
+		return .{ .kind = .any, .len = 0 };
+	}
+	if (std.mem.startsWith(u8, t, "*.")) {
+		const rest = t[2..];
+		if (std.mem.indexOfScalar(u8, rest, '*') != null) return null;
+		if (!isValidHostName(rest)) return null;
+		var p: DnsPattern = .{ .kind = .left_wildcard, .len = @intCast(rest.len) };
+		@memcpy(p.buf[0..rest.len], rest);
+		return p;
+	}
+	if (std.mem.indexOfScalar(u8, t, '*') != null) return null; // right-anchor or middle
+	if (!isValidHostName(t)) return null;
+	var p: DnsPattern = .{ .kind = .exact, .len = @intCast(t.len) };
+	@memcpy(p.buf[0..t.len], t);
+	return p;
+}
+
+pub const DnsLine = struct {
+	action: Action,
+	pattern: DnsPattern,
+};
+
+/// Parse a single `dns ...` line body (i.e. text after the `dns ` prefix).
+/// Recognises:
+///   `default allow` / `default deny`  -> returns null + writes to *default_out (if non-null)
+///   `allow PATTERN` / `deny PATTERN`  -> returns DnsLine
+/// Returns null on malformed input, on the `default` form, or on empty input.
+pub fn parseDnsBody(body: []const u8, default_out: ?*Action) ?DnsLine {
+	const t = std.mem.trim(u8, body, " \t");
+	if (t.len == 0) return null;
+	if (std.mem.startsWith(u8, t, "default ")) {
+		const v = std.mem.trim(u8, t[8..], " \t");
+		if (default_out) |out| {
+			if (std.mem.eql(u8, v, "allow")) out.* = .allow;
+			if (std.mem.eql(u8, v, "deny")) out.* = .deny;
+		}
+		return null;
+	}
+	var action: Action = undefined;
+	var rest: []const u8 = undefined;
+	if (std.mem.startsWith(u8, t, "allow ")) {
+		action = .allow;
+		rest = t[6..];
+	} else if (std.mem.startsWith(u8, t, "deny ")) {
+		action = .deny;
+		rest = t[5..];
+	} else {
+		return null;
+	}
+	const pat = parseDnsPattern(rest) orelse return null;
+	return .{ .action = action, .pattern = pat };
+}
 
 const ipv6_loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 const ipv4_mapped_prefix = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
@@ -171,7 +309,24 @@ pub fn parseRules(content: []const u8) RuleSet {
 	var lines = std.mem.splitScalar(u8, content, '\n');
 
 	while (lines.next()) |line| {
-		if (parseLine(line)) |rule| {
+		const trimmed = std.mem.trim(u8, line, " \t\r\n");
+		if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+		if (std.mem.startsWith(u8, trimmed, "dns ")) {
+			const body = trimmed[4..];
+			if (parseDnsBody(body, &ruleset.dns_default)) |entry| {
+				if (ruleset.dns_len < max_dns_rules) {
+					ruleset.dns_rules[ruleset.dns_len] = .{
+						.pattern = entry.pattern,
+						.action = entry.action,
+					};
+					ruleset.dns_len += 1;
+				}
+			}
+			continue;
+		}
+
+		if (parseLine(trimmed)) |rule| {
 			if (ruleset.len < max_rules) {
 				ruleset.rules[ruleset.len] = rule;
 				ruleset.len += 1;
@@ -314,4 +469,104 @@ test "parseRules multi-line with comments" {
 	try std.testing.expectEqual(@as(usize, 2), rs.len);
 	try std.testing.expectEqual(Action.allow, rs.rules[0].action);
 	try std.testing.expectEqual(Action.deny, rs.rules[1].action);
+}
+
+// --- DNS ---
+
+test "parseDnsPattern exact" {
+	const p = parseDnsPattern("api.anthropic.com").?;
+	try std.testing.expectEqual(DnsPatternKind.exact, p.kind);
+	try std.testing.expectEqualStrings("api.anthropic.com", p.slice());
+}
+
+test "parseDnsPattern left wildcard strips star-dot" {
+	const p = parseDnsPattern("*.githubusercontent.com").?;
+	try std.testing.expectEqual(DnsPatternKind.left_wildcard, p.kind);
+	try std.testing.expectEqualStrings("githubusercontent.com", p.slice());
+}
+
+test "parseDnsPattern bare star" {
+	const p = parseDnsPattern("*").?;
+	try std.testing.expectEqual(DnsPatternKind.any, p.kind);
+}
+
+test "parseDnsPattern rejects right-anchored wildcard" {
+	try std.testing.expect(parseDnsPattern("api.*") == null);
+	try std.testing.expect(parseDnsPattern("foo.*.com") == null);
+	try std.testing.expect(parseDnsPattern("*.foo.*") == null);
+}
+
+test "parseDnsPattern rejects malformed names" {
+	try std.testing.expect(parseDnsPattern("") == null);
+	try std.testing.expect(parseDnsPattern(".") == null);
+	try std.testing.expect(parseDnsPattern(".com") == null);
+	try std.testing.expect(parseDnsPattern("com.") == null);
+	try std.testing.expect(parseDnsPattern("foo..bar") == null);
+	try std.testing.expect(parseDnsPattern("foo bar") == null);
+	try std.testing.expect(parseDnsPattern("-foo.com") == null);
+	try std.testing.expect(parseDnsPattern("*.") == null);
+}
+
+test "matchDnsPattern exact case-insensitive" {
+	const p = parseDnsPattern("api.anthropic.com").?;
+	try std.testing.expect(matchDnsPattern(p, "api.anthropic.com"));
+	try std.testing.expect(matchDnsPattern(p, "API.Anthropic.COM"));
+	try std.testing.expect(!matchDnsPattern(p, "x.api.anthropic.com"));
+	try std.testing.expect(!matchDnsPattern(p, "anthropic.com"));
+}
+
+test "matchDnsPattern left wildcard requires >=1 subdomain label" {
+	const p = parseDnsPattern("*.example.com").?;
+	try std.testing.expect(matchDnsPattern(p, "a.example.com"));
+	try std.testing.expect(matchDnsPattern(p, "a.b.example.com"));
+	try std.testing.expect(matchDnsPattern(p, "A.Example.COM"));
+	try std.testing.expect(!matchDnsPattern(p, "example.com"));
+	try std.testing.expect(!matchDnsPattern(p, "evilexample.com"));
+	try std.testing.expect(!matchDnsPattern(p, "com"));
+}
+
+test "matchDnsPattern bare star matches everything" {
+	const p = parseDnsPattern("*").?;
+	try std.testing.expect(matchDnsPattern(p, "x"));
+	try std.testing.expect(matchDnsPattern(p, "anything.example.com"));
+}
+
+test "RuleSet evaluateDns default allow" {
+	const rs = RuleSet{};
+	try std.testing.expectEqual(Action.allow, rs.evaluateDns("anywhere.example"));
+}
+
+test "RuleSet evaluateDns first match wins, default applies" {
+	const rs = parseRules(
+		\\dns default deny
+		\\dns allow api.anthropic.com
+		\\dns allow *.githubusercontent.com
+		\\dns deny telemetry.example.com
+	);
+	try std.testing.expectEqual(Action.allow, rs.evaluateDns("api.anthropic.com"));
+	try std.testing.expectEqual(Action.allow, rs.evaluateDns("raw.githubusercontent.com"));
+	try std.testing.expectEqual(Action.deny, rs.evaluateDns("telemetry.example.com"));
+	try std.testing.expectEqual(Action.deny, rs.evaluateDns("unspecified.example"));
+}
+
+test "RuleSet evaluateDns strips trailing root dot" {
+	const rs = parseRules(
+		\\dns default deny
+		\\dns allow api.anthropic.com
+	);
+	try std.testing.expectEqual(Action.allow, rs.evaluateDns("api.anthropic.com."));
+}
+
+test "parseRules mixed CIDR + DNS rules go to separate tables" {
+	const rs = parseRules(
+		\\allow 10.0.0.0/8
+		\\dns default deny
+		\\dns allow api.anthropic.com
+		\\deny 0.0.0.0/0
+	);
+	try std.testing.expectEqual(@as(usize, 2), rs.len);
+	try std.testing.expectEqual(@as(usize, 1), rs.dns_len);
+	try std.testing.expectEqual(Action.deny, rs.dns_default);
+	try std.testing.expectEqual(Action.allow, rs.dns_rules[0].action);
+	try std.testing.expectEqualStrings("api.anthropic.com", rs.dns_rules[0].pattern.slice());
 }

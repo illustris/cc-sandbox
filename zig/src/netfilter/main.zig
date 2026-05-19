@@ -11,6 +11,17 @@ const c = @cImport({
 	@cInclude("string.h");
 });
 
+// netdb / arpa constants and prototypes -- declared directly. @cInclude of
+// netdb.h and arpa/inet.h drags in glibc's FORTIFY_SOURCE wrappers which
+// translate badly through @cImport in ReleaseSafe builds.
+const EAI_NONAME: c_int = -2;
+const HOST_NOT_FOUND: c_int = 1;
+const AF_INET_LOCAL: c_int = 2;
+const AF_INET6_LOCAL: c_int = 10;
+
+extern "c" fn __h_errno_location() *c_int;
+extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
+
 // POSIX I/O -- declared directly to avoid glibc macro issues with fcntl.h
 const O_RDONLY: c_int = 0;
 const SEEK_SET: c_int = 0;
@@ -39,10 +50,23 @@ const SendtoFn = *const fn (c_int, ?*const anyopaque, usize, c_int, ?*const c.st
 const SendmsgFn = *const fn (c_int, ?*const c.struct_msghdr, c_int) callconv(.c) isize;
 const SendmmsgFn = *const fn (c_int, ?[*]c.struct_mmsghdr, c_uint, c_int) callconv(.c) c_int;
 
+// Resolver entry points. The struct types are kept opaque -- we never
+// dereference them in the shim, only forward to libc.
+const GetaddrinfoFn = *const fn (?[*:0]const u8, ?[*:0]const u8, ?*const anyopaque, ?*?*anyopaque) callconv(.c) c_int;
+const GethostbynameFn = *const fn (?[*:0]const u8) callconv(.c) ?*anyopaque;
+const Gethostbyname2Fn = *const fn (?[*:0]const u8, c_int) callconv(.c) ?*anyopaque;
+const GethostbynameRFn = *const fn (?[*:0]const u8, ?*anyopaque, [*]u8, usize, ?*?*anyopaque, ?*c_int) callconv(.c) c_int;
+const Gethostbyname2RFn = *const fn (?[*:0]const u8, c_int, ?*anyopaque, [*]u8, usize, ?*?*anyopaque, ?*c_int) callconv(.c) c_int;
+
 var real_connect: ?ConnectFn = null;
 var real_sendto: ?SendtoFn = null;
 var real_sendmsg: ?SendmsgFn = null;
 var real_sendmmsg: ?SendmmsgFn = null;
+var real_getaddrinfo: ?GetaddrinfoFn = null;
+var real_gethostbyname: ?GethostbynameFn = null;
+var real_gethostbyname2: ?Gethostbyname2Fn = null;
+var real_gethostbyname_r: ?GethostbynameRFn = null;
+var real_gethostbyname2_r: ?Gethostbyname2RFn = null;
 
 fn resolve(comptime name: [*:0]const u8) *anyopaque {
 	return c.dlsym(RTLD_NEXT, name) orelse @panic("netfilter: dlsym failed");
@@ -67,6 +91,11 @@ fn init() void {
 	real_sendto = @ptrCast(resolve("sendto"));
 	real_sendmsg = @ptrCast(resolve("sendmsg"));
 	real_sendmmsg = @ptrCast(resolve("sendmmsg"));
+	real_getaddrinfo = @ptrCast(resolve("getaddrinfo"));
+	real_gethostbyname = @ptrCast(resolve("gethostbyname"));
+	real_gethostbyname2 = @ptrCast(resolve("gethostbyname2"));
+	real_gethostbyname_r = @ptrCast(resolve("gethostbyname_r"));
+	real_gethostbyname2_r = @ptrCast(resolve("gethostbyname2_r"));
 
 	// Install SIGUSR1 handler for rule reload.
 	// Requires rt_sigreturn in passt's seccomp allowlist.
@@ -211,4 +240,118 @@ export fn sendmmsg(fd: c_int, msgvec: ?[*]c.struct_mmsghdr, vlen: c_uint, flags:
 		}
 	}
 	return real_sendmmsg.?(fd, msgvec, vlen, flags);
+}
+
+// --- DNS resolver wrappers ---
+//
+// Gate libc-level name resolution by consulting `ruleset.evaluateDns()`.
+// On deny we never call libc, so no DNS packet is emitted upstream and the
+// caller sees the standard "host not found" return.
+//
+// Numeric IP literals (e.g. `getaddrinfo("1.2.3.4", ...)`) bypass DNS
+// rules -- they aren't names, and blocking them here would surprise
+// callers that happen to use the resolver API for numeric lookups.
+
+fn isNumericLiteralC(name: [*:0]const u8) bool {
+	var buf4: [4]u8 = undefined;
+	var buf6: [16]u8 = undefined;
+	if (inet_pton(AF_INET_LOCAL, name, &buf4) == 1) return true;
+	if (inet_pton(AF_INET6_LOCAL, name, &buf6) == 1) return true;
+	return false;
+}
+
+fn dnsDenies(name_c: [*:0]const u8) bool {
+	if (isNumericLiteralC(name_c)) return false;
+	const slice = std.mem.span(name_c);
+	return ruleset.evaluateDns(slice) == .deny;
+}
+
+fn setHostNotFound() void {
+	__h_errno_location().* = HOST_NOT_FOUND;
+}
+
+export fn getaddrinfo(
+	node: ?[*:0]const u8,
+	service: ?[*:0]const u8,
+	hints: ?*const anyopaque,
+	res: ?*?*anyopaque,
+) callconv(.c) c_int {
+	init();
+	checkReload();
+
+	if (node) |n| {
+		if (dnsDenies(n)) return EAI_NONAME;
+	}
+	return real_getaddrinfo.?(node, service, hints, res);
+}
+
+export fn gethostbyname(name: ?[*:0]const u8) callconv(.c) ?*anyopaque {
+	init();
+	checkReload();
+
+	if (name) |n| {
+		if (dnsDenies(n)) {
+			setHostNotFound();
+			return null;
+		}
+	}
+	return real_gethostbyname.?(name);
+}
+
+export fn gethostbyname2(name: ?[*:0]const u8, af: c_int) callconv(.c) ?*anyopaque {
+	init();
+	checkReload();
+
+	if (name) |n| {
+		if (dnsDenies(n)) {
+			setHostNotFound();
+			return null;
+		}
+	}
+	return real_gethostbyname2.?(name, af);
+}
+
+export fn gethostbyname_r(
+	name: ?[*:0]const u8,
+	ret: ?*anyopaque,
+	buf: [*]u8,
+	buflen: usize,
+	result: ?*?*anyopaque,
+	h_errnop: ?*c_int,
+) callconv(.c) c_int {
+	init();
+	checkReload();
+
+	if (name) |n| {
+		if (dnsDenies(n)) {
+			// glibc convention: return 0, set *result = NULL, set *h_errnop
+			// = HOST_NOT_FOUND. Callers that read errno also expect 0.
+			if (result) |r| r.* = null;
+			if (h_errnop) |hep| hep.* = HOST_NOT_FOUND;
+			return 0;
+		}
+	}
+	return real_gethostbyname_r.?(name, ret, buf, buflen, result, h_errnop);
+}
+
+export fn gethostbyname2_r(
+	name: ?[*:0]const u8,
+	af: c_int,
+	ret: ?*anyopaque,
+	buf: [*]u8,
+	buflen: usize,
+	result: ?*?*anyopaque,
+	h_errnop: ?*c_int,
+) callconv(.c) c_int {
+	init();
+	checkReload();
+
+	if (name) |n| {
+		if (dnsDenies(n)) {
+			if (result) |r| r.* = null;
+			if (h_errnop) |hep| hep.* = HOST_NOT_FOUND;
+			return 0;
+		}
+	}
+	return real_gethostbyname2_r.?(name, af, ret, buf, buflen, result, h_errnop);
 }
