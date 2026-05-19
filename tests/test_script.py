@@ -285,6 +285,115 @@ with subtest("Phase F: opencode + codex harnesses wired into the VM"):
     assert out == "persisted", out
     stop_instance("cc-default")
 
+with subtest("Phase H: TCP remap routes via SOCKS5 to a host stub"):
+    # The shim's remap primitive (zig/src/filter.zig::RemapRule) rewrites
+    # an outbound TCP connect to a loopback target and drives a SOCKS5 v5
+    # CONNECT handshake on it, carrying the original destination. The
+    # downstream proxy thus learns where the guest *wanted* to go.
+    #
+    # This phase validates that path end-to-end:
+    #   1. A Python stub on the outer VM (127.0.0.1:18080) speaks SOCKS5,
+    #      records the CONNECT target to a log, replies success.
+    #   2. The cogbox work instance gets a remap rule for
+    #      10.99.0.1/32:9000 -> 127.0.0.1:18080 via direct config.json
+    #      edit (no CLI verb for remap yet).
+    #   3. The cogbox guest probes 10.99.0.1:9000; passt's connect() is
+    #      intercepted by the shim, rewritten to 127.0.0.1:18080, and
+    #      hands off via SOCKS5.
+    #   4. The stub log must show a CONNECT for the *original* destination.
+
+    # Raw string: backslash escapes inside the bytes literals are
+    # preserved verbatim through the heredoc.
+    stub_script = r'''
+import socket, struct, sys
+LOG = "/tmp/socks5-conn.log"
+open(LOG, "w").close()
+def log(s):
+    with open(LOG, "a") as f:
+        f.write(s + "\n")
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 18080))
+srv.listen(8)
+log("ready")
+while True:
+    c, _ = srv.accept()
+    try:
+        greet = c.recv(3)
+        if greet != b"\x05\x01\x00":
+            c.close(); continue
+        c.sendall(b"\x05\x00")
+        hdr = c.recv(4)
+        if len(hdr) < 4 or hdr[:2] != b"\x05\x01" or hdr[3] != 1:
+            c.close(); continue
+        addr = c.recv(4)
+        port_b = c.recv(2)
+        ip_str = ".".join(str(b) for b in addr)
+        port = struct.unpack(">H", port_b)[0]
+        log("CONNECT {0}:{1}".format(ip_str, port))
+        c.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        # Consume any echo bytes the client sends so probe()'s bash
+        # exec doesn't block on a write to a full socket buffer.
+        try:
+            c.recv(64)
+        except Exception:
+            pass
+    finally:
+        c.close()
+'''
+    machine.succeed(
+        "cat > /tmp/socks5-stub.py << 'PY_EOF'\n" + stub_script + "\nPY_EOF"
+    )
+    machine.succeed("systemd-run --unit=socks5-stub --collect python3 /tmp/socks5-stub.py")
+    # Stub writes "ready" to its log on bind+listen.
+    machine.wait_until_succeeds("grep -q ready /tmp/socks5-conn.log", timeout=10)
+
+    # Pick a target that has NO direct listener so we can prove the
+    # remap is what made the probe succeed -- not a lucky catch-all on
+    # the existing nc -l -p 9000 (which binds 0.0.0.0).
+    machine.succeed("ip addr add 10.99.0.3/32 dev lo")
+    # Port 9100: no listener anywhere on the outer VM. Without remap,
+    # a TCP connect should be refused (RST).
+
+    # Restore .1 allow (phase D ended after `del 1` which removed .1)
+    # and explicitly allow .3.
+    machine.succeed(as_user("cogbox rules add allow 10.99.0.1/32 --at 1 --name work"))
+    machine.succeed(as_user("cogbox rules add allow 10.99.0.3/32 --at 2 --name work"))
+
+    # Hand-edit the remap table; no CLI verb yet.
+    machine.succeed(
+        "jq '.network.remap = [{\"from\":\"tcp 10.99.0.3/32:9100\",\"to\":\"tcp 127.0.0.1:18080\"}]' "
+        "/home/testuser/.config/cogbox/instances/work/config.json > /tmp/work-cfg.json "
+        "&& mv /tmp/work-cfg.json /home/testuser/.config/cogbox/instances/work/config.json "
+        "&& chown testuser:users /home/testuser/.config/cogbox/instances/work/config.json"
+    )
+
+    boot_and_wait("cc-work", "--name work", ssh_port=2223)
+
+    # The launch script renders both rules and remap into one file.
+    rules_text = machine.succeed("cat /run/user/1000/cogbox-work/netfilter-rules")
+    assert "remap tcp 10.99.0.3/32:9100 -> tcp 127.0.0.1:18080" in rules_text, rules_text
+
+    # End-to-end: guest connect to 10.99.0.3:9100 must succeed because
+    # the shim rewrote the destination to the SOCKS5 stub. The direct
+    # 10.99.0.3:9100 path would otherwise be refused (no listener).
+    def probe_port(name, ip, port):
+        remote = "timeout 3 bash -c 'exec 3<>/dev/tcp/" + ip + "/" + str(port) + "'"
+        return as_user("cogbox ssh --name " + name + " " + shlex.quote(remote))
+
+    machine.succeed(probe_port("work", "10.99.0.3", 9100))
+
+    # The stub recorded a CONNECT for the original (pre-remap) target.
+    out = machine.succeed("cat /tmp/socks5-conn.log")
+    assert "CONNECT 10.99.0.3:9100" in out, "stub log was: " + repr(out)
+
+    # Sanity: connect to 10.99.0.3 on a different port has no remap rule
+    # and no listener -- must fail.
+    machine.fail(probe_port("work", "10.99.0.3", 9101))
+
+    stop_instance("cc-work", name="work")
+    machine.succeed("systemctl stop socks5-stub")
+
 with subtest("Phase G: CLI parser regressions and stub-friendly verbs"):
     # cogbox writes errors to stderr; the test driver's machine.execute()
     # captures only stdout, so we redirect 2>&1 to assert on the message

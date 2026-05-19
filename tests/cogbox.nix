@@ -37,6 +37,9 @@ in {
 			# the closure. Pre-realize it on the outer machine so the inner
 			# nix build resolves it from the local store with no fetch.
 			hello
+			# Phase H runs a small SOCKS5 stub server to verify the shim's
+			# TCP remap path. The stub is plain Python; no extras needed.
+			python3
 		];
 
 		# Pin all transitive flake-input sources into the test machine's

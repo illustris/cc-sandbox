@@ -37,6 +37,14 @@ extern "c" fn lseek(fd: c_int, offset: c_long, whence: c_int) c_long;
 // the low 8 bits.
 const SOCK_TYPE_MASK: c_int = 0xff;
 
+// fcntl bits used to toggle O_NONBLOCK around the remap+SOCKS5 path.
+// passt creates non-blocking sockets; the SOCKS5 handshake needs the
+// connect()+read+write to block until each step completes.
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+const O_NONBLOCK: c_int = 0o4000;
+extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+
 // RTLD_NEXT = ((void *)-1)
 const RTLD_NEXT: *anyopaque = @ptrFromInt(~@as(usize, 0));
 
@@ -307,22 +315,56 @@ export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) 
 	// Remap (v1: TCP only).
 	if (proto == .tcp) {
 		if (ruleset.evaluateRemap(.tcp, info.addr, info.port)) |target| {
-			var target_sa = buildIpv4Sockaddr(target.addr, target.port);
-			const target_len: c.socklen_t = @intCast(@sizeOf(c.struct_sockaddr_in));
-			const sa_ptr: *const c.struct_sockaddr = @ptrCast(&target_sa);
-			const rc = real_connect.?(fd, sa_ptr, target_len);
-			if (rc != 0) return rc;
-			// Tell the proxy where we actually wanted to go, via SOCKS5
-			// CONNECT. The proxy then handles upstream.
-			socks5.handshake(fd, info.addr, info.port) catch {
-				std.c._errno().* = c.EHOSTUNREACH;
-				return -1;
-			};
-			return 0;
+			return doRemappedConnect(fd, info.addr, info.port, target);
 		}
 	}
 
 	return real_connect.?(fd, addr, len);
+}
+
+/// Execute a TCP connect with destination rewritten to `target` and a
+/// SOCKS5 CONNECT handshake driven on the fd to carry the original
+/// destination to the proxy. The handshake is synchronous, so we must
+/// clear O_NONBLOCK for its duration (passt sets it on every socket).
+fn doRemappedConnect(
+	fd: c_int,
+	orig_addr: filter.IpAddr,
+	orig_port: u16,
+	target: filter.RemapTarget,
+) c_int {
+	const old_flags = fcntl(fd, F_GETFL);
+	if (old_flags < 0) {
+		denyErrno();
+		return -1;
+	}
+	const was_nonblock = (old_flags & O_NONBLOCK) != 0;
+	if (was_nonblock) {
+		if (fcntl(fd, F_SETFL, old_flags & ~O_NONBLOCK) < 0) {
+			denyErrno();
+			return -1;
+		}
+	}
+
+	var target_sa = buildIpv4Sockaddr(target.addr, target.port);
+	const target_len: c.socklen_t = @intCast(@sizeOf(c.struct_sockaddr_in));
+	const sa_ptr: *const c.struct_sockaddr = @ptrCast(&target_sa);
+
+	const rc = real_connect.?(fd, sa_ptr, target_len);
+	if (rc != 0) {
+		const saved = std.c._errno().*;
+		if (was_nonblock) _ = fcntl(fd, F_SETFL, old_flags);
+		std.c._errno().* = saved;
+		return rc;
+	}
+
+	const hs = socks5.handshake(fd, orig_addr, orig_port);
+	if (was_nonblock) _ = fcntl(fd, F_SETFL, old_flags);
+	if (hs) |_| {
+		return 0;
+	} else |_| {
+		std.c._errno().* = c.EHOSTUNREACH;
+		return -1;
+	}
 }
 
 export fn sendto(fd: c_int, buf: ?*const anyopaque, len: usize, flags: c_int, dest_addr: ?*const c.struct_sockaddr, addrlen: c.socklen_t) callconv(.c) isize {
