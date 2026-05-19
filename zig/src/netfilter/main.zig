@@ -1,5 +1,6 @@
 const std = @import("std");
 const filter = @import("filter");
+const socks5 = @import("socks5");
 
 const c = @cImport({
 	@cDefine("_GNU_SOURCE", "1");
@@ -22,13 +23,19 @@ const AF_INET6_LOCAL: c_int = 10;
 extern "c" fn __h_errno_location() *c_int;
 extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
 
-// POSIX I/O -- declared directly to avoid glibc macro issues with fcntl.h
+// POSIX I/O -- declared directly to avoid glibc macro issues with fcntl.h.
+// `open`, `read`, `lseek` are only used during init for the rules file; we
+// don't intercept them. `close` is intercepted (see real_close below).
 const O_RDONLY: c_int = 0;
 const SEEK_SET: c_int = 0;
 extern "c" fn @"open"(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern "c" fn lseek(fd: c_int, offset: c_long, whence: c_int) c_long;
-extern "c" fn close(fd: c_int) c_int;
+
+// SOCK_* flag bits from <sys/socket.h>. The type argument to socket(2) can
+// include SOCK_NONBLOCK / SOCK_CLOEXEC ORed in; the actual type lives in
+// the low 8 bits.
+const SOCK_TYPE_MASK: c_int = 0xff;
 
 // RTLD_NEXT = ((void *)-1)
 const RTLD_NEXT: *anyopaque = @ptrFromInt(~@as(usize, 0));
@@ -49,6 +56,8 @@ const ConnectFn = *const fn (c_int, ?*const c.struct_sockaddr, c.socklen_t) call
 const SendtoFn = *const fn (c_int, ?*const anyopaque, usize, c_int, ?*const c.struct_sockaddr, c.socklen_t) callconv(.c) isize;
 const SendmsgFn = *const fn (c_int, ?*const c.struct_msghdr, c_int) callconv(.c) isize;
 const SendmmsgFn = *const fn (c_int, ?[*]c.struct_mmsghdr, c_uint, c_int) callconv(.c) c_int;
+const SocketFn = *const fn (c_int, c_int, c_int) callconv(.c) c_int;
+const CloseFn = *const fn (c_int) callconv(.c) c_int;
 
 // Resolver entry points. The struct types are kept opaque -- we never
 // dereference them in the shim, only forward to libc.
@@ -62,11 +71,78 @@ var real_connect: ?ConnectFn = null;
 var real_sendto: ?SendtoFn = null;
 var real_sendmsg: ?SendmsgFn = null;
 var real_sendmmsg: ?SendmmsgFn = null;
+var real_socket: ?SocketFn = null;
+var real_close: ?CloseFn = null;
 var real_getaddrinfo: ?GetaddrinfoFn = null;
 var real_gethostbyname: ?GethostbynameFn = null;
 var real_gethostbyname2: ?Gethostbyname2Fn = null;
 var real_gethostbyname_r: ?GethostbynameRFn = null;
 var real_gethostbyname2_r: ?Gethostbyname2RFn = null;
+
+// --- Per-fd table ---
+//
+// Tracks (proto, optional connected-UDP peer) for every fd we see go
+// through socket(). Used by connect() to know whether a remap rule
+// applies (remap is tcp-only in v1) and by sendto/sendmsg to honor the
+// CIDR check on connected UDP (which passes NULL dest_addr).
+
+const max_tracked_fds: usize = 4096;
+
+const FdEntry = struct {
+	proto: filter.Proto = .any,
+	peer_addr: ?filter.IpAddr = null,
+	peer_port: u16 = 0,
+};
+
+var fd_table: [max_tracked_fds]?FdEntry = [_]?FdEntry{null} ** max_tracked_fds;
+
+fn trackSocket(fd: c_int, sock_type: c_int) void {
+	if (fd < 0 or @as(usize, @intCast(fd)) >= max_tracked_fds) return;
+	const masked = sock_type & SOCK_TYPE_MASK;
+	const proto: filter.Proto = if (masked == c.SOCK_STREAM)
+		.tcp
+	else if (masked == c.SOCK_DGRAM)
+		.udp
+	else
+		return;
+	fd_table[@intCast(fd)] = .{ .proto = proto };
+}
+
+fn untrackFd(fd: c_int) void {
+	if (fd < 0 or @as(usize, @intCast(fd)) >= max_tracked_fds) return;
+	fd_table[@intCast(fd)] = null;
+}
+
+fn fdProto(fd: c_int) filter.Proto {
+	if (fd < 0 or @as(usize, @intCast(fd)) >= max_tracked_fds) return .any;
+	if (fd_table[@intCast(fd)]) |e| return e.proto;
+	return .any;
+}
+
+fn fdPeer(fd: c_int) ?AddrInfo {
+	if (fd < 0 or @as(usize, @intCast(fd)) >= max_tracked_fds) return null;
+	if (fd_table[@intCast(fd)]) |e| {
+		if (e.peer_addr) |a| return .{ .addr = a, .port = e.peer_port };
+	}
+	return null;
+}
+
+fn setFdPeer(fd: c_int, addr: filter.IpAddr, port: u16) void {
+	if (fd < 0 or @as(usize, @intCast(fd)) >= max_tracked_fds) return;
+	if (fd_table[@intCast(fd)]) |*e| {
+		e.peer_addr = addr;
+		e.peer_port = port;
+	} else {
+		// Fd never went through our socket() wrapper. Track it now with
+		// an unknown proto so subsequent NULL-dest sendto calls still
+		// pick up the peer.
+		fd_table[@intCast(fd)] = .{
+			.proto = .any,
+			.peer_addr = addr,
+			.peer_port = port,
+		};
+	}
+}
 
 fn resolve(comptime name: [*:0]const u8) *anyopaque {
 	return c.dlsym(RTLD_NEXT, name) orelse @panic("netfilter: dlsym failed");
@@ -91,6 +167,8 @@ fn init() void {
 	real_sendto = @ptrCast(resolve("sendto"));
 	real_sendmsg = @ptrCast(resolve("sendmsg"));
 	real_sendmmsg = @ptrCast(resolve("sendmmsg"));
+	real_socket = @ptrCast(resolve("socket"));
+	real_close = @ptrCast(resolve("close"));
 	real_getaddrinfo = @ptrCast(resolve("getaddrinfo"));
 	real_gethostbyname = @ptrCast(resolve("gethostbyname"));
 	real_gethostbyname2 = @ptrCast(resolve("gethostbyname2"));
@@ -172,20 +250,78 @@ fn denyErrno() void {
 	std.c._errno().* = c.ENETUNREACH;
 }
 
+fn buildIpv4Sockaddr(addr: filter.IpAddr, port: u16) c.struct_sockaddr_in {
+	var sa: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+	sa.sin_family = c.AF_INET;
+	sa.sin_port = std.mem.nativeToBig(u16, port);
+	const ipv4: [4]u8 = switch (addr) {
+		.ipv4 => |ip| ip,
+		.ipv6 => unreachable, // v1 remap targets are ipv4 only
+	};
+	sa.sin_addr.s_addr = @bitCast(ipv4);
+	return sa;
+}
+
 // --- Exported wrappers ---
+
+export fn socket(domain: c_int, sock_type: c_int, protocol_: c_int) callconv(.c) c_int {
+	init();
+	const fd = real_socket.?(domain, sock_type, protocol_);
+	if (fd >= 0) trackSocket(fd, sock_type);
+	return fd;
+}
+
+export fn close(fd: c_int) callconv(.c) c_int {
+	// Order: untrack first so we never read stale state after close
+	// returns. close() does NOT trigger full init() because passt's
+	// early-startup close_open_files() runs before any socket() and
+	// would clobber our rules_fd if init opened the rules file too
+	// early. Lazy-resolve real_close via dlsym instead.
+	untrackFd(fd);
+	if (real_close == null) {
+		real_close = @ptrCast(c.dlsym(RTLD_NEXT, "close") orelse @panic("netfilter: dlsym close failed"));
+	}
+	return real_close.?(fd);
+}
 
 export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) callconv(.c) c_int {
 	init();
 	checkReload();
 
-	if (addr) |a| {
-		if (extractAddr(a)) |info| {
-			if (ruleset.evaluate(info.addr, info.port) == .deny) {
-				denyErrno();
+	const a = addr orelse return real_connect.?(fd, addr, len);
+	const info = extractAddr(a) orelse return real_connect.?(fd, addr, len);
+	const proto = fdProto(fd);
+
+	// CIDR check against the ORIGINAL destination (before any remap).
+	if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
+		denyErrno();
+		return -1;
+	}
+
+	// Track connected-UDP peer for subsequent sendto/sendmsg with NULL
+	// dest_addr (typical glibc resolver pattern).
+	if (proto == .udp) {
+		setFdPeer(fd, info.addr, info.port);
+	}
+
+	// Remap (v1: TCP only).
+	if (proto == .tcp) {
+		if (ruleset.evaluateRemap(.tcp, info.addr, info.port)) |target| {
+			var target_sa = buildIpv4Sockaddr(target.addr, target.port);
+			const target_len: c.socklen_t = @intCast(@sizeOf(c.struct_sockaddr_in));
+			const sa_ptr: *const c.struct_sockaddr = @ptrCast(&target_sa);
+			const rc = real_connect.?(fd, sa_ptr, target_len);
+			if (rc != 0) return rc;
+			// Tell the proxy where we actually wanted to go, via SOCKS5
+			// CONNECT. The proxy then handles upstream.
+			socks5.handshake(fd, info.addr, info.port) catch {
+				std.c._errno().* = c.EHOSTUNREACH;
 				return -1;
-			}
+			};
+			return 0;
 		}
 	}
+
 	return real_connect.?(fd, addr, len);
 }
 
@@ -193,12 +329,20 @@ export fn sendto(fd: c_int, buf: ?*const anyopaque, len: usize, flags: c_int, de
 	init();
 	checkReload();
 
+	const proto = fdProto(fd);
+
 	if (dest_addr) |a| {
 		if (extractAddr(a)) |info| {
-			if (ruleset.evaluate(info.addr, info.port) == .deny) {
+			if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
 				denyErrno();
 				return -1;
 			}
+		}
+	} else if (fdPeer(fd)) |peer| {
+		// Connected UDP / TCP send with implicit peer.
+		if (ruleset.evaluate(proto, peer.addr, peer.port) == .deny) {
+			denyErrno();
+			return -1;
 		}
 	}
 	return real_sendto.?(fd, buf, len, flags, dest_addr, addrlen);
@@ -208,14 +352,21 @@ export fn sendmsg(fd: c_int, msg: ?*const c.struct_msghdr, flags: c_int) callcon
 	init();
 	checkReload();
 
+	const proto = fdProto(fd);
+
 	if (msg) |m| {
 		if (m.msg_name) |name| {
 			const sa: *const c.struct_sockaddr = @ptrCast(@alignCast(name));
 			if (extractAddr(sa)) |info| {
-				if (ruleset.evaluate(info.addr, info.port) == .deny) {
+				if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
 					denyErrno();
 					return -1;
 				}
+			}
+		} else if (fdPeer(fd)) |peer| {
+			if (ruleset.evaluate(proto, peer.addr, peer.port) == .deny) {
+				denyErrno();
+				return -1;
 			}
 		}
 	}
@@ -226,15 +377,22 @@ export fn sendmmsg(fd: c_int, msgvec: ?[*]c.struct_mmsghdr, vlen: c_uint, flags:
 	init();
 	checkReload();
 
+	const proto = fdProto(fd);
+
 	if (msgvec) |vec| {
 		if (vlen > 0) {
 			if (vec[0].msg_hdr.msg_name) |name| {
 				const sa: *const c.struct_sockaddr = @ptrCast(@alignCast(name));
 				if (extractAddr(sa)) |info| {
-					if (ruleset.evaluate(info.addr, info.port) == .deny) {
+					if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
 						denyErrno();
 						return -1;
 					}
+				}
+			} else if (fdPeer(fd)) |peer| {
+				if (ruleset.evaluate(proto, peer.addr, peer.port) == .deny) {
+					denyErrno();
+					return -1;
 				}
 			}
 		}

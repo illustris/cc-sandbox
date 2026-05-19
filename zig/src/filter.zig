@@ -5,18 +5,41 @@ pub const Action = enum {
 	deny,
 };
 
+pub const Proto = enum {
+	any,
+	tcp,
+	udp,
+};
+
 pub const IpAddr = union(enum) {
 	ipv4: [4]u8,
 	ipv6: [16]u8,
 };
 
 pub const Rule = struct {
+	proto: Proto = .any,
 	network: IpAddr,
 	prefix_len: u8,
+	port: u16 = 0, // 0 == "any port"
 	action: Action,
 };
 
+pub const RemapTarget = struct {
+	proto: Proto, // tcp or udp; never .any
+	addr: IpAddr,
+	port: u16,
+};
+
+pub const RemapRule = struct {
+	proto: Proto, // must be tcp or udp (no .any)
+	network: IpAddr,
+	prefix_len: u8,
+	port: u16, // explicit; 0 disallowed
+	target: RemapTarget,
+};
+
 pub const max_rules = 256;
+pub const max_remap_rules = 64;
 pub const max_dns_rules = 256;
 pub const max_dns_pattern_len: u8 = 253; // RFC 1035 FQDN length cap
 
@@ -41,21 +64,31 @@ pub const RuleSet = struct {
 	rules: [max_rules]Rule = undefined,
 	len: usize = 0,
 
+	// Remap rules consulted by the shim's TCP connect() wrapper to
+	// rewrite outbound destinations. Walked AFTER the CIDR allow/deny
+	// pass, so a remap hit implicitly says "allow but divert".
+	remap_rules: [max_remap_rules]RemapRule = undefined,
+	remap_len: usize = 0,
+
 	// DNS rules consulted by the libc-resolver wrappers in the shim.
 	// Independent of CIDR rules: a DNS allow does not imply IP allow.
 	dns_rules: [max_dns_rules]DnsRule = undefined,
 	dns_len: usize = 0,
 	dns_default: Action = .allow,
 
-	/// Evaluate a destination address and port against the ruleset.
-	pub fn evaluate(self: *const RuleSet, addr: IpAddr, port: u16) Action {
+	/// Evaluate a destination (proto, addr, port) against the CIDR rules.
+	/// Callers that don't know the protocol may pass `.any`; rules with an
+	/// explicit proto qualifier won't match a `.any` query.
+	pub fn evaluate(self: *const RuleSet, proto: Proto, addr: IpAddr, port: u16) Action {
 		// Implicit: allow DNS (port 53) -- checked first so DNS to
 		// loopback resolvers (e.g. 127.0.0.53 systemd-resolved) works.
 		if (port == 53) return .allow;
 
 		// Implicit: deny loopback -- passt maps its gateway and the
 		// host's IP to 127.0.0.1, so allowing loopback would expose
-		// all host services to the sandbox.
+		// all host services to the sandbox. The remap path bypasses
+		// this check because it never calls evaluate() against the
+		// rewritten destination.
 		switch (addr) {
 			.ipv4 => |ip| {
 				if (ip[0] == 127) return .deny;
@@ -66,24 +99,28 @@ pub const RuleSet = struct {
 			},
 		}
 
-		// Normalize IPv4-mapped IPv6 to IPv4 for rule matching
-		const check_addr: IpAddr = switch (addr) {
-			.ipv6 => |ip| if (isIpv4Mapped(ip))
-				.{ .ipv4 = .{ ip[12], ip[13], ip[14], ip[15] } }
-			else
-				addr,
-			.ipv4 => addr,
-		};
+		const check_addr = normalizeMapped(addr);
 
 		// Walk user rules in order, first match wins
 		for (self.rules[0..self.len]) |rule| {
-			if (cidrMatches(rule, check_addr)) {
+			if (ruleMatches(rule, proto, check_addr, port)) {
 				return rule.action;
 			}
 		}
 
 		// Default: deny
 		return .deny;
+	}
+
+	/// If a remap rule matches the (proto, addr, port) tuple, return its
+	/// target. Otherwise null. Caller is expected to have already passed
+	/// the CIDR check -- this method does not consult `rules`.
+	pub fn evaluateRemap(self: *const RuleSet, proto: Proto, addr: IpAddr, port: u16) ?RemapTarget {
+		const check_addr = normalizeMapped(addr);
+		for (self.remap_rules[0..self.remap_len]) |r| {
+			if (remapMatches(r, proto, check_addr, port)) return r.target;
+		}
+		return null;
 	}
 
 	/// Evaluate a hostname against the DNS rule table. The host may carry a
@@ -207,17 +244,43 @@ pub fn isIpv4Mapped(ip: [16]u8) bool {
 	return std.mem.eql(u8, ip[0..12], &ipv4_mapped_prefix);
 }
 
-fn cidrMatches(rule: Rule, addr: IpAddr) bool {
-	return switch (rule.network) {
+fn normalizeMapped(addr: IpAddr) IpAddr {
+	return switch (addr) {
+		.ipv6 => |ip| if (isIpv4Mapped(ip))
+			.{ .ipv4 = .{ ip[12], ip[13], ip[14], ip[15] } }
+		else
+			addr,
+		.ipv4 => addr,
+	};
+}
+
+fn cidrContains(network: IpAddr, prefix_len: u8, addr: IpAddr) bool {
+	return switch (network) {
 		.ipv4 => |net| switch (addr) {
-			.ipv4 => |ip| ipv4Matches(net, ip, rule.prefix_len),
+			.ipv4 => |ip| ipv4Matches(net, ip, prefix_len),
 			.ipv6 => false,
 		},
 		.ipv6 => |net| switch (addr) {
-			.ipv6 => |ip| ipv6Matches(net, ip, rule.prefix_len),
+			.ipv6 => |ip| ipv6Matches(net, ip, prefix_len),
 			.ipv4 => false,
 		},
 	};
+}
+
+fn cidrMatches(rule: Rule, addr: IpAddr) bool {
+	return cidrContains(rule.network, rule.prefix_len, addr);
+}
+
+fn ruleMatches(rule: Rule, proto: Proto, addr: IpAddr, port: u16) bool {
+	if (rule.proto != .any and rule.proto != proto) return false;
+	if (rule.port != 0 and rule.port != port) return false;
+	return cidrContains(rule.network, rule.prefix_len, addr);
+}
+
+fn remapMatches(r: RemapRule, proto: Proto, addr: IpAddr, port: u16) bool {
+	if (r.proto != proto) return false;
+	if (r.port != port) return false;
+	return cidrContains(r.network, r.prefix_len, addr);
 }
 
 fn ipv4Matches(net: [4]u8, ip: [4]u8, prefix_len: u8) bool {
@@ -250,8 +313,12 @@ fn ipv6Matches(net: [16]u8, ip: [16]u8, prefix_len: u8) bool {
 	return true;
 }
 
-/// Parse a single rule line like "allow 10.0.0.0/8" or "deny 0.0.0.0/0".
-/// Returns null for empty lines, comments, or malformed input.
+/// Parse a single allow/deny rule line. Accepted forms:
+///   allow|deny CIDR                       (proto=any, port=any)
+///   allow|deny tcp|udp CIDR               (port=any)
+///   allow|deny CIDR:PORT                  (proto=any)
+///   allow|deny tcp|udp CIDR:PORT
+/// IPv6 CIDRs and port suffixes on IPv6 are not supported in v1.
 pub fn parseLine(line: []const u8) ?Rule {
 	const trimmed = std.mem.trim(u8, line, " \t\r\n");
 	if (trimmed.len == 0 or trimmed[0] == '#') return null;
@@ -269,23 +336,110 @@ pub fn parseLine(line: []const u8) ?Rule {
 		return null;
 	}
 
-	const cidr = std.mem.trim(u8, rest, " \t");
-	const slash_pos = std.mem.indexOfScalar(u8, cidr, '/') orelse return null;
-	const ip_str = cidr[0..slash_pos];
-	const prefix_str = cidr[slash_pos + 1 ..];
-	const prefix_len = std.fmt.parseInt(u8, prefix_str, 10) catch return null;
+	const pcp = parseProtoCidrPort(rest, .{ .require_cidr_slash = true }) orelse return null;
+	return .{
+		.proto = pcp.proto,
+		.network = pcp.network,
+		.prefix_len = pcp.prefix_len,
+		.port = pcp.port,
+		.action = action,
+	};
+}
 
-	if (parseIpv4(ip_str)) |ipv4| {
-		if (prefix_len > 32) return null;
-		return .{
-			.network = .{ .ipv4 = ipv4 },
-			.prefix_len = prefix_len,
-			.action = action,
-		};
+const ProtoCidrPort = struct {
+	proto: Proto,
+	network: IpAddr,
+	prefix_len: u8,
+	port: u16, // 0 == not specified
+};
+
+const ParseOpts = struct {
+	require_proto: bool = false,
+	require_cidr_slash: bool = false,
+};
+
+/// Parse the trailing form `[tcp|udp ] CIDR[:port]`. When
+/// `require_cidr_slash` is false, a bare IP without `/N` defaults to /32
+/// (useful for remap targets).
+fn parseProtoCidrPort(s: []const u8, opts: ParseOpts) ?ProtoCidrPort {
+	var rest = std.mem.trim(u8, s, " \t");
+
+	var proto: Proto = .any;
+	if (std.mem.startsWith(u8, rest, "tcp ")) {
+		proto = .tcp;
+		rest = std.mem.trim(u8, rest[4..], " \t");
+	} else if (std.mem.startsWith(u8, rest, "udp ")) {
+		proto = .udp;
+		rest = std.mem.trim(u8, rest[4..], " \t");
+	}
+	if (opts.require_proto and proto == .any) return null;
+
+	// Split off `:port` if present. v1 supports IPv4 only here, so we
+	// can safely treat any single colon as the port separator.
+	var addr_part: []const u8 = rest;
+	var port: u16 = 0;
+	if (std.mem.indexOfScalar(u8, rest, ':')) |colon| {
+		// If there's more than one colon (IPv6 textual form), bail out.
+		if (std.mem.lastIndexOfScalar(u8, rest, ':').? != colon) return null;
+		addr_part = rest[0..colon];
+		const port_str = std.mem.trim(u8, rest[colon + 1 ..], " \t");
+		port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+		if (port == 0) return null; // port 0 reserved for "any"
 	}
 
-	// IPv6 rule parsing not yet implemented
-	return null;
+	var prefix_len: u8 = 32;
+	var ip_str: []const u8 = addr_part;
+	if (std.mem.indexOfScalar(u8, addr_part, '/')) |sp| {
+		ip_str = addr_part[0..sp];
+		prefix_len = std.fmt.parseInt(u8, addr_part[sp + 1 ..], 10) catch return null;
+	} else if (opts.require_cidr_slash) {
+		return null;
+	}
+	if (prefix_len > 32) return null;
+
+	const ipv4 = parseIpv4(ip_str) orelse return null;
+	return .{
+		.proto = proto,
+		.network = .{ .ipv4 = ipv4 },
+		.prefix_len = prefix_len,
+		.port = port,
+	};
+}
+
+/// Parse a single `remap` rule line:
+///   remap PROTO CIDR:PORT -> PROTO IP[:PORT]
+/// v1 restricts both sides to `tcp` and remap targets to single hosts
+/// (/32). Returns null for malformed input.
+pub fn parseRemapLine(line: []const u8) ?RemapRule {
+	const trimmed = std.mem.trim(u8, line, " \t\r\n");
+	if (trimmed.len == 0 or trimmed[0] == '#') return null;
+	if (!std.mem.startsWith(u8, trimmed, "remap ")) return null;
+	const body = trimmed[6..];
+
+	const arrow = std.mem.indexOf(u8, body, "->") orelse return null;
+	const lhs = std.mem.trim(u8, body[0..arrow], " \t");
+	const rhs = std.mem.trim(u8, body[arrow + 2 ..], " \t");
+
+	const lhs_p = parseProtoCidrPort(lhs, .{ .require_proto = true, .require_cidr_slash = true }) orelse return null;
+	if (lhs_p.port == 0) return null;
+	if (lhs_p.proto != .tcp) return null; // v1: tcp -> tcp only
+
+	const rhs_p = parseProtoCidrPort(rhs, .{ .require_proto = true }) orelse return null;
+	if (rhs_p.port == 0) return null;
+	if (rhs_p.prefix_len != 32) return null; // single host
+	if (rhs_p.proto != .tcp) return null;
+
+	return .{
+		.proto = lhs_p.proto,
+		.network = lhs_p.network,
+		.prefix_len = lhs_p.prefix_len,
+		.port = lhs_p.port,
+		.target = .{
+			.proto = rhs_p.proto,
+			.addr = rhs_p.network,
+			.port = rhs_p.port,
+		},
+	};
 }
 
 pub fn parseIpv4(s: []const u8) ?[4]u8 {
@@ -321,6 +475,16 @@ pub fn parseRules(content: []const u8) RuleSet {
 						.action = entry.action,
 					};
 					ruleset.dns_len += 1;
+				}
+			}
+			continue;
+		}
+
+		if (std.mem.startsWith(u8, trimmed, "remap ")) {
+			if (parseRemapLine(trimmed)) |r| {
+				if (ruleset.remap_len < max_remap_rules) {
+					ruleset.remap_rules[ruleset.remap_len] = r;
+					ruleset.remap_len += 1;
 				}
 			}
 			continue;
@@ -421,24 +585,24 @@ test "isIpv4Mapped" {
 
 test "RuleSet evaluate loopback denied" {
 	const rs = RuleSet{};
-	try std.testing.expectEqual(Action.deny, rs.evaluate(.{ .ipv4 = .{ 127, 0, 0, 1 } }, 80));
-	try std.testing.expectEqual(Action.deny, rs.evaluate(.{ .ipv6 = ipv6_loopback }, 80));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.any, .{ .ipv4 = .{ 127, 0, 0, 1 } }, 80));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.any, .{ .ipv6 = ipv6_loopback }, 80));
 }
 
 test "RuleSet evaluate loopback DNS allowed" {
 	const rs = RuleSet{};
-	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
-	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv6 = ipv6_loopback }, 53));
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.any, .{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.any, .{ .ipv6 = ipv6_loopback }, 53));
 }
 
 test "RuleSet evaluate DNS" {
 	const rs = RuleSet{};
-	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv4 = .{ 8, 8, 8, 8 } }, 53));
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.any, .{ .ipv4 = .{ 8, 8, 8, 8 } }, 53));
 }
 
 test "RuleSet evaluate default deny" {
 	const rs = RuleSet{};
-	try std.testing.expectEqual(Action.deny, rs.evaluate(.{ .ipv4 = .{ 8, 8, 8, 8 } }, 443));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.any, .{ .ipv4 = .{ 8, 8, 8, 8 } }, 443));
 }
 
 test "RuleSet evaluate user rules in order" {
@@ -447,15 +611,15 @@ test "RuleSet evaluate user rules in order" {
 		\\deny 192.168.0.0/16
 		\\allow 0.0.0.0/0
 	);
-	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv4 = .{ 10, 1, 2, 3 } }, 443));
-	try std.testing.expectEqual(Action.deny, rs.evaluate(.{ .ipv4 = .{ 192, 168, 1, 1 } }, 443));
-	try std.testing.expectEqual(Action.allow, rs.evaluate(.{ .ipv4 = .{ 8, 8, 8, 8 } }, 443));
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.any, .{ .ipv4 = .{ 10, 1, 2, 3 } }, 443));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.any, .{ .ipv4 = .{ 192, 168, 1, 1 } }, 443));
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.any, .{ .ipv4 = .{ 8, 8, 8, 8 } }, 443));
 }
 
 test "RuleSet evaluate IPv4-mapped IPv6" {
 	const rs = parseRules("deny 10.0.0.0/8");
 	const mapped = IpAddr{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 1, 2, 3 } };
-	try std.testing.expectEqual(Action.deny, rs.evaluate(mapped, 443));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.any, mapped, 443));
 }
 
 test "parseRules multi-line with comments" {
@@ -569,4 +733,97 @@ test "parseRules mixed CIDR + DNS rules go to separate tables" {
 	try std.testing.expectEqual(Action.deny, rs.dns_default);
 	try std.testing.expectEqual(Action.allow, rs.dns_rules[0].action);
 	try std.testing.expectEqualStrings("api.anthropic.com", rs.dns_rules[0].pattern.slice());
+}
+
+// --- proto/port qualifiers + remap ---
+
+test "parseLine with tcp proto qualifier" {
+	const r = parseLine("allow tcp 10.0.0.0/8").?;
+	try std.testing.expectEqual(Proto.tcp, r.proto);
+	try std.testing.expectEqual(@as(u16, 0), r.port);
+}
+
+test "parseLine with port qualifier" {
+	const r = parseLine("deny 0.0.0.0/0:25").?;
+	try std.testing.expectEqual(Proto.any, r.proto);
+	try std.testing.expectEqual(@as(u16, 25), r.port);
+}
+
+test "parseLine with proto + port" {
+	const r = parseLine("allow tcp 10.0.0.0/8:443").?;
+	try std.testing.expectEqual(Proto.tcp, r.proto);
+	try std.testing.expectEqual(@as(u16, 443), r.port);
+}
+
+test "parseLine backward compat: no qualifiers" {
+	const r = parseLine("allow 10.0.0.0/8").?;
+	try std.testing.expectEqual(Proto.any, r.proto);
+	try std.testing.expectEqual(@as(u16, 0), r.port);
+}
+
+test "evaluate honors proto qualifier" {
+	const rs = parseRules("allow tcp 8.8.8.8/32");
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.tcp, .{ .ipv4 = .{ 8, 8, 8, 8 } }, 443));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, .{ .ipv4 = .{ 8, 8, 8, 8 } }, 443));
+}
+
+test "evaluate honors port qualifier" {
+	const rs = parseRules("deny 0.0.0.0/0:25");
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, .{ .ipv4 = .{ 1, 2, 3, 4 } }, 25));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, .{ .ipv4 = .{ 1, 2, 3, 4 } }, 26)); // default-deny on no match
+}
+
+test "evaluate proto+port qualifier matches narrowly" {
+	const rs = parseRules(
+		\\allow tcp 0.0.0.0/0:443
+		\\deny 0.0.0.0/0
+	);
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.tcp, .{ .ipv4 = .{ 1, 2, 3, 4 } }, 443));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, .{ .ipv4 = .{ 1, 2, 3, 4 } }, 80));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, .{ .ipv4 = .{ 1, 2, 3, 4 } }, 443));
+}
+
+test "parseRemapLine basic" {
+	const r = parseRemapLine("remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18080").?;
+	try std.testing.expectEqual(Proto.tcp, r.proto);
+	try std.testing.expectEqual(@as(u8, 0), r.prefix_len);
+	try std.testing.expectEqual(@as(u16, 443), r.port);
+	try std.testing.expectEqual(Proto.tcp, r.target.proto);
+	try std.testing.expectEqual(@as(u16, 18080), r.target.port);
+	try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, r.target.addr.ipv4);
+}
+
+test "parseRemapLine narrow source CIDR" {
+	const r = parseRemapLine("remap tcp 1.2.3.0/24:80 -> tcp 127.0.0.1:18081").?;
+	try std.testing.expectEqual([4]u8{ 1, 2, 3, 0 }, r.network.ipv4);
+	try std.testing.expectEqual(@as(u8, 24), r.prefix_len);
+}
+
+test "parseRemapLine rejects missing proto, missing port, udp, multi-host target" {
+	try std.testing.expect(parseRemapLine("remap 0.0.0.0/0:443 -> tcp 127.0.0.1:8080") == null);
+	try std.testing.expect(parseRemapLine("remap tcp 0.0.0.0/0 -> tcp 127.0.0.1:8080") == null);
+	try std.testing.expect(parseRemapLine("remap udp 0.0.0.0/0:53 -> udp 127.0.0.1:1053") == null);
+	try std.testing.expect(parseRemapLine("remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.0/24:8080") == null);
+	try std.testing.expect(parseRemapLine("remap tcp 0.0.0.0/0:443") == null);
+}
+
+test "evaluateRemap returns target on match, null otherwise" {
+	const rs = parseRules("remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18080");
+	const tgt = rs.evaluateRemap(.tcp, .{ .ipv4 = .{ 1, 2, 3, 4 } }, 443).?;
+	try std.testing.expectEqual(@as(u16, 18080), tgt.port);
+	try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, tgt.addr.ipv4);
+	try std.testing.expect(rs.evaluateRemap(.tcp, .{ .ipv4 = .{ 1, 2, 3, 4 } }, 80) == null);
+	try std.testing.expect(rs.evaluateRemap(.udp, .{ .ipv4 = .{ 1, 2, 3, 4 } }, 443) == null);
+}
+
+test "parseRules mixes CIDR + remap + DNS into three tables" {
+	const rs = parseRules(
+		\\allow 10.0.0.0/8
+		\\remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18080
+		\\dns default deny
+		\\dns allow api.anthropic.com
+	);
+	try std.testing.expectEqual(@as(usize, 1), rs.len);
+	try std.testing.expectEqual(@as(usize, 1), rs.remap_len);
+	try std.testing.expectEqual(@as(usize, 1), rs.dns_len);
 }

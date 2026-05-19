@@ -160,6 +160,31 @@ that run only.
 | `cogbox rules del INDEX [-n NAME]` | Delete a rule by index |
 | `cogbox rules set [-n NAME]` | Replace all rules from stdin |
 
+CIDR rules accept optional `tcp`/`udp` and `:PORT` qualifiers when
+hand-edited in `config.json` (the CLI currently only emits the
+unqualified form). The runtime file format is:
+
+```
+allow 10.0.0.0/8                 # any proto, any port
+allow tcp 10.0.0.0/8             # tcp, any port
+deny  0.0.0.0/0:25               # any proto, port 25
+allow tcp 0.0.0.0/0:443          # tcp, port 443
+```
+
+There is also an experimental, hand-edit-only `remap` table for TCP
+destination rewriting (used by the upcoming HTTP-filtering layer). Add
+entries under `.network.remap` in `config.json`:
+
+```json
+"remap": [
+    {"from": "tcp 0.0.0.0/0:443", "to": "tcp 127.0.0.1:18080"}
+]
+```
+
+The shim performs a SOCKS5 CONNECT handshake against the target,
+carrying the original destination in the request, so any SOCKS5 server
+on the target port can act as a transparent proxy.
+
 If the instance is running, rule changes take effect immediately (the
 runtime rules file is regenerated and passt receives `SIGUSR1` to reload).
 

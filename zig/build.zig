@@ -10,6 +10,14 @@ pub fn build(b: *std.Build) void {
 		.optimize = optimize,
 	});
 
+	const socks5_mod = b.createModule(.{
+		.root_source_file = b.path("src/socks5/main.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	socks5_mod.addImport("filter", filter_mod);
+
 	const lib_mod = b.createModule(.{
 		.root_source_file = b.path("src/netfilter/main.zig"),
 		.target = target,
@@ -17,6 +25,7 @@ pub fn build(b: *std.Build) void {
 		.link_libc = true,
 	});
 	lib_mod.addImport("filter", filter_mod);
+	lib_mod.addImport("socks5", socks5_mod);
 
 	const lib = b.addLibrary(.{
 		.name = "netfilter",
@@ -55,6 +64,11 @@ pub fn build(b: *std.Build) void {
 	});
 	const run_filter_tests = b.addRunArtifact(filter_tests);
 
+	const socks5_tests = b.addTest(.{
+		.root_module = socks5_mod,
+	});
+	const run_socks5_tests = b.addRunArtifact(socks5_tests);
+
 	const rules_test_mod = b.createModule(.{
 		.root_source_file = b.path("src/rules/tests.zig"),
 		.target = target,
@@ -79,6 +93,7 @@ pub fn build(b: *std.Build) void {
 
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_filter_tests.step);
+	test_step.dependOn(&run_socks5_tests.step);
 	test_step.dependOn(&run_rules_tests.step);
 	test_step.dependOn(&run_cli_tests.step);
 }

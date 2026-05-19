@@ -661,11 +661,20 @@ for h in "${HARNESSES[@]}"; do
 done
 
 # -- Generate rules file for LD_PRELOAD filter ---------------------
+# Emits CIDR allow/deny rules and TCP remap rules to a single file.
+# The shim's loader (zig/src/filter.zig::parseRules) fans line types
+# into separate tables. v1 remap schema (no CLI verb yet, hand-edit
+# config.json):
+#   "remap": [{"from": "tcp 0.0.0.0/0:443", "to": "tcp 127.0.0.1:18080"}]
 if [ "$NETWORK_MODE" = "rules" ]; then
-	jq -r '.network.rules[] |
-		if .allow then "allow \(.allow)"
-		elif .deny then "deny \(.deny)"
-		else empty end' "$ACTIVE_CONFIG" > "$RUNTIME/netfilter-rules"
+	{
+		jq -r '.network.rules[]? |
+			if .allow then "allow \(.allow)"
+			elif .deny then "deny \(.deny)"
+			else empty end' "$ACTIVE_CONFIG"
+		jq -r '.network.remap[]? |
+			"remap \(.from) -> \(.to)"' "$ACTIVE_CONFIG"
+	} > "$RUNTIME/netfilter-rules"
 fi
 
 # -- Patch the microvm runner with runtime QEMU settings -----------
