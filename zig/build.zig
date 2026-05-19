@@ -43,6 +43,16 @@ pub fn build(b: *std.Build) void {
 	});
 	rules_mod.addImport("filter", filter_mod);
 
+	// Remap verb. Shares config/save/reload with the rules module so
+	// edits to either table re-render the full runtime rules file.
+	const remap_mod = b.createModule(.{
+		.root_source_file = b.path("src/remap/main.zig"),
+		.target = target,
+		.optimize = optimize,
+	});
+	remap_mod.addImport("filter", filter_mod);
+	remap_mod.addImport("rules_module", rules_mod);
+
 	// Top-level cogbox CLI.
 	const cli_mod = b.createModule(.{
 		.root_source_file = b.path("src/cli/main.zig"),
@@ -51,6 +61,7 @@ pub fn build(b: *std.Build) void {
 		.link_libc = true,
 	});
 	cli_mod.addImport("rules_module", rules_mod);
+	cli_mod.addImport("remap_module", remap_mod);
 	cli_mod.addImport("filter", filter_mod);
 
 	const cogbox_exe = b.addExecutable(.{
@@ -80,6 +91,17 @@ pub fn build(b: *std.Build) void {
 	});
 	const run_rules_tests = b.addRunArtifact(rules_tests);
 
+	const remap_test_mod = b.createModule(.{
+		.root_source_file = b.path("src/remap/tests.zig"),
+		.target = target,
+		.optimize = optimize,
+	});
+	remap_test_mod.addImport("filter", filter_mod);
+	const remap_tests = b.addTest(.{
+		.root_module = remap_test_mod,
+	});
+	const run_remap_tests = b.addRunArtifact(remap_tests);
+
 	const cli_test_mod = b.createModule(.{
 		.root_source_file = b.path("src/cli/parse.zig"),
 		.target = target,
@@ -95,5 +117,6 @@ pub fn build(b: *std.Build) void {
 	test_step.dependOn(&run_filter_tests.step);
 	test_step.dependOn(&run_socks5_tests.step);
 	test_step.dependOn(&run_rules_tests.step);
+	test_step.dependOn(&run_remap_tests.step);
 	test_step.dependOn(&run_cli_tests.step);
 }

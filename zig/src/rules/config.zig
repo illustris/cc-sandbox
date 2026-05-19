@@ -46,6 +46,18 @@ pub const Loaded = struct {
 			else => return error.InvalidJson,
 		}
 	}
+
+	/// Returns a pointer to the .network object itself (in rules mode).
+	/// Used by verbs that need to read sibling sub-objects -- e.g. the
+	/// remap verb wants to mutate .network.remap, but rule rendering also
+	/// has to read .network.rules so neither sub-verb clobbers the other.
+	pub fn network(self: *Loaded) !*std.json.Value {
+		const r = self.root();
+		if (r.* != .object) return error.InvalidJson;
+		const net = r.object.getPtr("network") orelse return error.NotInRulesMode;
+		if (net.* != .object) return error.NotInRulesMode;
+		return net;
+	}
 };
 
 pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Loaded {

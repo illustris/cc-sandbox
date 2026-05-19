@@ -1,29 +1,59 @@
 // Regenerate the runtime rules file (read by the LD_PRELOAD filter) and
-// signal a running passt to re-read it. Mirrors the shell behavior in
-// cogbox.sh.
+// signal a running passt to re-read it. Emits both the CIDR allow/deny
+// section AND the remap section from the loaded .network object, so the
+// `rules` and `remap` verbs can each rewrite the file independently
+// without dropping the other layer.
 
 const std = @import("std");
 const rule = @import("rule.zig");
 
-pub fn writeRuntimeRules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, rules_arr: std.json.Array) !void {
+/// Render `.network` to wire-format rule lines. Pure -- no I/O.
+/// Ordering on disk is stable: CIDR rules first, then remap.
+pub fn renderRules(allocator: std.mem.Allocator, network: std.json.Value, out: *std.ArrayList(u8)) !void {
+	if (network != .object) return;
+
+	if (network.object.getPtr("rules")) |rules_val| {
+		if (rules_val.* == .array) {
+			for (rules_val.array.items) |r| {
+				if (r != .object) continue;
+				const p = rule.ruleAction(r.object) orelse continue;
+				const action_str = switch (p.action) {
+					.allow => "allow",
+					.deny => "deny",
+				};
+				try out.appendSlice(allocator, action_str);
+				try out.append(allocator, ' ');
+				try out.appendSlice(allocator, p.cidr);
+				try out.append(allocator, '\n');
+			}
+		}
+	}
+
+	if (network.object.getPtr("remap")) |remap_val| {
+		if (remap_val.* == .array) {
+			for (remap_val.array.items) |r| {
+				if (r != .object) continue;
+				const from_v = r.object.getPtr("from") orelse continue;
+				const to_v = r.object.getPtr("to") orelse continue;
+				if (from_v.* != .string or to_v.* != .string) continue;
+				try out.appendSlice(allocator, "remap ");
+				try out.appendSlice(allocator, from_v.string);
+				try out.appendSlice(allocator, " -> ");
+				try out.appendSlice(allocator, to_v.string);
+				try out.append(allocator, '\n');
+			}
+		}
+	}
+}
+
+pub fn writeRuntimeRules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, network: std.json.Value) !void {
 	const path = try std.fs.path.join(allocator, &.{ runtime_dir, "netfilter-rules" });
 	defer allocator.free(path);
 
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
 
-	for (rules_arr.items) |r| {
-		if (r != .object) continue;
-		const p = rule.ruleAction(r.object) orelse continue;
-		const action_str = switch (p.action) {
-			.allow => "allow",
-			.deny => "deny",
-		};
-		try out.appendSlice(allocator, action_str);
-		try out.append(allocator, ' ');
-		try out.appendSlice(allocator, p.cidr);
-		try out.append(allocator, '\n');
-	}
+	try renderRules(allocator, network, &out);
 
 	const cwd = std.Io.Dir.cwd();
 	const f = try cwd.createFile(io, path, .{ .truncate = true });

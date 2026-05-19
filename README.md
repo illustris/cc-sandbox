@@ -116,7 +116,8 @@ cogbox uses a verb-based CLI. Bare `cogbox` (no verb) is sugar for
 | `list` | List all instances. `--json` for machine-readable output |
 | `init` | Create config + host directories without launching |
 | `ssh` | Connect to a running instance via SSH |
-| `rules` | Manage netfilter rules for an instance |
+| `rules` | Manage CIDR allow/deny rules for an instance |
+| `remap` | Manage TCP destination-remap rules |
 | `help` | `cogbox help VERB` ≡ `cogbox VERB --help` |
 
 Run `cogbox VERB --help` for verb-specific options.
@@ -171,19 +172,30 @@ deny  0.0.0.0/0:25               # any proto, port 25
 allow tcp 0.0.0.0/0:443          # tcp, port 443
 ```
 
-There is also an experimental, hand-edit-only `remap` table for TCP
-destination rewriting (used by the upcoming HTTP-filtering layer). Add
-entries under `.network.remap` in `config.json`:
+### Remap verb
 
-```json
-"remap": [
-    {"from": "tcp 0.0.0.0/0:443", "to": "tcp 127.0.0.1:18080"}
-]
+A second, independent table redirects outbound TCP connects from
+specific `(cidr, port)` destinations to a loopback target on the host.
+When a match fires, the shim drives a SOCKS5 v5 CONNECT handshake on
+the connecting fd, carrying the original `(ip, port)` to the target
+proxy. v1 supports TCP only; the target must be a single host.
+
+| Form | Description |
+|---|---|
+| `cogbox remap list [-n NAME]` | List current remap rules with 1-based indices |
+| `cogbox remap add FROM TO [--at N] [-n NAME]` | Add a rule. `FROM` and `TO` are single quoted args, e.g. `"tcp 0.0.0.0/0:443"` and `"tcp 127.0.0.1:18080"`. |
+| `cogbox remap del INDEX [-n NAME]` | Delete a rule by index |
+| `cogbox remap set [-n NAME]` | Replace all rules from stdin (one `FROM -> TO` per line) |
+
+Example: send every outbound TCP/443 connection through a SOCKS5 proxy
+running on `127.0.0.1:18080`:
+
+```sh
+cogbox remap add "tcp 0.0.0.0/0:443" "tcp 127.0.0.1:18080"
 ```
 
-The shim performs a SOCKS5 CONNECT handshake against the target,
-carrying the original destination in the request, so any SOCKS5 server
-on the target port can act as a transparent proxy.
+The CIDR + remap tables share one runtime rules file; edits to either
+verb rewrite both sections cleanly without dropping the other layer.
 
 If the instance is running, rule changes take effect immediately (the
 runtime rules file is regenerated and passt receives `SIGUSR1` to reload).

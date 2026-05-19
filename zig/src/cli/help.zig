@@ -21,7 +21,8 @@ pub const TOP_LEVEL =
 	\\  list      List all instances
 	\\  init      Create instance config and host directories without launching
 	\\  ssh       Connect to a running instance via SSH
-	\\  rules     Manage netfilter rules for an instance
+	\\  rules     Manage CIDR allow/deny rules for an instance
+	\\  remap     Manage TCP destination-remap rules
 	\\  help      Show help for a verb (cogbox help VERB)
 	\\
 	\\Common options:
@@ -235,6 +236,34 @@ pub const RULES =
 	\\
 ;
 
+pub const REMAP =
+	\\cogbox remap - manage TCP destination-remap rules
+	\\
+	\\Usage:
+	\\  cogbox remap [-n NAME] list
+	\\  cogbox remap [-n NAME] add FROM TO [--at N]
+	\\  cogbox remap [-n NAME] del INDEX
+	\\  cogbox remap [-n NAME] set            (reads rules from stdin)
+	\\
+	\\Spec syntax (v1: tcp only, single-host target):
+	\\  FROM:  tcp CIDR:PORT       e.g. "tcp 0.0.0.0/0:443"
+	\\  TO:    tcp IP[:PORT]       e.g. "tcp 127.0.0.1:18080"
+	\\
+	\\When a TCP connect() inside the LD_PRELOAD'd network process
+	\\matches FROM, the shim rewrites the destination to TO and drives
+	\\a SOCKS5 v5 CONNECT handshake on the same fd carrying the
+	\\original (IP, port). The downstream proxy thus sees the guest's
+	\\real intended destination.
+	\\
+	\\Examples:
+	\\  cogbox remap add "tcp 0.0.0.0/0:443" "tcp 127.0.0.1:18080"
+	\\  cogbox remap add "tcp 1.2.3.0/24:80" "tcp 10.0.0.1:8080" --at 1
+	\\
+	\\If the instance is running, edits hot-reload via SIGUSR1 to passt
+	\\(no VM restart needed).
+	\\
+;
+
 pub fn forVerb(verb: []const u8) ?[]const u8 {
 	if (std.mem.eql(u8, verb, "run")) return RUN;
 	if (std.mem.eql(u8, verb, "start")) return START;
@@ -245,6 +274,7 @@ pub fn forVerb(verb: []const u8) ?[]const u8 {
 	if (std.mem.eql(u8, verb, "init")) return INIT;
 	if (std.mem.eql(u8, verb, "ssh")) return SSH;
 	if (std.mem.eql(u8, verb, "rules")) return RULES;
+	if (std.mem.eql(u8, verb, "remap")) return REMAP;
 	return null;
 }
 

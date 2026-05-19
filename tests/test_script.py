@@ -391,6 +391,34 @@ while True:
     # and no listener -- must fail.
     machine.fail(probe_port("work", "10.99.0.3", 9101))
 
+    # Dynamic add through the `cogbox remap` CLI -- the running passt
+    # must pick up the new rule via SIGUSR1 reload without restart.
+    # Insert at position 1 so the index of the rule we're about to test
+    # is deterministic (the .3:9100 jq-edit rule already occupies a
+    # slot, so a plain append would land at position 2).
+    machine.succeed("ip addr add 10.99.0.4/32 dev lo")
+    machine.succeed(as_user("cogbox rules add allow 10.99.0.4/32 --at 1 --name work"))
+    out = machine.succeed(as_user(
+        "cogbox remap add 'tcp 10.99.0.4/32:9200' 'tcp 127.0.0.1:18080' --at 1 --name work"
+    ))
+    assert "Rules reloaded" in out, out
+
+    out = machine.succeed(as_user("cogbox remap list --name work"))
+    # The new rule should be at index 1 after --at 1.
+    first_line = out.splitlines()[0]
+    assert first_line == "1: tcp 10.99.0.4/32:9200 -> tcp 127.0.0.1:18080", out
+
+    # The reloaded rule must take effect without a VM restart.
+    machine.succeed(probe_port("work", "10.99.0.4", 9200))
+    out = machine.succeed("cat /tmp/socks5-conn.log")
+    assert "CONNECT 10.99.0.4:9200" in out, "stub log was: " + repr(out)
+
+    # `cogbox remap del 1` removes the .4:9200 rule we just inserted.
+    # After reload, the probe must fail -- no remap, no listener.
+    out = machine.succeed(as_user("cogbox remap del 1 --name work"))
+    assert "Rules reloaded" in out, out
+    machine.fail(probe_port("work", "10.99.0.4", 9200))
+
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop socks5-stub")
 

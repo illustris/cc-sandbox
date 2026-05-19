@@ -13,11 +13,12 @@ const stop_verb = @import("verbs/stop.zig");
 const restart_verb = @import("verbs/restart.zig");
 const ssh_verb = @import("verbs/ssh.zig");
 const rules_verb = @import("verbs/rules.zig");
+const remap_verb = @import("verbs/remap.zig");
 const run_verb = @import("verbs/run.zig");
 const start_verb = @import("verbs/start.zig");
 
 const KNOWN_VERBS = [_][]const u8{
-	"run", "start", "stop", "restart", "status", "list", "init", "ssh", "rules", "help",
+	"run", "start", "stop", "restart", "status", "list", "init", "ssh", "rules", "remap", "help",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -86,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "restart")) return restart_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "ssh")) return ssh_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "rules")) return rules_verb.run(allocator, io, &p, rest);
+	if (std.mem.eql(u8, verb, "remap")) return remap_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "init")) return run_verb.run(allocator, io, env, rest, "init", true);
 	if (std.mem.eql(u8, verb, "run")) return run_verb.run(allocator, io, env, rest, "run", false);
 	if (std.mem.eql(u8, verb, "start")) return start_verb.run(allocator, io, env, &p, rest);

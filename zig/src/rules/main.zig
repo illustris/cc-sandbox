@@ -1,8 +1,8 @@
 const std = @import("std");
 pub const cli = @import("cli.zig");
-const config = @import("config.zig");
-const rule = @import("rule.zig");
-const reload = @import("reload.zig");
+pub const config = @import("config.zig");
+pub const rule = @import("rule.zig");
+pub const reload = @import("reload.zig");
 
 /// Entry point for the rules verb. The new top-level cogbox CLI parses
 /// `--name` itself and constructs `--config`/`--runtime` from the active
@@ -55,6 +55,21 @@ pub fn dispatch(
 		.del => |d| try cmdDel(allocator, io, args, rules_arr, d, &loaded),
 		.set => try cmdSet(allocator, io, args, rules_arr, &loaded),
 	}
+}
+
+/// Render the runtime rules file from the loaded config's .network value
+/// (both CIDR and remap sections) and SIGUSR1 a running passt. No-op if
+/// passt isn't running. Shared by `cogbox rules`, `cogbox remap`, and any
+/// future verb that mutates rules-table state.
+pub fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []const u8, loaded: *config.Loaded) !void {
+	const pid_path = try std.fs.path.join(allocator, &.{ runtime_path, "passt.pid" });
+	defer allocator.free(pid_path);
+	std.Io.Dir.cwd().access(io, pid_path, .{}) catch return;
+
+	const net = try loaded.network();
+	try reload.writeRuntimeRules(allocator, io, runtime_path, net.*);
+	const sent = try reload.maybeSignalPasst(allocator, io, runtime_path);
+	if (sent) try announce(allocator, io, "Rules reloaded.", .{});
 }
 
 fn cmdList(allocator: std.mem.Allocator, io: std.Io, rules_arr: std.json.Array) !void {
@@ -118,7 +133,7 @@ fn cmdAdd(
 	} else {
 		try announce(allocator, io, "Added: {s} {s}", .{ action_str, a.cidr });
 	}
-	try maybeReload(allocator, io, args.runtime_path, rules_arr.*);
+	try maybeReload(allocator, io, args.runtime_path, loaded);
 }
 
 fn cmdDel(
@@ -135,7 +150,7 @@ fn cmdDel(
 
 	try config.save(allocator, io, args.config_path, loaded.root().*);
 	try announce(allocator, io, "Deleted rule {d}.", .{d.index});
-	try maybeReload(allocator, io, args.runtime_path, rules_arr.*);
+	try maybeReload(allocator, io, args.runtime_path, loaded);
 }
 
 fn cmdSet(
@@ -176,17 +191,7 @@ fn cmdSet(
 	try rule.replaceAll(loaded.treeAllocator(), rules_arr, pairs.items);
 	try config.save(allocator, io, args.config_path, loaded.root().*);
 	try announce(allocator, io, "Rules replaced.", .{});
-	try maybeReload(allocator, io, args.runtime_path, rules_arr.*);
-}
-
-fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []const u8, rules_arr: std.json.Array) !void {
-	const pid_path = try std.fs.path.join(allocator, &.{ runtime_path, "passt.pid" });
-	defer allocator.free(pid_path);
-	std.Io.Dir.cwd().access(io, pid_path, .{}) catch return;
-
-	try reload.writeRuntimeRules(allocator, io, runtime_path, rules_arr);
-	const sent = try reload.maybeSignalPasst(allocator, io, runtime_path);
-	if (sent) try announce(allocator, io, "Rules reloaded.", .{});
+	try maybeReload(allocator, io, args.runtime_path, loaded);
 }
 
 fn writeStdout(io: std.Io, bytes: []const u8) !void {
