@@ -1,6 +1,19 @@
 {
 	description = "cogbox MicroVM";
 
+	# A flake's nixConfig is only honored when it is the *top-level*
+	# flake; an input's nixConfig is deliberately never propagated to the
+	# consumer. So even though llm-agents.nix declares cache.numtide.com,
+	# building cogbox would ignore it and rebuild every harness (codex,
+	# etc.) from source. nixConfig also cannot reference `inputs` (it is a
+	# static attr, evaluated before outputs), so these values are mirrored
+	# by hand from numtide/llm-agents.nix's own flake.nix nixConfig.
+	# Re-sync if upstream rotates the cache URL or signing key.
+	nixConfig = {
+		extra-substituters = [ "https://cache.numtide.com" ];
+		extra-trusted-public-keys = [ "niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=" ];
+	};
+
 	inputs = {
 		nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
 		illustris-lib = {
