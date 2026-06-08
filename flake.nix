@@ -310,7 +310,16 @@
 						mountPoint = lowerMount p.harness p.pathkey;
 						readOnly = true;
 					}) overlayPaths;
-					qemu.extraArgs = lib.concatMap (p: [
+					# A human (HMP) QEMU monitor on a per-instance socket, for
+					# `cogbox monitor`. The microvm module already wires a QMP
+					# control socket (qemu.socket -> -qmp); this is the separate
+					# readline monitor humans actually want to type at. The
+					# ${runtimeDir} sentinel is sed-rewritten to the live $RUNTIME
+					# by cogbox-launch.sh, same as the fw_cfg paths below.
+					qemu.extraArgs = [
+						"-monitor"
+						"unix:${runtimeDir}/monitor.sock,server,nowait"
+					] ++ lib.concatMap (p: [
 						"-fw_cfg"
 						"name=opt/${tag p.harness p.pathkey},file=${sentinel p.harness p.pathkey}"
 					]) fwCfgPaths;

@@ -16,9 +16,15 @@ const rules_verb = @import("verbs/rules.zig");
 const remap_verb = @import("verbs/remap.zig");
 const run_verb = @import("verbs/run.zig");
 const start_verb = @import("verbs/start.zig");
+const attach_verb = @import("verbs/attach_verb.zig");
+const attach = @import("attach.zig");
 
 const KNOWN_VERBS = [_][]const u8{
-	"run", "start", "stop", "restart", "status", "list", "init", "ssh", "rules", "remap", "help",
+	"start",  "stop",  "restart", "status", "list", "init",
+	"ssh",    "rules", "remap",   "console", "monitor", "help",
+	// "__launch" is a hidden re-exec target (see verbs/run.zig); it is
+	// recognized below but intentionally omitted from help.
+	"__launch",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -48,11 +54,15 @@ pub fn main(init: std.process.Init) !void {
 		if (std.mem.eql(u8, argv[0], "--init-only")) {
 			util.die(allocator, io, null, exit_codes.usage, "--init-only was removed; use 'cogbox init'", .{});
 		}
+		if (std.mem.eql(u8, argv[0], "run")) {
+			util.die(allocator, io, null, exit_codes.usage, "'run' was removed. Bare 'cogbox' now starts in the background; add -f/--foreground to attach the console.", .{});
+		}
 	}
 
 	// Determine verb. If argv[0] is a known verb, that's the verb.
-	// Otherwise (no args, or first arg looks like a flag), default to `run`.
-	var verb: []const u8 = "run";
+	// Otherwise (no args, or first arg looks like a flag), default to
+	// `start` -- bare `cogbox` launches in the background.
+	var verb: []const u8 = "start";
 	var rest = argv;
 	if (argv.len > 0) {
 		if (isKnownVerb(argv[0])) {
@@ -88,8 +98,10 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "ssh")) return ssh_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "rules")) return rules_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "remap")) return remap_verb.run(allocator, io, &p, rest);
-	if (std.mem.eql(u8, verb, "init")) return run_verb.run(allocator, io, env, rest, "init", true);
-	if (std.mem.eql(u8, verb, "run")) return run_verb.run(allocator, io, env, rest, "run", false);
+	if (std.mem.eql(u8, verb, "console")) return attach_verb.run(allocator, io, &p, rest, attach.Target.console);
+	if (std.mem.eql(u8, verb, "monitor")) return attach_verb.run(allocator, io, &p, rest, attach.Target.monitor);
+	if (std.mem.eql(u8, verb, "init")) return run_verb.run(allocator, io, env, rest);
+	if (std.mem.eql(u8, verb, "__launch")) return run_verb.launchInPlace(allocator, io, env, rest);
 	if (std.mem.eql(u8, verb, "start")) return start_verb.run(allocator, io, env, &p, rest);
 
 	util.die(allocator, io, null, exit_codes.usage, "unknown verb '{s}'", .{verb});

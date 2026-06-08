@@ -3,6 +3,15 @@
 // The launch script lives in $out/libexec/cogbox-launch.sh, alongside
 // the binary at $out/bin/cogbox. We resolve the path at runtime via
 // /proc/self/exe so the binary is relocatable (no compile-time bake).
+//
+// Launch modes (passed to the script):
+//   --init-only   seed host state + (for custom flakes) warm the runner
+//                 build via re-exec, then stop before runtime setup. Used
+//                 by `cogbox init` and by the foreground init step of the
+//                 default launch.
+//   (no flag)     full launch: runtime setup + passt + QEMU. The script
+//                 daemonization itself is driven by the Zig `start` verb,
+//                 which forks before exec'ing the script in this mode.
 
 const std = @import("std");
 
@@ -13,12 +22,21 @@ pub const LaunchOpts = struct {
 	network: ?[]const u8,
 	auto_keys: bool,
 	yes: bool,
-	init_only: bool,
+	/// Zig-side only (never forwarded to the bash script): attach the serial
+	/// console after the VM comes up instead of returning immediately.
+	foreground: bool,
 };
 
-/// Build the argv that the bash launch script expects.
+/// Build the argv that the bash launch script expects. `init_only` selects
+/// the script mode; `opts.foreground` is intentionally NOT forwarded (it is
+/// handled entirely on the Zig side).
 /// Caller owns the returned slice and each element.
-pub fn buildLaunchArgs(allocator: std.mem.Allocator, opts: LaunchOpts, script_path: []const u8) ![]const []const u8 {
+pub fn buildLaunchArgs(
+	allocator: std.mem.Allocator,
+	opts: LaunchOpts,
+	script_path: []const u8,
+	init_only: bool,
+) ![]const []const u8 {
 	var args: std.ArrayList([]const u8) = .empty;
 	errdefer args.deinit(allocator);
 
@@ -42,7 +60,7 @@ pub fn buildLaunchArgs(allocator: std.mem.Allocator, opts: LaunchOpts, script_pa
 	}
 	if (!opts.auto_keys) try args.append(allocator, try allocator.dupe(u8, "--no-auto-keys"));
 	if (opts.yes) try args.append(allocator, try allocator.dupe(u8, "--yes"));
-	if (opts.init_only) try args.append(allocator, try allocator.dupe(u8, "--init-only"));
+	if (init_only) try args.append(allocator, try allocator.dupe(u8, "--init-only"));
 
 	return try args.toOwnedSlice(allocator);
 }
@@ -80,4 +98,19 @@ pub fn execvAlloc(allocator: std.mem.Allocator, argv: []const []const u8) !void 
 	const argv_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(argv_z.ptr);
 	_ = execv(prog.ptr, argv_ptr);
 	return error.ExecvFailed;
+}
+
+/// Resolve the script path, build args for `init_only`, and exec it in place
+/// (replacing this process). Used by `cogbox init` (init_only=true,
+/// foreground) and the hidden `__launch` re-exec target (init_only=false).
+pub fn execLaunchScript(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	env: *std.process.Environ.Map,
+	opts: LaunchOpts,
+	init_only: bool,
+) !void {
+	const script_path = try resolveScriptPath(allocator, io, env);
+	const argv = try buildLaunchArgs(allocator, opts, script_path, init_only);
+	try execvAlloc(allocator, argv);
 }

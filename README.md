@@ -49,6 +49,10 @@ The following paths will be created:
 Continue? [y/N]
 ```
 
+The VM then starts in the background and `cogbox` returns. Drop into it
+with `cogbox ssh`, or watch it boot with `cogbox -f` (foreground: launch and
+attach the serial console; `Ctrl-]` detaches without stopping the VM).
+
 Each enabled harness ships a launcher inside the VM: `c` for
 `claude-code`, `oc` for `opencode`, `cx` for `codex`. All three binaries
 are installed unconditionally (subject to per-architecture availability),
@@ -65,7 +69,7 @@ Run multiple isolated VMs simultaneously, like Wine prefixes. Each named
 instance gets its own data directory, overlay image, and network ports.
 
 ```sh
-# Default instance (foreground)
+# Default instance (background)
 nix run github:illustris/cogbox
 
 # Create and start a named instance
@@ -102,14 +106,20 @@ opens where the instance's state lives.
 ## CLI
 
 cogbox uses a verb-based CLI. Bare `cogbox` (no verb) is sugar for
-`cogbox run`, so the most common invocation stays short.
+`cogbox start`, so the most common invocation stays short.
+
+The VM always runs as a background daemon. Its serial console and QEMU
+monitor each live on a per-instance Unix socket, so you can attach and
+detach freely (Ctrl-] detaches) without ever stopping the VM. "Foreground"
+is just `start -f`: launch, then auto-attach the console.
 
 ### Verbs
 
 | Verb | Description |
 |---|---|
-| `run` | Init if needed, launch the VM in the foreground (default verb) |
-| `start` | Init if needed, launch the VM in the background and return |
+| `start` | Init if needed, launch the VM in the background and return (default verb). With `-f`, attach the serial console after launch. |
+| `console` | Attach the serial console of a running instance. `Ctrl-]` detaches; the VM keeps running. |
+| `monitor` | Attach the QEMU (HMP) monitor of a running instance. `Ctrl-]` detaches. |
 | `stop` | Stop a running instance (SIGTERM, then SIGKILL with `--force`) |
 | `restart` | `stop` then `start` |
 | `status` | Print whether an instance is running, plus ports/net mode |
@@ -120,6 +130,10 @@ cogbox uses a verb-based CLI. Bare `cogbox` (no verb) is sugar for
 | `remap` | Manage TCP destination-remap rules |
 | `help` | `cogbox help VERB` ≡ `cogbox VERB --help` |
 
+The `run` verb from earlier versions has been removed: bare `cogbox` now
+starts in the background, and `cogbox -f` is the foreground (attached)
+equivalent.
+
 Run `cogbox VERB --help` for verb-specific options.
 
 ### Common options
@@ -128,11 +142,12 @@ Run `cogbox VERB --help` for verb-specific options.
 |---|---|---|
 | `-n, --name NAME` | every verb that takes an instance | Instance name (default: `default`) |
 | `-h, --help` | every verb | Show help and exit |
-| `-y, --yes` | `run`, `start`, `init` | Skip the harness-selection prompt on first init |
-| `--vcpu N` | `run`, `start`, `init` | vCPU count (default: config.json or 16) |
-| `--mem N` | `run`, `start`, `init` | RAM in MB (default: config.json or 32768) |
-| `--network MODE` | `run`, `start`, `init` | `full`, `none`, or `rules` (default: rules) |
-| `--no-auto-keys` | `run`, `start`, `init` | Leave `authorized_keys` empty instead of seeding |
+| `-f, --foreground` | `start` | Attach the serial console after launch. Detaching (`Ctrl-]`) leaves the VM running. |
+| `-y, --yes` | `start`, `init` | Skip the harness-selection prompt on first init |
+| `--vcpu N` | `start`, `init` | vCPU count (default: config.json or 16) |
+| `--mem N` | `start`, `init` | RAM in MB (default: config.json or 32768) |
+| `--network MODE` | `start`, `init` | `full`, `none`, or `rules` (default: rules) |
+| `--no-auto-keys` | `start`, `init` | Leave `authorized_keys` empty instead of seeding |
 | `--force` | `stop` | Send SIGKILL after 10s if SIGTERM doesn't exit the process |
 | `--json` | `list` | Emit one JSON object per instance |
 
@@ -199,6 +214,36 @@ verb rewrite both sections cleanly without dropping the other layer.
 
 If the instance is running, rule changes take effect immediately (the
 runtime rules file is regenerated and passt receives `SIGUSR1` to reload).
+
+### Console and monitor
+
+The VM is always a background daemon. QEMU's guest serial console and a human
+(HMP) QEMU monitor each listen on a per-instance Unix socket in the runtime
+directory, so you can attach a terminal to either one, detach, and reattach
+as often as you like -- the VM is never interrupted.
+
+| Form | Description |
+|---|---|
+| `cogbox start -f [-n NAME]` | Launch in the background, then immediately attach the serial console (foreground). |
+| `cogbox console [-n NAME]` | Attach the serial console of an already-running instance. Recent console history is replayed first, then the session goes live. |
+| `cogbox monitor [-n NAME]` | Attach the QEMU monitor (the `(qemu)` prompt) of a running instance. Type commands like `info status`, `info block`, `system_powerdown`. |
+
+Press **`Ctrl-]`** to detach from either; the VM keeps running and you return
+to your shell. Only one attachment is possible at a time per socket (QEMU's
+character-device sockets are single-client).
+
+The full guest serial output of the current session is always captured to
+`<runtime>/console.log` regardless of whether a console is attached, and the
+daemon's own stdout/stderr (passt, QEMU warnings) go to `<runtime>/cogbox.log`.
+
+```sh
+# Start in the background, then watch it boot
+nix run github:illustris/cogbox -- -f
+
+# Attach later from another terminal
+nix run github:illustris/cogbox -- console
+nix run github:illustris/cogbox -- monitor --name work
+```
 
 ### SSH verb
 

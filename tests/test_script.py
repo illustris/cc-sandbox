@@ -1,7 +1,6 @@
 import shlex
 
 SSH_OPTS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=2"
-COGBOX = "/run/current-system/sw/bin/cogbox"
 
 
 def as_user(cmd):
@@ -15,14 +14,12 @@ def probe(name, ip):
 
 
 def boot_and_wait(unit, args, ssh_port):
-    # systemd-run keeps the wrapper + QEMU + passt in one cgroup so
-    # `systemctl stop` later tears the whole tree down cleanly.
-    machine.succeed(
-        f"systemd-run --unit={unit} --uid=testuser "
-        "--setenv=HOME=/home/testuser "
-        "--working-directory=/home/testuser "
-        f"{COGBOX} {args}"
-    )
+    # `cogbox start` daemonizes the VM (passt + QEMU) itself and returns once
+    # QEMU has come up. The daemon is setsid'd into its own session, so it
+    # survives this command and is torn down later by `cogbox stop`. The
+    # `unit` arg is kept for call-site compatibility but is now unused.
+    _ = unit
+    machine.succeed(as_user(f"cogbox start {args}".strip()))
     machine.wait_until_succeeds(
         as_user(f"ssh {SSH_OPTS} -p {ssh_port} root@127.0.0.1 true"),
         timeout=600,
@@ -30,19 +27,14 @@ def boot_and_wait(unit, args, ssh_port):
 
 
 def stop_instance(unit, name=None):
-    machine.succeed(f"systemctl stop {unit} || true")
+    # `cogbox stop` SIGTERMs the daemon; its trap forwards to QEMU + passt
+    # and the EXIT trap removes the runtime dir. This exercises the
+    # stop-reliability path that the background-by-default model depends on.
+    _ = unit
+    name_arg = f"--name {name}" if name else ""
+    machine.succeed(as_user(f"cogbox stop {name_arg}".strip()))
     runtime = "/run/user/1000/cogbox" + (("-" + name) if name else "")
     machine.wait_until_fails(f"test -e {runtime}/pid", timeout=30)
-    # Transient units linger in systemd's state briefly after stopping;
-    # without this dance a follow-up systemd-run with the same unit
-    # name fails as "already loaded". `show -p LoadState` reports
-    # "stub" (or "not-found") when the unit is fully gone, vs.
-    # "loaded" while systemd still holds it in memory.
-    machine.succeed(f"systemctl reset-failed {unit} 2>/dev/null || true")
-    machine.wait_until_succeeds(
-        f"[ \"$(systemctl show -p LoadState --value {unit} 2>/dev/null)\" != loaded ]",
-        timeout=15,
-    )
 
 
 machine.wait_for_unit("multi-user.target")
@@ -285,6 +277,90 @@ with subtest("Phase F: opencode + codex harnesses wired into the VM"):
     assert out == "persisted", out
     stop_instance("cc-default")
 
+with subtest("Phase I: background default, console + monitor sockets, stop teardown"):
+    rt = "/run/user/1000/cogbox"
+
+    # console/monitor on a stopped instance fail cleanly.
+    rc, _ = machine.execute(as_user("cogbox console 2>&1"))
+    assert rc != 0, "console on stopped instance should fail"
+    rc, _ = machine.execute(as_user("cogbox monitor 2>&1"))
+    assert rc != 0, "monitor on stopped instance should fail"
+
+    # `cogbox start` daemonizes and returns; boot_and_wait asserts SSH is up.
+    boot_and_wait("cc-default", "", ssh_port=2222)
+
+    # The per-instance console + monitor sockets exist, and the serial
+    # console was captured to console.log (proves the chardev rewrite took).
+    machine.succeed(f"test -S {rt}/console.sock")
+    machine.succeed(f"test -S {rt}/monitor.sock")
+    machine.succeed(f"test -f {rt}/console.log")
+
+    # Drive the live serial console over its socket: the guest runs an
+    # autologin root shell on ttyS0, so a typed command produces output.
+    console_drv = r'''
+import socket, time, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/run/user/1000/cogbox/console.sock")
+s.settimeout(1.0)
+buf = b""
+deadline = time.time() + 20
+s.sendall(b"\n")
+while time.time() < deadline:
+    s.sendall(b"uname -n\n")
+    try:
+        while True:
+            d = s.recv(4096)
+            if not d:
+                break
+            buf += d
+    except socket.timeout:
+        pass
+    if b"cogbox-default" in buf:
+        break
+sys.stderr.write(repr(buf[-200:]))
+sys.exit(0 if b"cogbox-default" in buf else 1)
+'''
+    machine.succeed("cat > /tmp/console-drv.py << 'PY_EOF'\n" + console_drv + "\nPY_EOF")
+    machine.succeed(as_user("python3 /tmp/console-drv.py"))
+
+    # Drive the HMP monitor over its socket: 'info status' reports VM state.
+    monitor_drv = r'''
+import socket, time, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/run/user/1000/cogbox/monitor.sock")
+s.settimeout(1.0)
+buf = b""
+deadline = time.time() + 15
+while time.time() < deadline:
+    s.sendall(b"info status\n")
+    try:
+        while True:
+            d = s.recv(4096)
+            if not d:
+                break
+            buf += d
+    except socket.timeout:
+        pass
+    if b"running" in buf or b"VM status" in buf:
+        break
+sys.stderr.write(repr(buf[-200:]))
+sys.exit(0 if (b"running" in buf or b"VM status" in buf) else 1)
+'''
+    machine.succeed("cat > /tmp/monitor-drv.py << 'PY_EOF'\n" + monitor_drv + "\nPY_EOF")
+    machine.succeed(as_user("python3 /tmp/monitor-drv.py"))
+
+    # Stop must tear the VM down without --force: SIGTERM to the daemon must
+    # propagate to QEMU + passt (the trap), not just orphan them.
+    stop_instance("cc-default")
+    rc, _ = machine.execute(as_user("cogbox status"))
+    assert rc == 3, f"expected stopped (exit 3) after stop, got {rc}"
+    # No QEMU process should survive a plain stop. Match on the process name
+    # (comm = "qemu-system-x86") NOT the full cmdline: microvm-run launches
+    # QEMU via `exec -a microvm@nixos`, so the cmdline contains no "qemu" and
+    # `pgrep -f qemu-system` would (a) never match the VM and (b) self-match
+    # the test driver's own `bash -c 'pgrep ...'` wrapper.
+    machine.wait_until_fails("pgrep qemu-system", timeout=15)
+
 with subtest("Phase H: TCP remap routes via SOCKS5 to a host stub"):
     # The shim's remap primitive (zig/src/filter.zig::RemapRule) rewrites
     # an outbound TCP connect to a loopback target and drives a SOCKS5 v5
@@ -443,14 +519,25 @@ with subtest("Phase G: CLI parser regressions and stub-friendly verbs"):
     assert rc == 64, f"expected exit 64, got {rc}; out={out!r}"
     assert "use 'cogbox init'" in out, out
 
+    # G2b: the `run` verb was removed in favor of background-by-default + -f.
+    rc, out = run_cli("cogbox run")
+    assert rc == 64, f"expected exit 64 for removed 'run', got {rc}; out={out!r}"
+    assert "was removed" in out and "-f" in out, out
+
+    # G2c: console/monitor exist as verbs and accept --help (exit 0).
+    rc, out = run_cli("cogbox console --help")
+    assert rc == 0 and "detach" in out.lower(), out
+    rc, out = run_cli("cogbox monitor --help")
+    assert rc == 0 and "monitor" in out.lower(), out
+
     # G3: parser bug -- `--name --vcpu 8` must NOT swallow `--vcpu` as the
     # name. Old bash parser bug; new parser exits 64 with "requires a value".
-    rc, out = run_cli("cogbox run --name --vcpu 8")
+    rc, out = run_cli("cogbox start --name --vcpu 8")
     assert rc == 64, f"expected exit 64, got {rc}; out={out!r}"
     assert "requires a value" in out, out
 
     # G4: integer validation on --vcpu; must reject non-numeric with 65.
-    rc, out = run_cli("cogbox run --vcpu abc")
+    rc, out = run_cli("cogbox start --vcpu abc")
     assert rc == 65, f"expected exit 65, got {rc}; out={out!r}"
     assert "positive integer" in out, out
 

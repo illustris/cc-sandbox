@@ -13,8 +13,10 @@ pub const TOP_LEVEL =
 	\\  cogbox [VERB] [OPTIONS]
 	\\
 	\\Verbs:
-	\\  run       Init if needed and launch the VM in the foreground (default)
-	\\  start     Launch the VM in the background and return
+	\\  start     Launch the VM in the background and return (default).
+	\\            -f/--foreground attaches the serial console instead.
+	\\  console   Attach the serial console of a running instance (Ctrl-] detaches)
+	\\  monitor   Attach the QEMU monitor of a running instance (Ctrl-] detaches)
 	\\  stop      Stop a running instance
 	\\  restart   Stop then start
 	\\  status    Print whether an instance is running, its ports, and net mode
@@ -27,10 +29,13 @@ pub const TOP_LEVEL =
 	\\
 	\\Common options:
 	\\  -n, --name NAME    Instance name (default: "default")
+	\\  -f, --foreground   (start) attach the serial console after launch
 	\\  -h, --help         Show help and exit
 	\\
 	\\Run 'cogbox VERB --help' for verb-specific options. Bare 'cogbox' is
-	\\equivalent to 'cogbox run'.
+	\\equivalent to 'cogbox start' -- it launches in the background. The VM's
+	\\serial console and QEMU monitor live on per-instance sockets, so you can
+	\\attach and detach (Ctrl-]) freely without stopping the VM.
 	\\
 	\\Network modes:
 	\\  full              Unrestricted networking
@@ -64,53 +69,77 @@ pub const TOP_LEVEL =
 	\\
 ;
 
-pub const RUN =
-	\\cogbox run - init if needed, launch the VM in the foreground
+pub const START =
+	\\cogbox start - launch the VM in the background (the default verb)
 	\\
 	\\Usage:
-	\\  cogbox run [OPTIONS]
-	\\  cogbox     [OPTIONS]            (alias for run)
+	\\  cogbox start [OPTIONS]
+	\\  cogbox       [OPTIONS]            (bare cogbox is equivalent)
 	\\
 	\\Options:
 	\\  -n, --name NAME       Instance name (default: "default")
+	\\  -f, --foreground      Attach the serial console after launch. Detaching
+	\\                        (Ctrl-]) leaves the VM running in the background.
 	\\  --vcpu N              vCPU count (default: 16; or value from config.json)
-	\\  --mem N               RAM in megabytes (default: 32768; or value from config.json)
+	\\  --mem N               RAM in megabytes (default: 32768; or from config.json)
 	\\  --network MODE        Network mode: full, none, or rules (default: rules)
 	\\  --no-auto-keys        On first init, leave authorized_keys empty instead of
 	\\                        seeding from ~/.ssh/*.pub and ssh-add -L
 	\\  -y, --yes             Skip the harness-selection prompt on first init
 	\\  -h, --help            Show this help and exit
 	\\
-	\\Examples:
-	\\  cogbox run                       Start the default instance
-	\\  cogbox run --name work           Start a named instance
-	\\  cogbox --vcpu 8 --mem 16384      Start the default with custom resources
-	\\  cogbox run --network none        Start fully isolated
+	\\The VM always runs as a background daemon. First-run setup prompts are
+	\\shown in the foreground; the daemon's own output goes to
+	\\<runtime>/cogbox.log, and the guest serial console is captured to
+	\\<runtime>/console.log. Exits 75 if an instance with the same name is
+	\\already running.
 	\\
-	\\See also: cogbox start, cogbox init, cogbox stop
+	\\Examples:
+	\\  cogbox                           Start the default instance in the background
+	\\  cogbox -f                        Start and attach the serial console
+	\\  cogbox --name work               Start a named instance in the background
+	\\  cogbox --vcpu 8 --mem 16384      Start with custom resources
+	\\  cogbox --network none -f         Start fully isolated, attach the console
+	\\
+	\\See also: cogbox console, cogbox monitor, cogbox status, cogbox stop
 	\\
 ;
 
-pub const START =
-	\\cogbox start - launch the VM in the background and return
+pub const CONSOLE =
+	\\cogbox console - attach the serial console of a running instance
 	\\
 	\\Usage:
-	\\  cogbox start [OPTIONS]
+	\\  cogbox console [OPTIONS]
 	\\
 	\\Options:
 	\\  -n, --name NAME       Instance name (default: "default")
-	\\  --vcpu N              vCPU count
-	\\  --mem N               RAM in megabytes
-	\\  --network MODE        Network mode: full, none, or rules
-	\\  --no-auto-keys        On first init, leave authorized_keys empty
-	\\  -y, --yes             Skip the harness-selection prompt on first init
 	\\  -h, --help            Show this help and exit
 	\\
-	\\start writes daemon stdout/stderr to <runtime>/cogbox.log and waits for
-	\\the SSH endpoint to come up before returning. Exits 75 if an instance
-	\\with the same name is already running.
+	\\Connects to the guest's serial console (<runtime>/console.sock) and relays
+	\\your terminal to it in raw mode. Recent console history is replayed first,
+	\\then the session goes live. Press Ctrl-] to detach; the VM keeps running.
+	\\Only one console attachment is possible at a time.
 	\\
-	\\See also: cogbox status, cogbox stop, cogbox restart
+	\\See also: cogbox monitor, cogbox start -f
+	\\
+;
+
+pub const MONITOR =
+	\\cogbox monitor - attach the QEMU (HMP) monitor of a running instance
+	\\
+	\\Usage:
+	\\  cogbox monitor [OPTIONS]
+	\\
+	\\Options:
+	\\  -n, --name NAME       Instance name (default: "default")
+	\\  -h, --help            Show this help and exit
+	\\
+	\\Connects to the human QEMU monitor (<runtime>/monitor.sock) where you can
+	\\type commands like 'info status', 'info block', or 'system_powerdown'.
+	\\Press Ctrl-] to detach; the VM keeps running. Only one monitor attachment
+	\\is possible at a time.
+	\\
+	\\See also: cogbox console, cogbox stop
 	\\
 ;
 
@@ -265,8 +294,9 @@ pub const REMAP =
 ;
 
 pub fn forVerb(verb: []const u8) ?[]const u8 {
-	if (std.mem.eql(u8, verb, "run")) return RUN;
 	if (std.mem.eql(u8, verb, "start")) return START;
+	if (std.mem.eql(u8, verb, "console")) return CONSOLE;
+	if (std.mem.eql(u8, verb, "monitor")) return MONITOR;
 	if (std.mem.eql(u8, verb, "stop")) return STOP;
 	if (std.mem.eql(u8, verb, "restart")) return RESTART;
 	if (std.mem.eql(u8, verb, "status")) return STATUS;

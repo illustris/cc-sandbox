@@ -40,11 +40,17 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-# Reconstruct the user-facing cogbox argv for the re-exec path below.
-# Only the launch-shaped flags are passed through; the verb is always
-# `run` because re-exec is only relevant when we'd otherwise launch the
-# VM (init-only, list, status, etc. don't trigger re-exec).
-ORIG_ARGS=(run)
+# Reconstruct the cogbox argv for the custom-flake re-exec path below. The
+# verb mirrors the current mode so the re-exec'd cogbox does the same thing
+# without re-forking or re-prompting: `init` for --init-only, otherwise the
+# hidden `__launch` verb (exec the launch script in place -- the
+# daemonization was already done by the `start` verb that forked us, so we
+# must not fork again).
+if [ "$INIT_ONLY" -eq 1 ]; then
+	ORIG_ARGS=(init)
+else
+	ORIG_ARGS=(__launch)
+fi
 [ -n "$INSTANCE_NAME" ] && ORIG_ARGS+=(--name "$INSTANCE_NAME")
 [ -n "$FLAG_VCPU" ]     && ORIG_ARGS+=(--vcpu "$FLAG_VCPU")
 [ -n "$FLAG_MEM" ]      && ORIG_ARGS+=(--mem "$FLAG_MEM")
@@ -565,6 +571,16 @@ if [ -z "${COGBOX_REEXECED:-}" ] && [ -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
 	fi
 fi
 
+# -- init-only stops here ------------------------------------------
+# By this point host state is seeded and (for a customized per-instance
+# flake) the runner has been built via the re-exec above, warming the cache
+# for the daemon launch. Runtime-dir setup and the VM launch belong to the
+# daemon, so `cogbox init` and the foreground init step both stop here.
+if [ "$INIT_ONLY" -eq 1 ]; then
+	echo "Init complete${INSTANCE_NAME:+ (instance \"$INSTANCE_NAME\")}."
+	exit 0
+fi
+
 # -- Validate and read runtime config -----------------------------
 ACTIVE_CONFIG="$INSTANCE_CONFIG_DIR/config.json"
 if ! jq empty "$ACTIVE_CONFIG" 2>/dev/null; then
@@ -602,6 +618,21 @@ else
 fi
 
 # -- Set up runtime symlink directory for QEMU ---------------------
+# Atomic single-starter guard. The lock lives beside (not inside) $RUNTIME so
+# the rm -rf below cannot clear it. Two near-simultaneous `cogbox start` for
+# the same instance would otherwise both wipe + recreate $RUNTIME and boot two
+# QEMUs against the same overlay image (corruption). `set -C` (noclobber) makes
+# the create fail if another starter holds the lock; a lock whose owner is dead
+# is reclaimed as stale.
+LOCK="${RUNTIME}.lock"
+if ! ( set -C; echo "$$" > "$LOCK" ) 2>/dev/null; then
+	owner=$(cat "$LOCK" 2>/dev/null)
+	if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+		die "instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is already running or starting." 75
+	fi
+	echo "$$" > "$LOCK"
+fi
+
 if [ -e "$RUNTIME" ]; then
 	if [ -f "$RUNTIME/pid" ] && kill -0 "$(cat "$RUNTIME/pid")" 2>/dev/null; then
 		die "instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is already running (PID $(cat "$RUNTIME/pid"))." 75
@@ -609,13 +640,51 @@ if [ -e "$RUNTIME" ]; then
 	rm -rf "$RUNTIME"
 fi
 mkdir -p "$RUNTIME"
+
+# `cogbox start` opened our stdout/stderr on $RUNTIME/cogbox.log before
+# exec'ing us, but the rm -rf above unlinked that inode. Reopen the fresh
+# cogbox.log so daemon diagnostics (passt, QEMU stderr, errors below) are
+# actually captured. Only when daemonized (stdout is the log file, not a
+# tty); a hand-run launch keeps writing to its terminal.
+if [ ! -t 1 ]; then
+	exec >>"$RUNTIME/cogbox.log" 2>&1
+fi
+
 echo "$$" > "$RUNTIME/pid"
 # Snapshot the active SSH endpoint for the `ssh` subcommand to read.
 # Bound to runtime, not config, so post-boot edits to config.json don't
 # misdirect connections to a port the VM isn't listening on.
 echo "$SSH_PORT $BIND_ADDR" > "$RUNTIME/ssh-endpoint"
 PASST_PID=""
-trap 'kill "$PASST_PID" 2>/dev/null || true; rm -rf "'"$RUNTIME"'"' EXIT
+QEMU_PID=""
+CLEANED=0
+# The VM is always a background daemon now, so this script's only job after
+# launch is to babysit QEMU and clean up. Forwarding the signal to QEMU (the
+# wait target) is what makes `cogbox stop` tear the VM down: previously QEMU
+# ran in this script's foreground and a SIGTERM here never reached it. We
+# SIGTERM QEMU, give it a few seconds to flush + exit, then SIGKILL, and only
+# then remove the runtime dir -- so we never rm the overlay/sockets out from
+# under a still-running QEMU.
+cogbox_cleanup() {
+	[ "$CLEANED" -eq 1 ] && return
+	CLEANED=1
+	if [ -n "$QEMU_PID" ]; then
+		kill -TERM "$QEMU_PID" 2>/dev/null
+		for _ in $(seq 1 50); do
+			kill -0 "$QEMU_PID" 2>/dev/null || break
+			sleep 0.1
+		done
+		kill -KILL "$QEMU_PID" 2>/dev/null
+		wait "$QEMU_PID" 2>/dev/null
+	fi
+	[ -n "$PASST_PID" ] && kill "$PASST_PID" 2>/dev/null
+	rm -rf "$RUNTIME"
+	[ -n "${LOCK:-}" ] && rm -f "$LOCK"
+}
+trap cogbox_cleanup EXIT
+# SIGTERM/SIGINT -> exit -> EXIT trap fires cogbox_cleanup. Interrupts the
+# `wait "$QEMU_PID"` at the end of the script.
+trap 'exit 143' TERM INT
 
 ln -sfn "$REAL_DATA" "$RUNTIME/data"
 
@@ -685,6 +754,14 @@ SED_ARGS=(
 	-e "s/(memory-backend-memfd,id=mem,size=)[0-9]+(M)/\1${MEM}\2/"
 	-e "s|${RUNTIME_TEMPLATE}/|${RUNTIME}/|g"
 	-e "s|@cogbox-instance@|${EFFECTIVE_NAME}|g"
+	# Move the guest serial console off QEMU's stdio onto a persistent unix
+	# socket so it can be attached/detached at will (cogbox console) while
+	# the VM runs in the background. Keeping id=stdio means microvm's
+	# `-serial chardev:stdio` keeps resolving. logfile= captures the full
+	# session's serial output for replay on attach. The replacement targets
+	# only the chardev descriptor, so it is agnostic to how microvm quotes
+	# the arg. The runtime dir is recreated per launch, so no logappend.
+	-e "s|stdio,id=stdio,signal=off|socket,id=stdio,path=${RUNTIME}/console.sock,server=on,wait=off,logfile=${RUNTIME}/console.log|"
 )
 if [ "$NETWORK_MODE" = "none" ]; then
 	# SLIRP with restrict=on -- blocks all outbound, keeps port forwards
@@ -701,9 +778,11 @@ fi
 sed -E "${SED_ARGS[@]}" "@runner@/bin/microvm-run" > "$RUNTIME/run"
 chmod +x "$RUNTIME/run"
 
-if [ "$INIT_ONLY" -eq 1 ]; then
-	echo "Init complete${INSTANCE_NAME:+ (instance \"$INSTANCE_NAME\")}. Runtime directory: $RUNTIME"
-	exit 0
+# Fail loud if the serial-console rewrite did not take (e.g. microvm changed
+# the chardev string): otherwise the console would silently fall back to
+# stdio (the daemon log) and `cogbox console` would find no socket.
+if ! grep -q "console.sock" "$RUNTIME/run"; then
+	echo "cogbox-launch: warning: serial console socket rewrite did not apply; 'cogbox console' will not work for this instance." >&2
 fi
 
 # -- Launch --------------------------------------------------------
@@ -723,6 +802,21 @@ wait_for_passt() {
 	fi
 }
 
+# Launch QEMU as a background child and wait for it. Backgrounding (rather
+# than a bare foreground exec) is what lets the TERM/INT traps above signal
+# QEMU so `cogbox stop` shuts the VM down cleanly.
+launch_vm() {
+	cd "$RUNTIME" || die "cannot enter runtime dir $RUNTIME" 70
+	"$RUNTIME/run" &
+	QEMU_PID=$!
+	# Readiness/liveness marker the parent (`cogbox start`) waits on. Written
+	# the instant QEMU is launched, regardless of whether the serial console
+	# rewrite applied, so a console-less VM (e.g. a flake that disables
+	# serialConsole) is still detected as up rather than timing out.
+	echo "$QEMU_PID" > "$RUNTIME/qemu.pid"
+	wait "$QEMU_PID"
+}
+
 if [ "$NETWORK_MODE" = "rules" ]; then
 	# Rules mode: passt with LD_PRELOAD netfilter
 	NETFILTER_RULES="$RUNTIME/netfilter-rules" \
@@ -732,8 +826,7 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
-	cd "$RUNTIME"
-	"$RUNTIME/run"
+	launch_vm
 elif [ "$NETWORK_MODE" != "none" ]; then
 	# Full mode: unrestricted passt
 	passt --foreground --socket "$PASST_SOCK" \
@@ -741,9 +834,7 @@ elif [ "$NETWORK_MODE" != "none" ]; then
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
-	cd "$RUNTIME"
-	"$RUNTIME/run"
+	launch_vm
 else
-	cd "$RUNTIME"
-	"$RUNTIME/run"
+	launch_vm
 fi

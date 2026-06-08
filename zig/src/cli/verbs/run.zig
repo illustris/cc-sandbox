@@ -1,5 +1,9 @@
-// `cogbox run` - validate args, then exec the bash launch script in
-// the foreground. The bash script handles init/migration/launch.
+// `cogbox init` - validate args, then exec the bash launch script in
+// the foreground with --init-only. The script seeds host state and (for
+// customized per-instance flakes) warms the runner build, then stops before
+// runtime setup. The VM launch itself is the `start` verb's job.
+//
+// This module also exports `validate`, shared by the `start` verb.
 
 const std = @import("std");
 const util = @import("../util.zig");
@@ -14,8 +18,6 @@ pub fn run(
 	io: std.Io,
 	env: *std.process.Environ.Map,
 	argv: []const []const u8,
-	verb_name: []const u8, // "run" for help text on errors
-	init_only: bool, // true when invoked as `cogbox init`
 ) !void {
 	const flags = [_]parse.Flag{
 		.{ .long = "name", .short = 'n', .kind = .value },
@@ -26,26 +28,46 @@ pub fn run(
 		.{ .long = "yes", .short = 'y', .kind = .bool },
 		.{ .long = "help", .short = 'h', .kind = .bool },
 	};
-	var parsed = parse.parse(allocator, io, .{ .verb = verb_name, .flags = &flags }, argv);
+	var parsed = parse.parse(allocator, io, .{ .verb = "init", .flags = &flags }, argv);
 	defer parsed.deinit();
 
 	if (parsed.isSet("help")) {
-		try help.print(io, if (init_only) help.INIT else help.RUN);
+		try help.print(io, help.INIT);
 		return;
 	}
 
-	const opts = try validate(&parsed, allocator, io, verb_name, init_only);
+	const opts = try validate(&parsed, allocator, io, "init");
+	try launch.execLaunchScript(allocator, io, env, opts, true);
+}
 
-	const script_path = try launch.resolveScriptPath(allocator, io, env);
-	defer allocator.free(script_path);
-
-	const script_argv = try launch.buildLaunchArgs(allocator, opts, script_path);
-	defer {
-		for (script_argv) |a| allocator.free(a);
-		allocator.free(script_argv);
+/// Hidden `__launch` verb. Exec the launch script in full-launch mode in
+/// place (no fork, no interactive init). Only used by the bash script's
+/// custom-flake re-exec path (`nix run ... -- __launch`), which runs inside
+/// the already-daemonized process and must not fork or prompt again.
+pub fn launchInPlace(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	env: *std.process.Environ.Map,
+	argv: []const []const u8,
+) !void {
+	// Only reachable via the bash re-exec, which runs under COGBOX_REEXECED=1.
+	// A hand-typed `cogbox __launch` would launch QEMU in the foreground with
+	// no daemonization, so reject it as an unknown verb.
+	if (env.get("COGBOX_REEXECED") == null) {
+		util.die(allocator, io, null, exit_codes.usage, "unknown verb '__launch'", .{});
 	}
-
-	try launch.execvAlloc(allocator, script_argv);
+	const flags = [_]parse.Flag{
+		.{ .long = "name", .short = 'n', .kind = .value },
+		.{ .long = "vcpu", .kind = .value },
+		.{ .long = "mem", .kind = .value },
+		.{ .long = "network", .kind = .value },
+		.{ .long = "no-auto-keys", .kind = .bool },
+		.{ .long = "yes", .short = 'y', .kind = .bool },
+	};
+	var parsed = parse.parse(allocator, io, .{ .verb = "__launch", .flags = &flags }, argv);
+	defer parsed.deinit();
+	const opts = try validate(&parsed, allocator, io, "__launch");
+	try launch.execLaunchScript(allocator, io, env, opts, false);
 }
 
 pub fn validate(
@@ -53,7 +75,6 @@ pub fn validate(
 	allocator: std.mem.Allocator,
 	io: std.Io,
 	verb_name: []const u8,
-	init_only: bool,
 ) !launch.LaunchOpts {
 	const name: ?[]const u8 = blk: {
 		const v = parsed.get("name") orelse break :blk null;
@@ -97,6 +118,6 @@ pub fn validate(
 		.network = network,
 		.auto_keys = !parsed.isSet("no-auto-keys"),
 		.yes = parsed.isSet("yes"),
-		.init_only = init_only,
+		.foreground = parsed.isSet("foreground"),
 	};
 }
