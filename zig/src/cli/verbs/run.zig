@@ -119,5 +119,6 @@ pub fn validate(
 		.auto_keys = !parsed.isSet("no-auto-keys"),
 		.yes = parsed.isSet("yes"),
 		.foreground = parsed.isSet("foreground"),
+		.no_ssh = parsed.isSet("no-ssh"),
 	};
 }

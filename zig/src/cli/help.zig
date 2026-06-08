@@ -13,8 +13,8 @@ pub const TOP_LEVEL =
 	\\  cogbox [VERB] [OPTIONS]
 	\\
 	\\Verbs:
-	\\  start     Launch the VM in the background and return (default).
-	\\            -f/--foreground attaches the serial console instead.
+	\\  start     Launch the VM in the background, then SSH into it (default).
+	\\            --no-ssh just returns; -f/--foreground attaches the console.
 	\\  console   Attach the serial console of a running instance (Ctrl-] detaches)
 	\\  monitor   Attach the QEMU monitor of a running instance (Ctrl-] detaches)
 	\\  stop      Stop a running instance
@@ -30,10 +30,12 @@ pub const TOP_LEVEL =
 	\\Common options:
 	\\  -n, --name NAME    Instance name (default: "default")
 	\\  -f, --foreground   (start) attach the serial console after launch
+	\\      --no-ssh       (start) don't auto-ssh; just launch and return
 	\\  -h, --help         Show help and exit
 	\\
 	\\Run 'cogbox VERB --help' for verb-specific options. Bare 'cogbox' is
-	\\equivalent to 'cogbox start' -- it launches in the background. The VM's
+	\\equivalent to 'cogbox start' -- it launches the VM in the background and
+	\\then opens an SSH session into it (pass --no-ssh to just return). The VM's
 	\\serial console and QEMU monitor live on per-instance sockets, so you can
 	\\attach and detach (Ctrl-]) freely without stopping the VM.
 	\\
@@ -70,7 +72,7 @@ pub const TOP_LEVEL =
 ;
 
 pub const START =
-	\\cogbox start - launch the VM in the background (the default verb)
+	\\cogbox start - launch the VM in the background, then SSH in (the default verb)
 	\\
 	\\Usage:
 	\\  cogbox start [OPTIONS]
@@ -78,8 +80,10 @@ pub const START =
 	\\
 	\\Options:
 	\\  -n, --name NAME       Instance name (default: "default")
-	\\  -f, --foreground      Attach the serial console after launch. Detaching
-	\\                        (Ctrl-]) leaves the VM running in the background.
+	\\      --no-ssh          Don't open an SSH session after launch; just start
+	\\                        the VM in the background and return.
+	\\  -f, --foreground      Attach the serial console after launch instead of
+	\\                        sshing. Detaching (Ctrl-]) leaves the VM running.
 	\\  --vcpu N              vCPU count (default: 16; or value from config.json)
 	\\  --mem N               RAM in megabytes (default: 32768; or from config.json)
 	\\  --network MODE        Network mode: full, none, or rules (default: rules)
@@ -88,20 +92,26 @@ pub const START =
 	\\  -y, --yes             Skip the harness-selection prompt on first init
 	\\  -h, --help            Show this help and exit
 	\\
-	\\The VM always runs as a background daemon. First-run setup prompts are
-	\\shown in the foreground; the daemon's own output goes to
-	\\<runtime>/cogbox.log, and the guest serial console is captured to
-	\\<runtime>/console.log. Exits 75 if an instance with the same name is
-	\\already running.
+	\\The VM always runs as a background daemon. By default, once QEMU is up
+	\\cogbox waits for the guest's sshd to start accepting connections and then
+	\\execs `ssh` into the guest; when that session ends the VM keeps running
+	\\(stop it with `cogbox stop`). Press Ctrl-C during the wait to leave the VM
+	\\running and drop back to your shell.
+	\\
+	\\First-run setup prompts are shown in the foreground; the daemon's own
+	\\output goes to <runtime>/cogbox.log, and the guest serial console is
+	\\captured to <runtime>/console.log. Exits 75 if an instance with the same
+	\\name is already running.
 	\\
 	\\Examples:
-	\\  cogbox                           Start the default instance in the background
+	\\  cogbox                           Start the default instance and SSH in
+	\\  cogbox --no-ssh                  Start in the background and return
 	\\  cogbox -f                        Start and attach the serial console
-	\\  cogbox --name work               Start a named instance in the background
-	\\  cogbox --vcpu 8 --mem 16384      Start with custom resources
-	\\  cogbox --network none -f         Start fully isolated, attach the console
+	\\  cogbox --name work               Start the "work" instance and SSH in
+	\\  cogbox --vcpu 8 --mem 16384      Start with custom resources, then SSH in
+	\\  cogbox --network none --no-ssh   Start fully isolated, don't connect
 	\\
-	\\See also: cogbox console, cogbox monitor, cogbox status, cogbox stop
+	\\See also: cogbox ssh, cogbox console, cogbox monitor, cogbox status, cogbox stop
 	\\
 ;
 
@@ -165,7 +175,9 @@ pub const RESTART =
 	\\Usage:
 	\\  cogbox restart [OPTIONS]
 	\\
-	\\Accepts the same options as `cogbox start`.
+	\\Accepts the same options as `cogbox start`, including its default behavior:
+	\\once the VM is back up it waits for sshd and opens an SSH session. Pass
+	\\--no-ssh to just restart the daemon and return, or -f to attach the console.
 	\\
 ;
 

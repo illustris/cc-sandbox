@@ -25,6 +25,10 @@ pub const LaunchOpts = struct {
 	/// Zig-side only (never forwarded to the bash script): attach the serial
 	/// console after the VM comes up instead of returning immediately.
 	foreground: bool,
+	/// Zig-side only: suppress the default auto-ssh. With neither this nor
+	/// `foreground`, `start` waits for the guest's sshd and then execs `ssh`;
+	/// with this set it just prints how to connect and returns.
+	no_ssh: bool,
 };
 
 /// Build the argv that the bash launch script expects. `init_only` selects

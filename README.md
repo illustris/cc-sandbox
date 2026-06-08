@@ -49,9 +49,12 @@ The following paths will be created:
 Continue? [y/N]
 ```
 
-The VM then starts in the background and `cogbox` returns. Drop into it
-with `cogbox ssh`, or watch it boot with `cogbox -f` (foreground: launch and
-attach the serial console; `Ctrl-]` detaches without stopping the VM).
+The VM then starts in the background and, by default, `cogbox` waits for
+the guest's SSH server to come up and drops you straight into an SSH
+session. When you exit the session the VM keeps running (stop it with
+`cogbox stop`). Pass `--no-ssh` to just start it and return, or `-f` to
+watch it boot on the serial console instead (foreground: `Ctrl-]` detaches
+without stopping the VM).
 
 Each enabled harness ships a launcher inside the VM: `c` for
 `claude-code`, `oc` for `opencode`, `cx` for `codex`. All three binaries
@@ -69,7 +72,7 @@ Run multiple isolated VMs simultaneously, like Wine prefixes. Each named
 instance gets its own data directory, overlay image, and network ports.
 
 ```sh
-# Default instance (background)
+# Default instance (starts in the background, then SSHes in)
 nix run github:illustris/cogbox
 
 # Create and start a named instance
@@ -106,7 +109,9 @@ opens where the instance's state lives.
 ## CLI
 
 cogbox uses a verb-based CLI. Bare `cogbox` (no verb) is sugar for
-`cogbox start`, so the most common invocation stays short.
+`cogbox start`, so the most common invocation stays short. By default
+`start` launches the VM in the background and then opens an SSH session
+into it; `--no-ssh` skips that and just returns.
 
 The VM always runs as a background daemon. Its serial console and QEMU
 monitor each live on a per-instance Unix socket, so you can attach and
@@ -117,7 +122,7 @@ is just `start -f`: launch, then auto-attach the console.
 
 | Verb | Description |
 |---|---|
-| `start` | Init if needed, launch the VM in the background and return (default verb). With `-f`, attach the serial console after launch. |
+| `start` | Init if needed, launch the VM in the background, then SSH into it (default verb). With `--no-ssh` it just returns; with `-f` it attaches the serial console after launch. |
 | `console` | Attach the serial console of a running instance. `Ctrl-]` detaches; the VM keeps running. |
 | `monitor` | Attach the QEMU (HMP) monitor of a running instance. `Ctrl-]` detaches. |
 | `stop` | Stop a running instance (SIGTERM, then SIGKILL with `--force`) |
@@ -131,8 +136,8 @@ is just `start -f`: launch, then auto-attach the console.
 | `help` | `cogbox help VERB` ≡ `cogbox VERB --help` |
 
 The `run` verb from earlier versions has been removed: bare `cogbox` now
-starts in the background, and `cogbox -f` is the foreground (attached)
-equivalent.
+starts the VM in the background and SSHes into it, `cogbox --no-ssh` just
+starts it, and `cogbox -f` is the foreground (serial-console) equivalent.
 
 Run `cogbox VERB --help` for verb-specific options.
 
@@ -142,7 +147,8 @@ Run `cogbox VERB --help` for verb-specific options.
 |---|---|---|
 | `-n, --name NAME` | every verb that takes an instance | Instance name (default: `default`) |
 | `-h, --help` | every verb | Show help and exit |
-| `-f, --foreground` | `start` | Attach the serial console after launch. Detaching (`Ctrl-]`) leaves the VM running. |
+| `--no-ssh` | `start` | Don't auto-SSH after launch; just start the VM in the background and return. |
+| `-f, --foreground` | `start` | Attach the serial console after launch instead of SSHing. Detaching (`Ctrl-]`) leaves the VM running. |
 | `-y, --yes` | `start`, `init` | Skip the harness-selection prompt on first init |
 | `--vcpu N` | `start`, `init` | vCPU count (default: config.json or 16) |
 | `--mem N` | `start`, `init` | RAM in MB (default: config.json or 32768) |

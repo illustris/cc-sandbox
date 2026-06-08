@@ -14,12 +14,14 @@ def probe(name, ip):
 
 
 def boot_and_wait(unit, args, ssh_port):
-    # `cogbox start` daemonizes the VM (passt + QEMU) itself and returns once
-    # QEMU has come up. The daemon is setsid'd into its own session, so it
-    # survives this command and is torn down later by `cogbox stop`. The
-    # `unit` arg is kept for call-site compatibility but is now unused.
+    # `cogbox start --no-ssh` daemonizes the VM (passt + QEMU) itself and
+    # returns once QEMU has come up, WITHOUT opening an interactive SSH session
+    # (which would block this command forever). The auto-ssh default is covered
+    # separately in Phase J. The daemon is setsid'd into its own session, so it
+    # survives this command and is torn down later by `cogbox stop`. The `unit`
+    # arg is kept for call-site compatibility but is now unused.
     _ = unit
-    machine.succeed(as_user(f"cogbox start {args}".strip()))
+    machine.succeed(as_user(f"cogbox start --no-ssh {args}".strip()))
     machine.wait_until_succeeds(
         as_user(f"ssh {SSH_OPTS} -p {ssh_port} root@127.0.0.1 true"),
         timeout=600,
@@ -552,3 +554,28 @@ with subtest("Phase G: CLI parser regressions and stub-friendly verbs"):
     assert isinstance(parsed, list) and len(parsed) >= 2, parsed
     names = {e["name"] for e in parsed}
     assert "default" in names and "work" in names, names
+
+with subtest("Phase J: bare `cogbox start` waits for sshd then auto-SSHes in"):
+    # The new default: daemonize, poll the forwarded SSH port until sshd sends
+    # its banner, then exec ssh into the guest. With a non-tty stdin the remote
+    # shell reads piped input, so feeding it a command and capturing the output
+    # proves the readiness wait + auto-connect work end to end -- in particular
+    # that we don't exec ssh before sshd is actually accepting connections.
+    # (The foreground init step also prints "Init complete." to stdout, so match
+    # on a substring rather than the whole capture.)
+    out = machine.succeed(as_user("echo 'uname -n' | cogbox start"), timeout=600)
+    assert "cogbox-default" in out, out
+    # The VM keeps running after the SSH session ends.
+    rc, _ = machine.execute(as_user("cogbox status"))
+    assert rc == 0, f"expected running (0) after auto-ssh, got {rc}"
+    stop_instance("cc-default")
+
+    # --no-ssh keeps the old behavior: daemonize and return immediately without
+    # opening a session. A second start while running reports already-running.
+    machine.succeed(as_user("cogbox start --no-ssh"))
+    machine.wait_until_succeeds(
+        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 true"), timeout=600
+    )
+    rc, out = machine.execute(as_user("cogbox start --no-ssh 2>&1"))
+    assert rc == 75, f"expected already-running (75), got {rc}; out={out!r}"
+    stop_instance("cc-default")

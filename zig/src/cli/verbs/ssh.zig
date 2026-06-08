@@ -58,20 +58,66 @@ pub fn run(
 		std.process.exit(exit_codes.software);
 	}
 
-	const endpoint_path = try std.fs.path.join(allocator, &.{ inst_runtime, "ssh-endpoint" });
-	defer allocator.free(endpoint_path);
-	const text = readSmall(allocator, io, endpoint_path) catch {
-		util.die(allocator, io, "ssh", exit_codes.software, "missing {s} (instance launched by an older cogbox?). Restart the instance to repopulate it.", .{endpoint_path});
+	const endpoint = readEndpoint(allocator, io, inst_runtime) catch |err| switch (err) {
+		error.Missing => util.die(allocator, io, "ssh", exit_codes.software, "missing {s}/ssh-endpoint (instance launched by an older cogbox?). Restart the instance to repopulate it.", .{inst_runtime}),
+		error.Malformed => util.die(allocator, io, "ssh", exit_codes.software, "ssh-endpoint is malformed in {s}. Restart the instance to repopulate it.", .{inst_runtime}),
+		error.OutOfMemory => return error.OutOfMemory,
 	};
+	defer endpoint.deinit(allocator);
+
+	// Forward everything after the verb (and any `--`) to the remote as the
+	// command/args. With terminate_on_positional both land in `trailing`, but
+	// fold `positional` in too for parity.
+	var extra: std.ArrayList([]const u8) = .empty;
+	defer extra.deinit(allocator);
+	for (parsed.trailing.items) |t| try extra.append(allocator, t);
+	for (parsed.positional.items) |t| try extra.append(allocator, t);
+
+	try exec(allocator, endpoint, extra.items);
+}
+
+/// SSH host:port for a running instance, read from <runtime>/ssh-endpoint.
+/// Both fields are owned by the caller; free via `deinit`.
+pub const Endpoint = struct {
+	port: []const u8,
+	host: []const u8,
+
+	pub fn deinit(self: Endpoint, allocator: std.mem.Allocator) void {
+		allocator.free(self.port);
+		allocator.free(self.host);
+	}
+};
+
+pub const EndpointError = error{ Missing, Malformed, OutOfMemory };
+
+/// Parse <inst_runtime>/ssh-endpoint ("PORT HOST", written by the launch
+/// script when the VM comes up). Returns duped fields. `error.Missing` if the
+/// file is absent/unreadable; `error.Malformed` if it lacks a port or host.
+pub fn readEndpoint(allocator: std.mem.Allocator, io: std.Io, inst_runtime: []const u8) EndpointError!Endpoint {
+	const endpoint_path = std.fs.path.join(allocator, &.{ inst_runtime, "ssh-endpoint" }) catch return error.OutOfMemory;
+	defer allocator.free(endpoint_path);
+	const text = readSmall(allocator, io, endpoint_path) catch return error.Missing;
 	defer allocator.free(text);
 
 	var iter = std.mem.tokenizeAny(u8, text, " \t\r\n");
-	const port = iter.next() orelse util.die(allocator, io, "ssh", exit_codes.software, "ssh-endpoint is empty: {s}", .{endpoint_path});
-	const host = iter.next() orelse util.die(allocator, io, "ssh", exit_codes.software, "ssh-endpoint missing host: {s}", .{endpoint_path});
+	const port = iter.next() orelse return error.Malformed;
+	const host = iter.next() orelse return error.Malformed;
 
-	// Build the ssh argv: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-	//                       -o LogLevel=ERROR -p <port> root@<host> [trailing...]
-	const target = try std.fmt.allocPrint(allocator, "root@{s}", .{host});
+	const port_d = allocator.dupe(u8, port) catch return error.OutOfMemory;
+	errdefer allocator.free(port_d);
+	const host_d = allocator.dupe(u8, host) catch return error.OutOfMemory;
+	return .{ .port = port_d, .host = host_d };
+}
+
+/// Replace this process with `ssh` pointed at `endpoint`. `extra` is appended
+/// after the `root@host` target (remote command and/or extra ssh args). Host
+/// key checking is disabled because the guest's root disk is ephemeral and its
+/// host keys regenerate on every boot.
+///
+/// ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+///     -o LogLevel=ERROR -p <port> root@<host> [extra...]
+pub fn exec(allocator: std.mem.Allocator, endpoint: Endpoint, extra: []const []const u8) !void {
+	const target = try std.fmt.allocPrint(allocator, "root@{s}", .{endpoint.host});
 	defer allocator.free(target);
 
 	var ssh_argv: std.ArrayList([]const u8) = .empty;
@@ -84,10 +130,9 @@ pub fn run(
 	try ssh_argv.append(allocator, "-o");
 	try ssh_argv.append(allocator, "LogLevel=ERROR");
 	try ssh_argv.append(allocator, "-p");
-	try ssh_argv.append(allocator, port);
+	try ssh_argv.append(allocator, endpoint.port);
 	try ssh_argv.append(allocator, target);
-	for (parsed.trailing.items) |t| try ssh_argv.append(allocator, t);
-	for (parsed.positional.items) |t| try ssh_argv.append(allocator, t);
+	for (extra) |t| try ssh_argv.append(allocator, t);
 
 	try execvpAlloc(allocator, ssh_argv.items);
 }
