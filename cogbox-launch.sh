@@ -804,8 +804,11 @@ wait_for_passt() {
 # -- Helper: start the host-side L7 proxy --------------------------
 # Runs WITHOUT the LD_PRELOAD shim (so it reaches the internet directly to
 # re-resolve allowed vhosts) and writes its pid for the hot-reload SIGHUP
-# path. Started only when .network.l7 has rules. Failure is non-fatal: a
-# dead proxy makes the funnel remap fail closed (EHOSTUNREACH to the guest).
+# path. Started for EVERY rules-mode instance (it is a cheap, idle loopback
+# listener until the funnel diverts to it), so that enabling L7 on an
+# already-running instance via `cogbox l7 add` works without a restart -- the
+# funnel hot-reloads into passt and the proxy is already listening. Failure is
+# non-fatal: a dead proxy makes the funnel remap fail closed (EHOSTUNREACH).
 start_l7proxy() {
 	@cogbox@ __l7proxy "$RUNTIME" &
 	L7PROXY_PID=$!
@@ -842,7 +845,11 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
-	[ "$L7_ACTIVE" = "1" ] && start_l7proxy
+	# Always run the L7 proxy in rules mode so L7 can be enabled on a live
+	# instance without a restart (the funnel only diverts to it once a rule
+	# exists; until then it idles). L7_ACTIVE still gates whether the funnel
+	# is rendered into netfilter-rules.
+	start_l7proxy
 	launch_vm
 elif [ "$NETWORK_MODE" != "none" ]; then
 	# Full mode: unrestricted passt
