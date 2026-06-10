@@ -666,10 +666,22 @@ pub const L7RuleSet = struct {
 	/// request path the proxy already normalized (percent-decoded,
 	/// dot-segments collapsed, query stripped). When `path` is null (HTTPS
 	/// passthrough, host-only), rules that require a path simply don't match.
+	///
+	/// Path fail-closed: if an `allow` rule names this host but no matching
+	/// rule covers the request path, the result is `deny`, not `no_match`.
+	/// Otherwise a path-restricted host (`allow api.x /v1/`) accessed over
+	/// cleartext HTTP would fall through to the L4 policy and bypass the path
+	/// constraint whenever the IP is independently L4-allowed (the common
+	/// "allow the internet at L4, restrict vhosts at L7" supersede setup).
+	/// A `deny` rule whose host matches but whose path does not is NOT a
+	/// fail-closed trigger -- `deny api.x /admin/` blocks only /admin/ and
+	/// leaves every other path to the L4 policy.
 	pub fn evaluate(self: *const L7RuleSet, host: []const u8, path: ?[]const u8) L7Verdict {
 		const h = stripRootDot(host);
+		var allow_host_matched = false;
 		for (self.rules[0..self.len]) |r| {
 			if (!matchDnsPattern(r.host, h)) continue;
+			if (r.action == .allow) allow_host_matched = true;
 			if (r.has_path) {
 				const p = path orelse continue;
 				if (!pathPrefixMatches(r.pathSlice().?, p)) continue;
@@ -679,6 +691,7 @@ pub const L7RuleSet = struct {
 				.deny => .deny,
 			};
 		}
+		if (allow_host_matched) return .deny;
 		return .no_match;
 	}
 
@@ -1252,6 +1265,35 @@ test "L7 path rules + needsTerminate" {
 	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("api.example.com", "/v1/x"));
 	// /v2/x doesn't match the path rule, but `deny *` catches it
 	try std.testing.expectEqual(L7Verdict.deny, rs.evaluate("api.example.com", "/v2/x"));
+}
+
+test "L7 path fail-closed: allow-host + uncovered path is deny, not no_match" {
+	var rs: L7RuleSet = undefined;
+	// No catch-all `deny *` -- the supersede setup relies on no_match
+	// deferring to L4, so a path miss must NOT silently defer to an
+	// L4-allowed IP. An allow rule named the host, so an uncovered path
+	// fails closed.
+	parseL7Rules(
+		\\allow api.example.com /v1/ terminate
+		\\allow plain.test
+	, &rs);
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("api.example.com", "/v1/sub"));
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluate("api.example.com", "/v2/x"));
+	// host with no path constraint is still a clean allow
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("plain.test", "/anything"));
+	// a wholly unlisted host stays no_match (defers to L4)
+	try std.testing.expectEqual(L7Verdict.no_match, rs.evaluate("other.test", "/v1/"));
+}
+
+test "L7 deny-path rule does not fail closed for other paths" {
+	var rs: L7RuleSet = undefined;
+	// `deny api.example.com /admin/` blocks only /admin/; other paths
+	// defer to L4 (no_match), because no allow rule names the host.
+	parseL7Rules(
+		\\deny api.example.com /admin/ terminate
+	, &rs);
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluate("api.example.com", "/admin/panel"));
+	try std.testing.expectEqual(L7Verdict.no_match, rs.evaluate("api.example.com", "/public/"));
 }
 
 test "L7 mode terminate floor applies to matched allow hosts only" {

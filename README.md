@@ -450,6 +450,16 @@ traffic:
 and link-local incl. cloud metadata `169.254.169.254`) is *always* dropped,
 even for an allowed vhost.
 
+**Path constraints fail closed.** When an `allow` rule names a host but adds a
+path prefix (`allow api.example.com /v1/`), a request to that host on an
+*uncovered* path (e.g. `/v2/`) is **dropped**, not deferred to L4 -- otherwise
+the constraint would be silently bypassed whenever the IP is independently
+L4-allowed (the usual "allow the internet at L4, restrict vhosts at L7" setup).
+A `deny` rule with a path (`deny api.example.com /admin/`) only blocks that
+prefix and leaves other paths to L4, since you're carving out a hole, not
+whitelisting. Cleartext HTTP paths are enforced inline; HTTPS path enforcement
+needs the terminate tier (see phase 2).
+
 So to reach an internal vhost on a private LB, you just allow the **name** --
 no L4 IP rule, and you never open that IP for anything else:
 
