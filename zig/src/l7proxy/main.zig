@@ -229,7 +229,7 @@ fn worker(client_fd: c_int) void {
 
 	lockRules();
 	const needs_term = l7_rs.needsTerminate(host);
-	const action = l7_rs.evaluate(host, path);
+	const verdict = l7_rs.evaluate(host, path);
 	unlockRules();
 
 	if (is_tls and needs_term) {
@@ -237,12 +237,16 @@ fn worker(client_fd: c_int) void {
 		logReject(orig, host, "terminate-tier-unavailable");
 		return;
 	}
-	if (action == .deny) {
+	if (verdict == .deny) {
 		logReject(orig, host, "l7-deny");
 		return;
 	}
 
-	const up_fd = dialUpstream(host, orig.port) orelse {
+	// L7 allow SUPERSEDES the L4 CIDR deny-list for the re-resolved IP (still
+	// gated by the non-overridable hard floor). A no_match host falls back to
+	// the instance L4 policy. Either way the hard floor always applies.
+	const supersede_l4 = verdict == .allow;
+	const up_fd = dialUpstream(host, orig.port, supersede_l4) orelse {
 		logReject(orig, host, "no-vetted-upstream");
 		return;
 	};
@@ -343,7 +347,11 @@ fn peekClassify(
 
 // --- upstream dial with SSRF + CIDR re-check ---
 
-fn dialUpstream(host: []const u8, port: u16) ?c_int {
+/// Dial the re-resolved upstream. `supersede_l4` is true when an explicit L7
+/// `allow` matched the vhost -- then the only gate is the non-overridable hard
+/// floor (the name allow overrides the L4 IP deny-list). When false (the vhost
+/// matched no L7 rule), the resolved IP must also pass the instance L4 policy.
+fn dialUpstream(host: []const u8, port: u16, supersede_l4: bool) ?c_int {
 	var name_z: [256]u8 = undefined;
 	if (host.len >= name_z.len) return null;
 	@memcpy(name_z[0..host.len], host);
@@ -364,19 +372,21 @@ fn dialUpstream(host: []const u8, port: u16) ?c_int {
 		const ip = sockaddrToIp(sa) orelse continue;
 
 		// Non-overridable hard floor (loopback / this-net / link-local+metadata).
+		// Applies even to an explicitly-allowed vhost.
 		if (filter.isHardBlocked(ip)) {
 			logLine("l7proxy: refusing {s}: resolves into a hard-blocked range (loopback/link-local/metadata)", .{host});
 			continue;
 		}
-		// Instance CIDR deny-list (the proxy obeys the same policy the guest
-		// does -- this is where private ranges are gated: default-denied, but
-		// reachable via an explicit `allow`).
-		lockRules();
-		const denied = cidr_rs.evaluate(.tcp, ip, port) == .deny;
-		unlockRules();
-		if (denied) {
-			logLine("l7proxy: refusing {s}: resolved IP denied by instance CIDR policy", .{host});
-			continue;
+		// For an unlisted (no_match) vhost, defer to the instance L4 policy. An
+		// explicit L7 allow skips this -- the name allow supersedes the IP deny.
+		if (!supersede_l4) {
+			lockRules();
+			const denied = cidr_rs.evaluate(.tcp, ip, port) == .deny;
+			unlockRules();
+			if (denied) {
+				logLine("l7proxy: refusing {s}: unlisted vhost, resolved IP denied by L4 policy", .{host});
+				continue;
+			}
 		}
 
 		// Vet-then-pin: connect to exactly the sockaddr we just vetted.

@@ -593,10 +593,13 @@ serve(80, handle_http)
     machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
     machine.wait_until_succeeds("grep -q 'listen 80' /tmp/origin-hits.log", timeout=10)
 
-    # Clean CIDR ruleset for the work instance: allow the origin (so the
-    # proxy's post-resolution CIDR re-check passes) + a public catch-all.
+    # The origin IP is BLOCKED at L4 (TEST-NET deny + public catch-all). Under
+    # the L7-composition model an L7 `allow` supersedes that block, so vhost-a
+    # is reachable with NO L4 IP allow, while an unlisted sibling on the same
+    # blocked IP is dropped. (Keeping the public catch-all also proves the SSRF
+    # canary's metadata IP is stopped by the hard floor, not by an L4 deny.)
     machine.succeed(as_user(
-        "printf 'allow 203.0.113.5/32\\nallow 0.0.0.0/0\\n' | cogbox rules set --name work"
+        "printf 'deny 203.0.113.0/24\\nallow 0.0.0.0/0\\n' | cogbox rules set --name work"
     ))
     # Seed the L7 allowlist with vhost-a only (vhost-b is the sibling).
     machine.succeed(as_user("cogbox l7 add allow vhost-a.test --name work"))
@@ -618,7 +621,8 @@ serve(80, handle_http)
         cmd = "curl -k -s -o /dev/null -w '%{http_code}' --max-time 10 " + extra
         return machine.execute(as_user("cogbox ssh --name work " + shlex.quote(cmd)))
 
-    # Allowed vhost over HTTPS -> 200 (re-resolved + spliced E2E).
+    # Allowed vhost over HTTPS -> 200, even though its IP is L4-blocked
+    # (proves the L7 allow supersedes the L4 deny; re-resolved + spliced E2E).
     rc, out = gcurl("--resolve vhost-a.test:443:203.0.113.5 https://vhost-a.test/p1")
     assert rc == 0 and out.strip().endswith("200"), f"vhost-a https rc={rc} out={out!r}"
     # Same vhost over plaintext HTTP :80 -> 200.
