@@ -363,12 +363,14 @@ fn dialUpstream(host: []const u8, port: u16) ?c_int {
 		const sa = ai.ai_addr orelse continue;
 		const ip = sockaddrToIp(sa) orelse continue;
 
-		// Non-overridable SSRF floor.
-		if (filter.isSsrfBlocked(ip)) {
-			logLine("l7proxy: refusing {s}: resolves into SSRF-blocked range", .{host});
+		// Non-overridable hard floor (loopback / this-net / link-local+metadata).
+		if (filter.isHardBlocked(ip)) {
+			logLine("l7proxy: refusing {s}: resolves into a hard-blocked range (loopback/link-local/metadata)", .{host});
 			continue;
 		}
-		// Instance CIDR deny-list (the proxy obeys the same policy the guest does).
+		// Instance CIDR deny-list (the proxy obeys the same policy the guest
+		// does -- this is where private ranges are gated: default-denied, but
+		// reachable via an explicit `allow`).
 		lockRules();
 		const denied = cidr_rs.evaluate(.tcp, ip, port) == .deny;
 		unlockRules();
