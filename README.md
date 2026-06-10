@@ -433,12 +433,23 @@ through. Re-resolution is the point: the guest's chosen IP is discarded, so
 cogbox l7 add allow api.example.com        # only this vhost on its LB
 ```
 
-The proxy enforces a non-overridable **SSRF floor**: it refuses to connect
-to any name that resolves into loopback, link-local (incl. cloud metadata
-`169.254.169.254`), RFC1918, CGNAT, or ULA space, and it re-applies the
-instance's own CIDR deny-list to every resolved IP. (It runs outside the
-`LD_PRELOAD` shim, so without this an allowed name pointed at metadata would
-be an SSRF amplifier.)
+Because it runs outside the `LD_PRELOAD` shim, the proxy re-applies egress
+policy to every re-resolved IP, in two layers:
+
+- a **non-overridable hard floor** -- it never connects to loopback,
+  this-network (`0.0.0.0/8`), or link-local (incl. cloud metadata
+  `169.254.169.254`); these are never legitimate targets and stay blocked
+  even with a broad `allow`; and
+- the **instance's own CIDR policy** -- private ranges (RFC1918 / CGNAT /
+  ULA) are default-denied by the seeded rules, but you can reach an internal
+  vhost on a private LB by adding an explicit `allow` for its IP, exactly as
+  you would for a direct L4 connection.
+
+```sh
+# internal vhost on a private LB:
+cogbox l7 add allow data-wiki.example.internal
+cogbox rules add allow 10.251.5.215/32 --at 1   # let the proxy dial it
+```
 
 **v1 caveats** (documented, not silently assumed safe):
 
@@ -450,9 +461,9 @@ be an SSRF amplifier.)
 - **QUIC / UDP-443 and all guest IPv6** are denied while L7 is active (the
   funnel is IPv4/TCP-only), so clients fall back to inspectable IPv4 TCP.
   DNS (port 53) still works.
-- L7 cannot reach vhosts hosted on loopback/RFC1918/link-local addresses
-  (the SSRF floor blocks them) -- consistent with the sandbox's default
-  LAN-deny posture.
+- Loopback, this-network, and link-local/metadata vhosts are never reachable
+  through the proxy (the hard floor) -- consistent with the sandbox's LAN
+  posture for those specific ranges.
 
 ## Configuration
 

@@ -257,28 +257,34 @@ pub fn isLoopback(addr: IpAddr) bool {
 	};
 }
 
-// CIDRs the L7 proxy must NEVER dial, regardless of instance rules. This is
-// a non-overridable floor: the proxy runs OUTSIDE the LD_PRELOAD shim, so its
-// host-side getaddrinfo()+connect() faces no L4 policy unless we add it here.
-// Without this, an allowed vhost name (attacker-controlled DNS, or matched by
-// a `*.suffix` wildcard) pointed at link-local/metadata/LAN would turn the
-// feature into an SSRF amplifier from the trusted host's vantage.
-const ssrf_blocked_v4 = [_]struct { net: [4]u8, prefix: u8 }{
+// The L7 proxy's NON-OVERRIDABLE hard floor: addresses it must never dial no
+// matter what the instance rules say. The proxy runs OUTSIDE the LD_PRELOAD
+// shim, so its host-side getaddrinfo()+connect() faces no L4 policy except
+// what we enforce here plus the instance CIDR re-check.
+//
+// This floor is deliberately MINIMAL -- only targets that are never a
+// legitimate egress destination and are the classic SSRF pivots: loopback,
+// "this-network", and link-local (which includes cloud metadata
+// 169.254.169.254). Private ranges (RFC1918 / CGNAT / ULA) are NOT here: they
+// are blocked by the instance's seeded default-deny rules, but a user can
+// legitimately reach an internal vhost on a private LB by adding an explicit
+// `allow` -- exactly as they would for a direct L4 connection. Deferring those
+// to the CIDR re-check makes the proxy's egress identical to L4 for them,
+// rather than strictly more restrictive.
+const hard_blocked_v4 = [_]struct { net: [4]u8, prefix: u8 }{
 	.{ .net = .{ 0, 0, 0, 0 }, .prefix = 8 }, // "this network" (0.0.0.0/8, localhost alias on Linux)
 	.{ .net = .{ 127, 0, 0, 0 }, .prefix = 8 }, // loopback
-	.{ .net = .{ 10, 0, 0, 0 }, .prefix = 8 }, // RFC1918
-	.{ .net = .{ 172, 16, 0, 0 }, .prefix = 12 }, // RFC1918
-	.{ .net = .{ 192, 168, 0, 0 }, .prefix = 16 }, // RFC1918
 	.{ .net = .{ 169, 254, 0, 0 }, .prefix = 16 }, // link-local incl. cloud metadata 169.254.169.254
-	.{ .net = .{ 100, 64, 0, 0 }, .prefix = 10 }, // CGNAT (RFC 6598)
 };
 
-/// True if the L7 proxy must refuse to dial this resolved address. Folds
-/// IPv4-mapped IPv6 into IPv4 first so `::ffff:169.254.169.254` is caught.
-pub fn isSsrfBlocked(addr: IpAddr) bool {
+/// True if the L7 proxy must refuse to dial this resolved address regardless
+/// of instance rules. Folds IPv4-mapped IPv6 into IPv4 first so
+/// `::ffff:169.254.169.254` is caught. Private ranges are intentionally NOT
+/// hard-blocked -- they are governed by the instance CIDR policy (see above).
+pub fn isHardBlocked(addr: IpAddr) bool {
 	switch (normalizeMapped(addr)) {
 		.ipv4 => |ip| {
-			for (ssrf_blocked_v4) |b| {
+			for (hard_blocked_v4) |b| {
 				if (ipv4Matches(b.net, ip, b.prefix)) return true;
 			}
 			return false;
@@ -287,7 +293,6 @@ pub fn isSsrfBlocked(addr: IpAddr) bool {
 			if (std.mem.eql(u8, &ip, &ipv6_loopback)) return true; // ::1
 			if (std.mem.eql(u8, &ip, &([_]u8{0} ** 16))) return true; // :: unspecified
 			if (ip[0] == 0xfe and (ip[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
-			if ((ip[0] & 0xfe) == 0xfc) return true; // fc00::/7 ULA (incl. fd00:ec2:: metadata)
 			return false;
 		},
 	}
@@ -1128,7 +1133,7 @@ test "parseRules mixes CIDR + remap + DNS into three tables" {
 	try std.testing.expectEqual(@as(usize, 1), rs.dns_len);
 }
 
-// --- isLoopback / isSsrfBlocked ---
+// --- isLoopback / isHardBlocked ---
 
 test "isLoopback v4/v6/mapped" {
 	try std.testing.expect(isLoopback(.{ .ipv4 = .{ 127, 0, 0, 1 } }));
@@ -1139,24 +1144,29 @@ test "isLoopback v4/v6/mapped" {
 	try std.testing.expect(isLoopback(mapped_lo));
 }
 
-test "isSsrfBlocked covers metadata/LAN/loopback, allows public" {
-	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 127, 0, 0, 1 } }));
-	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 169, 254, 169, 254 } }));
-	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 10, 1, 2, 3 } }));
-	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 172, 16, 5, 5 } }));
-	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 192, 168, 1, 1 } }));
-	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 100, 64, 0, 1 } }));
-	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 0, 0, 0, 0 } }));
+test "isHardBlocked: loopback/this-net/link-local only; private ranges deferred to CIDR" {
+	// Hard-blocked (non-overridable): loopback, this-network, link-local/metadata.
+	try std.testing.expect(isHardBlocked(.{ .ipv4 = .{ 127, 0, 0, 1 } }));
+	try std.testing.expect(isHardBlocked(.{ .ipv4 = .{ 0, 0, 0, 0 } }));
+	try std.testing.expect(isHardBlocked(.{ .ipv4 = .{ 169, 254, 169, 254 } }));
 	// v4-mapped metadata
-	try std.testing.expect(isSsrfBlocked(.{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 169, 254, 169, 254 } }));
-	// v6 loopback / link-local / ULA
-	try std.testing.expect(isSsrfBlocked(.{ .ipv6 = ipv6_loopback }));
-	try std.testing.expect(isSsrfBlocked(.{ .ipv6 = .{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
-	try std.testing.expect(isSsrfBlocked(.{ .ipv6 = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
-	// public addresses pass
-	try std.testing.expect(!isSsrfBlocked(.{ .ipv4 = .{ 1, 1, 1, 1 } }));
-	try std.testing.expect(!isSsrfBlocked(.{ .ipv4 = .{ 93, 184, 216, 34 } }));
-	try std.testing.expect(!isSsrfBlocked(.{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
+	try std.testing.expect(isHardBlocked(.{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 169, 254, 169, 254 } }));
+	// v6 loopback / unspecified / link-local
+	try std.testing.expect(isHardBlocked(.{ .ipv6 = ipv6_loopback }));
+	try std.testing.expect(isHardBlocked(.{ .ipv6 = .{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
+
+	// NOT hard-blocked: RFC1918 / CGNAT / ULA -- governed by the instance CIDR
+	// policy (default-denied by seeded rules, reachable via an explicit allow).
+	try std.testing.expect(!isHardBlocked(.{ .ipv4 = .{ 10, 1, 2, 3 } }));
+	try std.testing.expect(!isHardBlocked(.{ .ipv4 = .{ 172, 16, 5, 5 } }));
+	try std.testing.expect(!isHardBlocked(.{ .ipv4 = .{ 192, 168, 1, 1 } }));
+	try std.testing.expect(!isHardBlocked(.{ .ipv4 = .{ 100, 64, 0, 1 } }));
+	try std.testing.expect(!isHardBlocked(.{ .ipv6 = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
+
+	// Public addresses always pass.
+	try std.testing.expect(!isHardBlocked(.{ .ipv4 = .{ 1, 1, 1, 1 } }));
+	try std.testing.expect(!isHardBlocked(.{ .ipv4 = .{ 93, 184, 216, 34 } }));
+	try std.testing.expect(!isHardBlocked(.{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
 }
 
 // --- L7 rules ---
