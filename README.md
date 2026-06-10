@@ -445,11 +445,19 @@ policy to every re-resolved IP, in two layers:
   vhost on a private LB by adding an explicit `allow` for its IP, exactly as
   you would for a direct L4 connection.
 
+Scope that L4 `allow` to the web ports (`tcp …:443`/`:80`) rather than a bare
+`/32`, so you don't also open every other port/proto on that host. Those ports
+are funneled through the proxy (which still enforces the SNI allowlist), and
+everything else on the IP stays default-denied:
+
 ```sh
-# internal vhost on a private LB:
+# internal vhost on a private LB -- minimal grant:
 cogbox l7 add allow data-wiki.example.internal
-cogbox rules add allow 10.251.5.215/32 --at 1   # let the proxy dial it
+cogbox rules add allow 'tcp 10.251.5.215/32:443' --at 1   # + ':80' for HTTP
 ```
+
+A bare `cogbox rules add allow 10.251.5.215/32` would work too, but it opens
+*all* ports/protos on that IP -- only the web ports are mediated by L7.
 
 **v1 caveats** (documented, not silently assumed safe):
 
