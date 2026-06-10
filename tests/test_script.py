@@ -500,6 +500,177 @@ while True:
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop socks5-stub")
 
+with subtest("Phase K: L7 vhost filtering (passthrough tier)"):
+    # The L7 layer funnels ALL guest 80/443 through the host-side proxy,
+    # which allows only whitelisted vhosts (by TLS SNI / HTTP Host) and
+    # re-resolves the name host-side. The decisive property: allowing
+    # vhost-a does NOT grant a sibling vhost-b that shares the SAME IP.
+    #
+    # Guest and node are different machines, so we decouple resolution --
+    # which IS the security story:
+    #   - guest pins names to the origin IP with curl --resolve;
+    #   - the node's /etc/hosts (networking.hosts in cogbox.nix) maps the
+    #     vhosts to 203.0.113.5 for the proxy's host-side re-resolution.
+    # 203.0.113.0/24 (TEST-NET-3) is NOT in the proxy's SSRF floor, so a
+    # legit allow can reach it; evil-meta.test -> 169.254.169.254 must be
+    # refused by that floor.
+
+    # Throwaway self-signed cert for the origin (passthrough never validates
+    # it; the guest uses curl -k). Combined cert+key in one PEM.
+    machine.succeed(
+        "openssl req -x509 -newkey rsa:2048 -keyout /tmp/origin.key "
+        "-out /tmp/origin.crt -days 1 -nodes -subj '/CN=test-origin' "
+        "-addext 'subjectAltName=DNS:vhost-a.test,DNS:vhost-b.test' 2>/dev/null "
+        "&& cat /tmp/origin.crt /tmp/origin.key > /tmp/origin.pem"
+    )
+    machine.succeed("ip addr add 203.0.113.5/32 dev lo")
+
+    # Origin: HTTPS on :443 + HTTP on :80, both bound to 203.0.113.5. Each
+    # request's Host is appended to a hit log; the proxy only ever connects
+    # here for an ALLOWED vhost, so the log is the ground truth for which
+    # vhosts actually reached a backend.
+    origin_script = r'''
+import socket, ssl, threading
+ORIGIN = "203.0.113.5"
+HITLOG = "/tmp/origin-hits.log"
+open(HITLOG, "w").close()
+lock = threading.Lock()
+def loghit(s):
+    with lock:
+        with open(HITLOG, "a") as f:
+            f.write(s + "\n")
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain("/tmp/origin.pem")
+def respond(conn, scheme):
+    data = conn.recv(8192).decode("latin1")
+    first = data.split("\r\n")[0]
+    parts = first.split(" ")
+    path = parts[1] if len(parts) > 1 else "?"
+    host = ""
+    for h in data.split("\r\n"):
+        if h.lower().startswith("host:"):
+            host = h.split(":", 1)[1].strip()
+    loghit("%s host=%s path=%s" % (scheme, host, path))
+    body = ("ok %s host=%s path=%s" % (scheme, host, path)).encode()
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+                 % (len(body), body))
+def handle_tls(raw):
+    try:
+        c = ctx.wrap_socket(raw, server_side=True)
+    except Exception:
+        try: raw.close()
+        except Exception: pass
+        return
+    try:
+        respond(c, "TLS")
+    except Exception:
+        pass
+    finally:
+        try: c.close()
+        except Exception: pass
+def handle_http(c):
+    try:
+        respond(c, "HTTP")
+    except Exception:
+        pass
+    finally:
+        try: c.close()
+        except Exception: pass
+def serve(port, handler):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((ORIGIN, port))
+    s.listen(16)
+    loghit("listen %d" % port)
+    while True:
+        conn, _ = s.accept()
+        threading.Thread(target=handler, args=(conn,), daemon=True).start()
+threading.Thread(target=serve, args=(443, handle_tls), daemon=True).start()
+serve(80, handle_http)
+'''
+    machine.succeed("cat > /tmp/l7-origin.py << 'PY_EOF'\n" + origin_script + "\nPY_EOF")
+    machine.succeed("systemd-run --unit=l7-origin --collect python3 /tmp/l7-origin.py")
+    machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
+    machine.wait_until_succeeds("grep -q 'listen 80' /tmp/origin-hits.log", timeout=10)
+
+    # Clean CIDR ruleset for the work instance: allow the origin (so the
+    # proxy's post-resolution CIDR re-check passes) + a public catch-all.
+    machine.succeed(as_user(
+        "printf 'allow 203.0.113.5/32\\nallow 0.0.0.0/0\\n' | cogbox rules set --name work"
+    ))
+    # Seed the L7 allowlist with vhost-a only (vhost-b is the sibling).
+    machine.succeed(as_user("cogbox l7 add allow vhost-a.test --name work"))
+
+    boot_and_wait("cc-work", "--name work", ssh_port=2223)
+
+    nf = machine.succeed("cat /run/user/1000/cogbox-work/netfilter-rules")
+    assert "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443" in nf, nf
+    assert "remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:18081" in nf, nf
+    assert "deny udp 0.0.0.0/0:443" in nf, nf
+    assert "deny tcp ::/0" in nf, nf
+    l7r = machine.succeed("cat /run/user/1000/cogbox-work/l7-rules")
+    assert "allow vhost-a.test" in l7r, l7r
+    # The proxy must be running (its pidfile exists and the process is alive).
+    machine.succeed("test -f /run/user/1000/cogbox-work/l7proxy.pid")
+    machine.succeed("kill -0 $(cat /run/user/1000/cogbox-work/l7proxy.pid)")
+
+    def gcurl(extra):
+        cmd = "curl -k -s -o /dev/null -w '%{http_code}' --max-time 10 " + extra
+        return machine.execute(as_user("cogbox ssh --name work " + shlex.quote(cmd)))
+
+    # Allowed vhost over HTTPS -> 200 (re-resolved + spliced E2E).
+    rc, out = gcurl("--resolve vhost-a.test:443:203.0.113.5 https://vhost-a.test/p1")
+    assert rc == 0 and out.strip().endswith("200"), f"vhost-a https rc={rc} out={out!r}"
+    # Same vhost over plaintext HTTP :80 -> 200.
+    rc, out = gcurl("--resolve vhost-a.test:80:203.0.113.5 http://vhost-a.test/p1")
+    assert rc == 0 and out.strip().endswith("200"), f"vhost-a http rc={rc} out={out!r}"
+
+    # CORE PROPERTY: sibling vhost-b on the SAME IP is blocked. Dual proof:
+    #  (1) the guest request fails, and
+    #  (2) the origin never logs a hit for vhost-b (it never connected).
+    rc, out = gcurl("--resolve vhost-b.test:443:203.0.113.5 https://vhost-b.test/")
+    assert rc != 0, f"sibling vhost-b should be blocked, got rc={rc} out={out!r}"
+    hits = machine.succeed("cat /tmp/origin-hits.log")
+    assert "host=vhost-a.test" in hits, hits
+    assert "vhost-b.test" not in hits, f"sibling reached origin! log={hits!r}"
+
+    # Direct-IP / no-SNI HTTPS -> denied (proxy can't identify a vhost).
+    rc, out = gcurl("https://203.0.113.5/")
+    assert rc != 0, f"direct-IP no-SNI should be blocked, got rc={rc}"
+
+    # SSRF canary: an allowed name that resolves (host-side) to the cloud
+    # metadata IP MUST be refused by the proxy's non-overridable SSRF floor.
+    # Without the post-resolution re-check this would connect.
+    machine.succeed(as_user("cogbox l7 add allow evil-meta.test --name work"))
+    rc, out = gcurl("--resolve evil-meta.test:443:169.254.169.254 https://evil-meta.test/")
+    assert rc != 0, f"SSRF canary should be refused, got rc={rc} out={out!r}"
+
+    # Hot reload + renderer-drift guard: adding vhost-b flips its
+    # reachability WITHOUT a VM restart, and the funnel lines survive the
+    # hot re-render of netfilter-rules.
+    out = machine.succeed(as_user("cogbox l7 add allow vhost-b.test --name work"))
+    assert "Rules reloaded" in out, out
+    nf2 = machine.succeed("cat /run/user/1000/cogbox-work/netfilter-rules")
+    assert "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443" in nf2, nf2
+    rc, out = gcurl("--resolve vhost-b.test:443:203.0.113.5 https://vhost-b.test/")
+    assert rc == 0 and out.strip().endswith("200"), f"vhost-b should now be allowed rc={rc} out={out!r}"
+
+    # And deleting it blocks it again (proxy SIGHUP reload).
+    # vhost-b is the last rule added; list to find its index.
+    listing = machine.succeed(as_user("cogbox l7 list --name work"))
+    idx = None
+    for line in listing.splitlines():
+        if "vhost-b.test" in line and ":" in line:
+            idx = line.split(":", 1)[0].strip()
+    assert idx is not None, listing
+    out = machine.succeed(as_user(f"cogbox l7 del {idx} --name work"))
+    assert "Rules reloaded" in out, out
+    rc, out = gcurl("--resolve vhost-b.test:443:203.0.113.5 https://vhost-b.test/")
+    assert rc != 0, f"vhost-b should be blocked again after del, rc={rc}"
+
+    stop_instance("cc-work", name="work")
+    machine.succeed("systemctl stop l7-origin")
+
 with subtest("Phase G: CLI parser regressions and stub-friendly verbs"):
     # cogbox writes errors to stderr; the test driver's machine.execute()
     # captures only stdout, so we redirect 2>&1 to assert on the message

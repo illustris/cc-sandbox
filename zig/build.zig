@@ -27,6 +27,16 @@ pub fn build(b: *std.Build) void {
 	lib_mod.addImport("filter", filter_mod);
 	lib_mod.addImport("socks5", socks5_mod);
 
+	// Host-side L7 proxy (cogbox __l7proxy). Reuses the filter rule engine;
+	// links libc for getaddrinfo + the socket layer.
+	const l7proxy_mod = b.createModule(.{
+		.root_source_file = b.path("src/l7proxy/main.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	l7proxy_mod.addImport("filter", filter_mod);
+
 	const lib = b.addLibrary(.{
 		.name = "netfilter",
 		.linkage = .dynamic,
@@ -53,6 +63,16 @@ pub fn build(b: *std.Build) void {
 	remap_mod.addImport("filter", filter_mod);
 	remap_mod.addImport("rules_module", rules_mod);
 
+	// L7 verb. Like remap, shares config/save/reload with the rules module
+	// so an edit re-renders the funnel rules + the proxy's l7-rules file.
+	const l7_mod = b.createModule(.{
+		.root_source_file = b.path("src/l7/main.zig"),
+		.target = target,
+		.optimize = optimize,
+	});
+	l7_mod.addImport("filter", filter_mod);
+	l7_mod.addImport("rules_module", rules_mod);
+
 	// Top-level cogbox CLI.
 	const cli_mod = b.createModule(.{
 		.root_source_file = b.path("src/cli/main.zig"),
@@ -62,6 +82,8 @@ pub fn build(b: *std.Build) void {
 	});
 	cli_mod.addImport("rules_module", rules_mod);
 	cli_mod.addImport("remap_module", remap_mod);
+	cli_mod.addImport("l7_module", l7_mod);
+	cli_mod.addImport("l7proxy_module", l7proxy_mod);
 	cli_mod.addImport("filter", filter_mod);
 
 	const cogbox_exe = b.addExecutable(.{
@@ -79,6 +101,18 @@ pub fn build(b: *std.Build) void {
 		.root_module = socks5_mod,
 	});
 	const run_socks5_tests = b.addRunArtifact(socks5_tests);
+
+	const l7proxy_test_mod = b.createModule(.{
+		.root_source_file = b.path("src/l7proxy/tests.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	l7proxy_test_mod.addImport("filter", filter_mod);
+	const l7proxy_tests = b.addTest(.{
+		.root_module = l7proxy_test_mod,
+	});
+	const run_l7proxy_tests = b.addRunArtifact(l7proxy_tests);
 
 	const rules_test_mod = b.createModule(.{
 		.root_source_file = b.path("src/rules/tests.zig"),
@@ -102,6 +136,17 @@ pub fn build(b: *std.Build) void {
 	});
 	const run_remap_tests = b.addRunArtifact(remap_tests);
 
+	const l7_test_mod = b.createModule(.{
+		.root_source_file = b.path("src/l7/tests.zig"),
+		.target = target,
+		.optimize = optimize,
+	});
+	l7_test_mod.addImport("filter", filter_mod);
+	const l7_tests = b.addTest(.{
+		.root_module = l7_test_mod,
+	});
+	const run_l7_tests = b.addRunArtifact(l7_tests);
+
 	const cli_test_mod = b.createModule(.{
 		.root_source_file = b.path("src/cli/parse.zig"),
 		.target = target,
@@ -116,7 +161,9 @@ pub fn build(b: *std.Build) void {
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_filter_tests.step);
 	test_step.dependOn(&run_socks5_tests.step);
+	test_step.dependOn(&run_l7proxy_tests.step);
 	test_step.dependOn(&run_rules_tests.step);
 	test_step.dependOn(&run_remap_tests.step);
+	test_step.dependOn(&run_l7_tests.step);
 	test_step.dependOn(&run_cli_tests.step);
 }

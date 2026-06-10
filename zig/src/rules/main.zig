@@ -68,8 +68,27 @@ pub fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []con
 
 	const net = try loaded.network();
 	try reload.writeRuntimeRules(allocator, io, runtime_path, net.*);
+	try reload.writeL7Rules(allocator, io, runtime_path, net.*);
 	const sent = try reload.maybeSignalPasst(allocator, io, runtime_path);
+	_ = try reload.maybeSignalL7proxy(allocator, io, runtime_path);
 	if (sent) try announce(allocator, io, "Rules reloaded.", .{});
+}
+
+/// Boot-time render: write BOTH runtime files (netfilter-rules + l7-rules)
+/// from config.json. Backs the hidden `cogbox __render-rules <config>
+/// <runtime>` verb that the launcher calls before passt/the proxy start, so
+/// the boot path and hot-reload path share one renderer (no jq/Zig drift).
+pub fn renderFiles(allocator: std.mem.Allocator, io: std.Io, config_path: []const u8, runtime_path: []const u8) !void {
+	var loaded = try config.load(allocator, io, config_path);
+	defer loaded.deinit();
+	const net = loaded.network() catch {
+		// "full"/"none" mode carries no rules; emit empty files defensively.
+		try reload.writeRuntimeRules(allocator, io, runtime_path, .null);
+		try reload.writeL7Rules(allocator, io, runtime_path, .null);
+		return;
+	};
+	try reload.writeRuntimeRules(allocator, io, runtime_path, net.*);
+	try reload.writeL7Rules(allocator, io, runtime_path, net.*);
 }
 
 fn cmdList(allocator: std.mem.Allocator, io: std.Io, rules_arr: std.json.Array) !void {

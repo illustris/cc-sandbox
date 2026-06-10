@@ -656,6 +656,7 @@ echo "$$" > "$RUNTIME/pid"
 # misdirect connections to a port the VM isn't listening on.
 echo "$SSH_PORT $BIND_ADDR" > "$RUNTIME/ssh-endpoint"
 PASST_PID=""
+L7PROXY_PID=""
 QEMU_PID=""
 CLEANED=0
 # The VM is always a background daemon now, so this script's only job after
@@ -678,6 +679,7 @@ cogbox_cleanup() {
 		wait "$QEMU_PID" 2>/dev/null
 	fi
 	[ -n "$PASST_PID" ] && kill "$PASST_PID" 2>/dev/null
+	[ -n "$L7PROXY_PID" ] && kill "$L7PROXY_PID" 2>/dev/null
 	rm -rf "$RUNTIME"
 	[ -n "${LOCK:-}" ] && rm -f "$LOCK"
 }
@@ -729,21 +731,18 @@ for h in "${HARNESSES[@]}"; do
 	done < <(harness_pathkeys "$h")
 done
 
-# -- Generate rules file for LD_PRELOAD filter ---------------------
-# Emits CIDR allow/deny rules and TCP remap rules to a single file.
-# The shim's loader (zig/src/filter.zig::parseRules) fans line types
-# into separate tables. v1 remap schema (no CLI verb yet, hand-edit
-# config.json):
-#   "remap": [{"from": "tcp 0.0.0.0/0:443", "to": "tcp 127.0.0.1:18080"}]
+# -- Generate runtime rule files -----------------------------------
+# Render BOTH the LD_PRELOAD filter's netfilter-rules (CIDR + remap +
+# the auto-injected L7 funnel lines) and the L7 proxy's l7-rules from
+# config.json, using the same Zig renderer the hot-reload path uses --
+# so boot output and edit output can never drift. L7_ACTIVE drives
+# whether the L7 proxy is launched below.
+L7_ACTIVE=0
 if [ "$NETWORK_MODE" = "rules" ]; then
-	{
-		jq -r '.network.rules[]? |
-			if .allow then "allow \(.allow)"
-			elif .deny then "deny \(.deny)"
-			else empty end' "$ACTIVE_CONFIG"
-		jq -r '.network.remap[]? |
-			"remap \(.from) -> \(.to)"' "$ACTIVE_CONFIG"
-	} > "$RUNTIME/netfilter-rules"
+	@cogbox@ __render-rules "$ACTIVE_CONFIG" "$RUNTIME"
+	if [ "$(jq -r '(.network.l7.rules // []) | length' "$ACTIVE_CONFIG")" -gt 0 ]; then
+		L7_ACTIVE=1
+	fi
 fi
 
 # -- Patch the microvm runner with runtime QEMU settings -----------
@@ -802,6 +801,23 @@ wait_for_passt() {
 	fi
 }
 
+# -- Helper: start the host-side L7 proxy --------------------------
+# Runs WITHOUT the LD_PRELOAD shim (so it reaches the internet directly to
+# re-resolve allowed vhosts) and writes its pid for the hot-reload SIGHUP
+# path. Started only when .network.l7 has rules. Failure is non-fatal: a
+# dead proxy makes the funnel remap fail closed (EHOSTUNREACH to the guest).
+start_l7proxy() {
+	@cogbox@ __l7proxy "$RUNTIME" &
+	L7PROXY_PID=$!
+	echo "$L7PROXY_PID" > "$RUNTIME/l7proxy.pid"
+	# Brief liveness check: if it died immediately (e.g. port in use), warn.
+	sleep 0.2
+	if ! kill -0 "$L7PROXY_PID" 2>/dev/null; then
+		echo "cogbox-launch: warning: L7 proxy failed to start; guest 80/443 will be blocked." >&2
+		L7PROXY_PID=""
+	fi
+}
+
 # Launch QEMU as a background child and wait for it. Backgrounding (rather
 # than a bare foreground exec) is what lets the TERM/INT traps above signal
 # QEMU so `cogbox stop` shuts the VM down cleanly.
@@ -826,6 +842,7 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
+	[ "$L7_ACTIVE" = "1" ] && start_l7proxy
 	launch_vm
 elif [ "$NETWORK_MODE" != "none" ]; then
 	# Full mode: unrestricted passt
