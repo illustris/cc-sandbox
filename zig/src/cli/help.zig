@@ -25,6 +25,7 @@ pub const TOP_LEVEL =
 	\\  ssh       Connect to a running instance via SSH
 	\\  rules     Manage CIDR allow/deny rules for an instance
 	\\  remap     Manage TCP destination-remap rules
+	\\  l7        Manage L7 (vhost) allow/deny rules for an instance
 	\\  help      Show help for a verb (cogbox help VERB)
 	\\
 	\\Common options:
@@ -305,6 +306,47 @@ pub const REMAP =
 	\\
 ;
 
+pub const L7 =
+	\\cogbox l7 - manage L7 (vhost) allow/deny rules for an instance
+	\\
+	\\Usage:
+	\\  cogbox l7 [-n NAME] list
+	\\  cogbox l7 [-n NAME] add allow|deny HOST [--at N]
+	\\  cogbox l7 [-n NAME] del INDEX
+	\\  cogbox l7 [-n NAME] set                  (reads rules from stdin)
+	\\  cogbox l7 [-n NAME] mode passthrough     (terminate tier: not in v1)
+	\\
+	\\Options:
+	\\  -n, --name NAME       Instance name (default: "default")
+	\\  -h, --help            Show this help and exit
+	\\
+	\\HOST is an SNI/Host pattern: an exact name (api.example.com), a left
+	\\wildcard (*.example.com), or a bare * catch-all. Rules are first-match,
+	\\default deny.
+	\\
+	\\While L4 rules whitelist a destination IP, L7 rules whitelist individual
+	\\vhosts behind a shared load-balancer IP. When any L7 rule exists, all
+	\\guest 80/443 traffic is funneled through a host-side proxy that allows
+	\\only the listed vhosts (matched by TLS SNI / HTTP Host) and re-resolves
+	\\the name host-side -- so allowing one vhost does NOT expose siblings on
+	\\the same IP, and DNS-based load balancing keeps working. Requires the
+	\\instance's network mode to be "rules".
+	\\
+	\\v1 caveats: passthrough (no TLS interception) only -- it trusts the SNI,
+	\\so a shared ingress that routes by inner Host can still be reached for a
+	\\sibling on a single connection; QUIC/UDP-443 and all guest IPv6 are
+	\\denied while L7 is active (clients fall back to inspectable IPv4 TCP).
+	\\
+	\\Examples:
+	\\  cogbox l7 add allow api.example.com
+	\\  cogbox l7 add allow '*.pages.example.com'
+	\\  cogbox l7 add deny '*' --at 1
+	\\
+	\\If the instance is running, edits hot-reload the proxy via SIGHUP and
+	\\passt via SIGUSR1 (no VM restart needed).
+	\\
+;
+
 pub fn forVerb(verb: []const u8) ?[]const u8 {
 	if (std.mem.eql(u8, verb, "start")) return START;
 	if (std.mem.eql(u8, verb, "console")) return CONSOLE;
@@ -317,6 +359,7 @@ pub fn forVerb(verb: []const u8) ?[]const u8 {
 	if (std.mem.eql(u8, verb, "ssh")) return SSH;
 	if (std.mem.eql(u8, verb, "rules")) return RULES;
 	if (std.mem.eql(u8, verb, "remap")) return REMAP;
+	if (std.mem.eql(u8, verb, "l7")) return L7;
 	return null;
 }
 

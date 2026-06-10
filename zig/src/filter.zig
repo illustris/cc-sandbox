@@ -89,15 +89,7 @@ pub const RuleSet = struct {
 		// all host services to the sandbox. The remap path bypasses
 		// this check because it never calls evaluate() against the
 		// rewritten destination.
-		switch (addr) {
-			.ipv4 => |ip| {
-				if (ip[0] == 127) return .deny;
-			},
-			.ipv6 => |ip| {
-				if (std.mem.eql(u8, &ip, &ipv6_loopback)) return .deny;
-				if (isIpv4Mapped(ip) and ip[12] == 127) return .deny;
-			},
-		}
+		if (isLoopback(addr)) return .deny;
 
 		const check_addr = normalizeMapped(addr);
 
@@ -154,7 +146,7 @@ fn matchDnsPattern(p: DnsPattern, host: []const u8) bool {
 /// Validate a hostname-shaped string. Permissive enough for real-world
 /// names (LDH labels), strict enough to reject empty labels, leading/
 /// trailing dots, and stray punctuation.
-fn isValidHostName(s: []const u8) bool {
+pub fn isValidHostName(s: []const u8) bool {
 	if (s.len == 0 or s.len > max_dns_pattern_len) return false;
 	if (s[0] == '.' or s[s.len - 1] == '.') return false;
 	var prev_dot = true;
@@ -252,6 +244,53 @@ fn normalizeMapped(addr: IpAddr) IpAddr {
 			addr,
 		.ipv4 => addr,
 	};
+}
+
+/// True for loopback destinations (127.0.0.0/8, ::1, and the IPv4-mapped
+/// form of 127/8). Lifted out of `evaluate()` so the shim's connect()
+/// reorder can reuse it: a remap rule's broad LHS (e.g. 0.0.0.0/0:443)
+/// must NOT divert the guest's own loopback probes.
+pub fn isLoopback(addr: IpAddr) bool {
+	return switch (normalizeMapped(addr)) {
+		.ipv4 => |ip| ip[0] == 127,
+		.ipv6 => |ip| std.mem.eql(u8, &ip, &ipv6_loopback),
+	};
+}
+
+// CIDRs the L7 proxy must NEVER dial, regardless of instance rules. This is
+// a non-overridable floor: the proxy runs OUTSIDE the LD_PRELOAD shim, so its
+// host-side getaddrinfo()+connect() faces no L4 policy unless we add it here.
+// Without this, an allowed vhost name (attacker-controlled DNS, or matched by
+// a `*.suffix` wildcard) pointed at link-local/metadata/LAN would turn the
+// feature into an SSRF amplifier from the trusted host's vantage.
+const ssrf_blocked_v4 = [_]struct { net: [4]u8, prefix: u8 }{
+	.{ .net = .{ 0, 0, 0, 0 }, .prefix = 8 }, // "this network" (0.0.0.0/8, localhost alias on Linux)
+	.{ .net = .{ 127, 0, 0, 0 }, .prefix = 8 }, // loopback
+	.{ .net = .{ 10, 0, 0, 0 }, .prefix = 8 }, // RFC1918
+	.{ .net = .{ 172, 16, 0, 0 }, .prefix = 12 }, // RFC1918
+	.{ .net = .{ 192, 168, 0, 0 }, .prefix = 16 }, // RFC1918
+	.{ .net = .{ 169, 254, 0, 0 }, .prefix = 16 }, // link-local incl. cloud metadata 169.254.169.254
+	.{ .net = .{ 100, 64, 0, 0 }, .prefix = 10 }, // CGNAT (RFC 6598)
+};
+
+/// True if the L7 proxy must refuse to dial this resolved address. Folds
+/// IPv4-mapped IPv6 into IPv4 first so `::ffff:169.254.169.254` is caught.
+pub fn isSsrfBlocked(addr: IpAddr) bool {
+	switch (normalizeMapped(addr)) {
+		.ipv4 => |ip| {
+			for (ssrf_blocked_v4) |b| {
+				if (ipv4Matches(b.net, ip, b.prefix)) return true;
+			}
+			return false;
+		},
+		.ipv6 => |ip| {
+			if (std.mem.eql(u8, &ip, &ipv6_loopback)) return true; // ::1
+			if (std.mem.eql(u8, &ip, &([_]u8{0} ** 16))) return true; // :: unspecified
+			if (ip[0] == 0xfe and (ip[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
+			if ((ip[0] & 0xfe) == 0xfc) return true; // fc00::/7 ULA (incl. fd00:ec2:: metadata)
+			return false;
+		},
+	}
 }
 
 fn cidrContains(network: IpAddr, prefix_len: u8, addr: IpAddr) bool {
@@ -374,8 +413,25 @@ fn parseProtoCidrPort(s: []const u8, opts: ParseOpts) ?ProtoCidrPort {
 	}
 	if (opts.require_proto and proto == .any) return null;
 
-	// Split off `:port` if present. v1 supports IPv4 only here, so we
-	// can safely treat any single colon as the port separator.
+	// IPv6 path: any textual IPv6 address carries >=2 colons. v1 supports
+	// PORT-LESS IPv6 CIDRs only (used for the L7 v6 fail-closed denies, e.g.
+	// `deny tcp ::/0`); bracketed IPv6+port is not supported.
+	if (std.mem.count(u8, rest, ":") >= 2) {
+		var prefix6: u8 = 128;
+		var ip6_str: []const u8 = rest;
+		if (std.mem.indexOfScalar(u8, rest, '/')) |sp| {
+			ip6_str = rest[0..sp];
+			prefix6 = std.fmt.parseInt(u8, rest[sp + 1 ..], 10) catch return null;
+		} else if (opts.require_cidr_slash) {
+			return null;
+		}
+		if (prefix6 > 128) return null;
+		const ipv6 = parseIpv6(ip6_str) orelse return null;
+		return .{ .proto = proto, .network = .{ .ipv6 = ipv6 }, .prefix_len = prefix6, .port = 0 };
+	}
+
+	// Split off `:port` if present. The IPv4 path treats any single colon as
+	// the port separator.
 	var addr_part: []const u8 = rest;
 	var port: u16 = 0;
 	if (std.mem.indexOfScalar(u8, rest, ':')) |colon| {
@@ -442,6 +498,60 @@ pub fn parseRemapLine(line: []const u8) ?RemapRule {
 	};
 }
 
+/// Parse a textual IPv6 address (with optional `::` compression) into 16
+/// bytes. Embedded IPv4 (`::ffff:1.2.3.4`) is not accepted in v1. Returns
+/// null on malformed input.
+pub fn parseIpv6(s: []const u8) ?[16]u8 {
+	var result = [_]u8{0} ** 16;
+	if (std.mem.indexOf(u8, s, "::")) |dc| {
+		const head = s[0..dc];
+		const tail = s[dc + 2 ..];
+		if (std.mem.indexOf(u8, tail, "::") != null) return null; // only one ::
+		var front: [8]u16 = undefined;
+		var fcount: usize = 0;
+		if (head.len > 0) fcount = parseV6Groups(head, &front) orelse return null;
+		var back: [8]u16 = undefined;
+		var bcount: usize = 0;
+		if (tail.len > 0) bcount = parseV6Groups(tail, &back) orelse return null;
+		if (fcount + bcount > 8) return null; // :: must elide >=1 group... unless whole-zero
+		var i: usize = 0;
+		while (i < fcount) : (i += 1) {
+			result[i * 2] = @intCast(front[i] >> 8);
+			result[i * 2 + 1] = @intCast(front[i] & 0xff);
+		}
+		const back_start = 8 - bcount;
+		i = 0;
+		while (i < bcount) : (i += 1) {
+			const idx = back_start + i;
+			result[idx * 2] = @intCast(back[i] >> 8);
+			result[idx * 2 + 1] = @intCast(back[i] & 0xff);
+		}
+		return result;
+	}
+	var groups: [8]u16 = undefined;
+	const n = parseV6Groups(s, &groups) orelse return null;
+	if (n != 8) return null;
+	var i: usize = 0;
+	while (i < 8) : (i += 1) {
+		result[i * 2] = @intCast(groups[i] >> 8);
+		result[i * 2 + 1] = @intCast(groups[i] & 0xff);
+	}
+	return result;
+}
+
+fn parseV6Groups(s: []const u8, out: *[8]u16) ?usize {
+	var n: usize = 0;
+	var it = std.mem.splitScalar(u8, s, ':');
+	while (it.next()) |grp| {
+		if (n >= 8) return null;
+		if (grp.len == 0 or grp.len > 4) return null;
+		if (std.mem.indexOfScalar(u8, grp, '.') != null) return null; // no embedded v4
+		out[n] = std.fmt.parseInt(u16, grp, 16) catch return null;
+		n += 1;
+	}
+	return n;
+}
+
 pub fn parseIpv4(s: []const u8) ?[4]u8 {
 	var result: [4]u8 = undefined;
 	var octet_idx: usize = 0;
@@ -501,6 +611,165 @@ pub fn parseRules(content: []const u8) RuleSet {
 	return ruleset;
 }
 
+// --- L7 (vhost) rules ---
+//
+// Consumed by the host-side L7 proxy (cogbox __l7proxy), NOT by the shim.
+// Each rule whitelists/blacklists an SNI/Host pattern (reusing DnsPattern),
+// optionally narrowed to a URL path prefix and/or marked `terminate`. The
+// proxy reads these from <runtime>/l7-rules; the shim never sees them.
+
+pub const max_l7_rules = 128;
+pub const max_l7_path_len = 256;
+
+// Fixed loopback ports the L7 proxy listens on, and the funnel remap targets.
+// Single source of truth shared by the proxy, the rules renderer, and the
+// launch script. 18080 is intentionally avoided (the test SOCKS5 stub uses it).
+pub const l7_tls_port: u16 = 18443;
+pub const l7_http_port: u16 = 18081;
+
+pub const L7Rule = struct {
+	action: Action,
+	host: DnsPattern,
+	has_path: bool = false,
+	path_buf: [max_l7_path_len]u8 = undefined,
+	path_len: u16 = 0,
+	terminate: bool = false,
+
+	pub fn pathSlice(self: *const L7Rule) ?[]const u8 {
+		if (!self.has_path) return null;
+		return self.path_buf[0..self.path_len];
+	}
+};
+
+pub const L7RuleSet = struct {
+	// Instance floor: when true, every L7-governed host is handled in the
+	// terminating tier even if its rule doesn't say `terminate`.
+	mode_terminate: bool = false,
+	rules: [max_l7_rules]L7Rule = undefined,
+	len: usize = 0,
+
+	/// First-match allow/deny over (host[, path]); default deny. `path` is
+	/// the request path the proxy already normalized (percent-decoded,
+	/// dot-segments collapsed, query stripped). When `path` is null (HTTPS
+	/// passthrough, host-only), rules that require a path simply don't match.
+	pub fn evaluate(self: *const L7RuleSet, host: []const u8, path: ?[]const u8) Action {
+		const h = stripRootDot(host);
+		for (self.rules[0..self.len]) |r| {
+			if (!matchDnsPattern(r.host, h)) continue;
+			if (r.has_path) {
+				const p = path orelse continue;
+				if (!pathPrefixMatches(r.pathSlice().?, p)) continue;
+			}
+			return r.action;
+		}
+		return .deny;
+	}
+
+	/// Should this host be served through the terminating tier? True if the
+	/// instance floor is terminate, or any host-matching rule asks for
+	/// termination (explicit flag, or a path constraint that is only
+	/// enforceable on a terminated/plaintext stream).
+	pub fn needsTerminate(self: *const L7RuleSet, host: []const u8) bool {
+		if (self.mode_terminate) return true;
+		const h = stripRootDot(host);
+		for (self.rules[0..self.len]) |r| {
+			if (matchDnsPattern(r.host, h) and (r.terminate or r.has_path)) return true;
+		}
+		return false;
+	}
+};
+
+fn stripRootDot(host: []const u8) []const u8 {
+	if (host.len > 0 and host[host.len - 1] == '.') return host[0 .. host.len - 1];
+	return host;
+}
+
+/// Boundary-aware left-anchored prefix match. `rule_path` matches `req_path`
+/// iff they are equal, or `req_path` extends `rule_path` at a `/` boundary.
+/// e.g. `/api` matches `/api`, `/api/`, `/api/v1` but NOT `/apifoo`.
+/// Both inputs are expected pre-normalized.
+pub fn pathPrefixMatches(rule_path: []const u8, req_path: []const u8) bool {
+	if (req_path.len < rule_path.len) return false;
+	if (!std.mem.startsWith(u8, req_path, rule_path)) return false;
+	if (req_path.len == rule_path.len) return true;
+	if (rule_path.len > 0 and rule_path[rule_path.len - 1] == '/') return true;
+	return req_path[rule_path.len] == '/';
+}
+
+pub const L7Line = union(enum) {
+	rule: L7Rule,
+	mode_terminate: bool,
+	none, // blank / comment / malformed
+};
+
+/// Parse a single `l7-rules` line:
+///   mode passthrough|terminate
+///   allow|deny  <host-pattern>  [<path>]  [terminate]
+/// Tokens are whitespace-separated. A token starting with `/` is the path;
+/// the literal token `terminate` sets the flag. Order of the trailing tokens
+/// is not significant. Malformed lines return `.none` (dropped, fail-closed).
+pub fn parseL7Line(line: []const u8) L7Line {
+	const trimmed = std.mem.trim(u8, line, " \t\r\n");
+	if (trimmed.len == 0 or trimmed[0] == '#') return .none;
+
+	var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+	const head = it.next() orelse return .none;
+
+	if (std.mem.eql(u8, head, "mode")) {
+		const v = it.next() orelse return .none;
+		if (std.mem.eql(u8, v, "terminate")) return .{ .mode_terminate = true };
+		if (std.mem.eql(u8, v, "passthrough")) return .{ .mode_terminate = false };
+		return .none;
+	}
+
+	var action: Action = undefined;
+	if (std.mem.eql(u8, head, "allow")) {
+		action = .allow;
+	} else if (std.mem.eql(u8, head, "deny")) {
+		action = .deny;
+	} else {
+		return .none;
+	}
+
+	const host_tok = it.next() orelse return .none;
+	const pat = parseDnsPattern(host_tok) orelse return .none;
+
+	var rule: L7Rule = .{ .action = action, .host = pat };
+	while (it.next()) |tok| {
+		if (std.mem.eql(u8, tok, "terminate")) {
+			rule.terminate = true;
+		} else if (tok.len > 0 and tok[0] == '/') {
+			if (rule.has_path) return .none; // duplicate path
+			if (tok.len > max_l7_path_len) return .none;
+			@memcpy(rule.path_buf[0..tok.len], tok);
+			rule.path_len = @intCast(tok.len);
+			rule.has_path = true;
+		} else {
+			return .none; // unknown token -> reject the whole line
+		}
+	}
+	return .{ .rule = rule };
+}
+
+/// Parse a multi-line `l7-rules` document into `out` (passed by pointer to
+/// avoid copying the large fixed-size table).
+pub fn parseL7Rules(content: []const u8, out: *L7RuleSet) void {
+	out.* = .{};
+	var lines = std.mem.splitScalar(u8, content, '\n');
+	while (lines.next()) |line| {
+		switch (parseL7Line(line)) {
+			.none => {},
+			.mode_terminate => |t| out.mode_terminate = t,
+			.rule => |r| {
+				if (out.len < max_l7_rules) {
+					out.rules[out.len] = r;
+					out.len += 1;
+				}
+			},
+		}
+	}
+}
+
 // --- Tests ---
 
 test "parseIpv4 valid" {
@@ -519,6 +788,37 @@ test "parseIpv4 invalid" {
 	try std.testing.expect(parseIpv4("1.2.3.4.5") == null);
 	try std.testing.expect(parseIpv4("abc") == null);
 	try std.testing.expect(parseIpv4("") == null);
+}
+
+test "parseIpv6 :: forms" {
+	try std.testing.expectEqual([_]u8{0} ** 16, parseIpv6("::").?);
+	const lo = parseIpv6("::1").?;
+	try std.testing.expectEqual(@as(u8, 1), lo[15]);
+	const full = parseIpv6("2001:db8::1").?;
+	try std.testing.expectEqual([_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, full);
+	try std.testing.expect(parseIpv6("2001:::1") == null);
+	try std.testing.expect(parseIpv6("xyz") == null);
+	try std.testing.expect(parseIpv6("::ffff:1.2.3.4") == null); // embedded v4 not supported
+}
+
+test "parseLine accepts port-less IPv6 CIDR" {
+	const r = parseLine("deny tcp ::/0").?;
+	try std.testing.expectEqual(Proto.tcp, r.proto);
+	try std.testing.expectEqual(@as(u8, 0), r.prefix_len);
+	try std.testing.expectEqual(@as(u16, 0), r.port);
+	try std.testing.expectEqual([_]u8{0} ** 16, r.network.ipv6);
+}
+
+test "evaluate honors v6 deny-all but keeps DNS" {
+	const rs = parseRules(
+		\\deny tcp ::/0
+		\\deny udp ::/0
+	);
+	const v6 = IpAddr{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, v6, 443));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, v6, 443));
+	// DNS (port 53) stays implicitly allowed
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.udp, v6, 53));
 }
 
 test "parseLine allow" {
@@ -826,4 +1126,113 @@ test "parseRules mixes CIDR + remap + DNS into three tables" {
 	try std.testing.expectEqual(@as(usize, 1), rs.len);
 	try std.testing.expectEqual(@as(usize, 1), rs.remap_len);
 	try std.testing.expectEqual(@as(usize, 1), rs.dns_len);
+}
+
+// --- isLoopback / isSsrfBlocked ---
+
+test "isLoopback v4/v6/mapped" {
+	try std.testing.expect(isLoopback(.{ .ipv4 = .{ 127, 0, 0, 1 } }));
+	try std.testing.expect(isLoopback(.{ .ipv4 = .{ 127, 9, 9, 9 } }));
+	try std.testing.expect(!isLoopback(.{ .ipv4 = .{ 8, 8, 8, 8 } }));
+	try std.testing.expect(isLoopback(.{ .ipv6 = ipv6_loopback }));
+	const mapped_lo = IpAddr{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 } };
+	try std.testing.expect(isLoopback(mapped_lo));
+}
+
+test "isSsrfBlocked covers metadata/LAN/loopback, allows public" {
+	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 127, 0, 0, 1 } }));
+	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 169, 254, 169, 254 } }));
+	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 10, 1, 2, 3 } }));
+	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 172, 16, 5, 5 } }));
+	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 192, 168, 1, 1 } }));
+	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 100, 64, 0, 1 } }));
+	try std.testing.expect(isSsrfBlocked(.{ .ipv4 = .{ 0, 0, 0, 0 } }));
+	// v4-mapped metadata
+	try std.testing.expect(isSsrfBlocked(.{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 169, 254, 169, 254 } }));
+	// v6 loopback / link-local / ULA
+	try std.testing.expect(isSsrfBlocked(.{ .ipv6 = ipv6_loopback }));
+	try std.testing.expect(isSsrfBlocked(.{ .ipv6 = .{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
+	try std.testing.expect(isSsrfBlocked(.{ .ipv6 = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
+	// public addresses pass
+	try std.testing.expect(!isSsrfBlocked(.{ .ipv4 = .{ 1, 1, 1, 1 } }));
+	try std.testing.expect(!isSsrfBlocked(.{ .ipv4 = .{ 93, 184, 216, 34 } }));
+	try std.testing.expect(!isSsrfBlocked(.{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
+}
+
+// --- L7 rules ---
+
+test "pathPrefixMatches boundary-aware" {
+	try std.testing.expect(pathPrefixMatches("/api", "/api"));
+	try std.testing.expect(pathPrefixMatches("/api", "/api/"));
+	try std.testing.expect(pathPrefixMatches("/api", "/api/v1"));
+	try std.testing.expect(!pathPrefixMatches("/api", "/apifoo"));
+	try std.testing.expect(!pathPrefixMatches("/api", "/ap"));
+	try std.testing.expect(pathPrefixMatches("/v1/", "/v1/x"));
+	try std.testing.expect(pathPrefixMatches("/v1/", "/v1/"));
+	try std.testing.expect(!pathPrefixMatches("/v1/", "/v1"));
+}
+
+test "L7 evaluate first-match, default-deny, sibling host denied" {
+	var rs: L7RuleSet = undefined;
+	parseL7Rules(
+		\\mode passthrough
+		\\allow vhost-a.test
+		\\allow *.cdn.test
+		\\deny *
+	, &rs);
+	try std.testing.expectEqual(Action.allow, rs.evaluate("vhost-a.test", null));
+	try std.testing.expectEqual(Action.allow, rs.evaluate("x.cdn.test", null));
+	// sibling on the same LB is NOT granted by allowing vhost-a
+	try std.testing.expectEqual(Action.deny, rs.evaluate("vhost-b.test", null));
+	// trailing root dot is stripped
+	try std.testing.expectEqual(Action.allow, rs.evaluate("vhost-a.test.", null));
+	try std.testing.expect(!rs.mode_terminate);
+}
+
+test "L7 evaluate default-deny with no catch-all" {
+	var rs: L7RuleSet = undefined;
+	parseL7Rules("allow only.test", &rs);
+	try std.testing.expectEqual(Action.allow, rs.evaluate("only.test", null));
+	try std.testing.expectEqual(Action.deny, rs.evaluate("other.test", null));
+}
+
+test "L7 path rules + needsTerminate" {
+	var rs: L7RuleSet = undefined;
+	parseL7Rules(
+		\\mode passthrough
+		\\allow api.example.com /v1/ terminate
+		\\allow plain.test
+		\\deny *
+	, &rs);
+	// host with a path rule needs the terminating tier
+	try std.testing.expect(rs.needsTerminate("api.example.com"));
+	try std.testing.expect(!rs.needsTerminate("plain.test"));
+	// path enforcement: only /v1/* allowed for api.example.com
+	try std.testing.expectEqual(Action.allow, rs.evaluate("api.example.com", "/v1/x"));
+	try std.testing.expectEqual(Action.deny, rs.evaluate("api.example.com", "/v2/x"));
+	// host-only check (passthrough, no path) does not match a path-required rule
+	try std.testing.expectEqual(Action.deny, rs.evaluate("api.example.com", null));
+}
+
+test "L7 mode terminate floor" {
+	var rs: L7RuleSet = undefined;
+	parseL7Rules(
+		\\mode terminate
+		\\allow a.test
+	, &rs);
+	try std.testing.expect(rs.mode_terminate);
+	try std.testing.expect(rs.needsTerminate("a.test"));
+}
+
+test "parseL7Line rejects malformed" {
+	try std.testing.expect(parseL7Line("") == .none);
+	try std.testing.expect(parseL7Line("# comment") == .none);
+	try std.testing.expect(parseL7Line("allow") == .none); // no host
+	try std.testing.expect(parseL7Line("allow *.foo.*") == .none); // bad pattern
+	try std.testing.expect(parseL7Line("allow a.test bogustoken") == .none);
+	try std.testing.expect(parseL7Line("mode sideways") == .none);
+	const r = parseL7Line("allow a.test /p/ terminate");
+	try std.testing.expect(r == .rule);
+	try std.testing.expect(r.rule.terminate);
+	try std.testing.expectEqualStrings("/p/", r.rule.pathSlice().?);
 }

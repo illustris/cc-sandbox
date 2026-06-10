@@ -40,7 +40,20 @@ in {
 			# Phase H runs a small SOCKS5 stub server to verify the shim's
 			# TCP remap path. The stub is plain Python; no extras needed.
 			python3
+			# Phase K's L7 origin uses a throwaway self-signed cert.
+			openssl
 		];
+
+		# Phase K (L7 vhost filtering): the host-side L7 proxy re-resolves the
+		# allowed vhost NAME via the node's resolver, so the node's /etc/hosts
+		# must map the test vhosts to the TEST-NET origin IP. 203.0.113.0/24
+		# (TEST-NET-3) is deliberately NOT in the proxy's SSRF blocklist, so a
+		# legit allow can reach it; the SSRF canary points a name at the cloud
+		# metadata IP, which the proxy MUST refuse.
+		networking.hosts = {
+			"203.0.113.5" = [ "vhost-a.test" "vhost-b.test" ];
+			"169.254.169.254" = [ "evil-meta.test" ];
+		};
 
 		# Pin all transitive flake-input sources into the test machine's
 		# /nix/store so the wrapper's `nix run` re-eval (Phase E) can

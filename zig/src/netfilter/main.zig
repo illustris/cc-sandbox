@@ -300,7 +300,25 @@ export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) 
 	const info = extractAddr(a) orelse return real_connect.?(fd, addr, len);
 	const proto = fdProto(fd);
 
-	// CIDR check against the ORIGINAL destination (before any remap).
+	// Remap is consulted FIRST for non-loopback TCP. A remap hit means
+	// "allow but divert": it intentionally bypasses the CIDR allow/deny
+	// pass, because the connection never reaches the original destination
+	// -- it is rewritten to a loopback proxy and a SOCKS5 handshake carries
+	// the original dest. This keeps the L7 funnel ("remap any :443 -> the
+	// L7 proxy") fail-CLOSED: the single rendered remap line is the only
+	// thing that both authorizes and diverts the port, so dropping it
+	// yields ENETUNREACH rather than direct unfiltered egress.
+	//
+	// The !isLoopback guard is load-bearing: the funnel's broad LHS
+	// (0.0.0.0/0:443) would otherwise divert the guest's own 127.0.0.1:443
+	// probes. Loopback stays subject to the implicit loopback-deny below.
+	if (proto == .tcp and !filter.isLoopback(info.addr)) {
+		if (ruleset.evaluateRemap(.tcp, info.addr, info.port)) |target| {
+			return doRemappedConnect(fd, info.addr, info.port, target);
+		}
+	}
+
+	// CIDR check against the ORIGINAL destination (no remap matched).
 	if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
 		denyErrno();
 		return -1;
@@ -310,13 +328,6 @@ export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) 
 	// dest_addr (typical glibc resolver pattern).
 	if (proto == .udp) {
 		setFdPeer(fd, info.addr, info.port);
-	}
-
-	// Remap (v1: TCP only).
-	if (proto == .tcp) {
-		if (ruleset.evaluateRemap(.tcp, info.addr, info.port)) |target| {
-			return doRemappedConnect(fd, info.addr, info.port, target);
-		}
 	}
 
 	return real_connect.?(fd, addr, len);

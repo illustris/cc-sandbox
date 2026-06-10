@@ -131,8 +131,9 @@ is just `start -f`: launch, then auto-attach the console.
 | `list` | List all instances. `--json` for machine-readable output |
 | `init` | Create config + host directories without launching |
 | `ssh` | Connect to a running instance via SSH |
-| `rules` | Manage CIDR allow/deny rules for an instance |
+| `rules` | Manage CIDR (L4) allow/deny rules for an instance |
 | `remap` | Manage TCP destination-remap rules |
+| `l7` | Manage L7 (vhost) allow/deny rules for an instance |
 | `help` | `cogbox help VERB` ≡ `cogbox VERB --help` |
 
 The `run` verb from earlier versions has been removed: bare `cogbox` now
@@ -220,6 +221,28 @@ verb rewrite both sections cleanly without dropping the other layer.
 
 If the instance is running, rule changes take effect immediately (the
 runtime rules file is regenerated and passt receives `SIGUSR1` to reload).
+
+### L7 verb
+
+While `rules` whitelists a destination *IP*, `l7` whitelists individual
+*vhosts* behind a shared load-balancer IP. See
+["L7 host filtering"](#l7-host-filtering) for the model and threat caveats.
+
+| Form | Description |
+|---|---|
+| `cogbox l7 list [-n NAME]` | List current L7 rules and the instance mode |
+| `cogbox l7 add allow\|deny HOST [--at N] [-n NAME]` | Add a rule. `HOST` is an exact name, a `*.suffix` wildcard, or a bare `*`. |
+| `cogbox l7 del INDEX [-n NAME]` | Delete a rule by index |
+| `cogbox l7 set [-n NAME]` | Replace all rules from stdin (one `allow\|deny HOST` per line) |
+| `cogbox l7 mode passthrough [-n NAME]` | Set the tier (only `passthrough` in v1) |
+
+```sh
+cogbox l7 add allow api.example.com
+cogbox l7 add allow '*.pages.example.com'
+```
+
+L7 rules live under `.network.l7` and require the instance's network mode
+to be `rules`. Edits hot-reload the proxy (`SIGHUP`) and passt (`SIGUSR1`).
 
 ### Console and monitor
 
@@ -386,6 +409,50 @@ The filter works by intercepting passt's outbound `connect()`,
 VM's only network path, this is a complete enforcement point. The filter
 is a Zig shared library (`libnetfilter.so`) loaded via `LD_PRELOAD`;
 initialization runs before passt enables its seccomp sandbox.
+
+#### L7 host filtering
+
+L4 rules whitelist a destination *IP*. That is not enough when several
+virtual hosts share one load-balancer IP: allowing the LB lets the sandbox
+reach **every** backend on it by guessing the `Host`/SNI. The `l7` layer
+whitelists individual vhosts instead.
+
+When `.network.l7` has any rule, cogbox starts a small host-side proxy and
+funnels **all** guest 80/443 traffic to it (via an auto-injected `remap`).
+For each connection the proxy reads the vhost from the TLS **SNI** (HTTPS)
+or **Host** header (HTTP), checks it against your `allow`/`deny` list
+(first match, default deny; patterns are exact / `*.suffix` / `*`), and on
+allow **re-resolves that name itself, host-side**, then splices the bytes
+through. Re-resolution is the point: the guest's chosen IP is discarded, so
+
+- allowing one vhost does **not** expose siblings on the same IP, and
+- DNS-based load balancing (rotating/shared IPs) keeps working, because the
+  proxy always resolves the allowed name fresh.
+
+```sh
+cogbox l7 add allow api.example.com        # only this vhost on its LB
+```
+
+The proxy enforces a non-overridable **SSRF floor**: it refuses to connect
+to any name that resolves into loopback, link-local (incl. cloud metadata
+`169.254.169.254`), RFC1918, CGNAT, or ULA space, and it re-applies the
+instance's own CIDR deny-list to every resolved IP. (It runs outside the
+`LD_PRELOAD` shim, so without this an allowed name pointed at metadata would
+be an SSRF amplifier.)
+
+**v1 caveats** (documented, not silently assumed safe):
+
+- **Passthrough only** -- TLS is *not* intercepted, so cert pinning is
+  preserved, but the proxy trusts the SNI it sees. A shared ingress that
+  routes by the inner `Host:`/HTTP-2 `:authority` could still be steered to
+  a sibling on a single connection. A future terminate tier (per-instance
+  CA) will close this and add URL path rules; it is not in v1.
+- **QUIC / UDP-443 and all guest IPv6** are denied while L7 is active (the
+  funnel is IPv4/TCP-only), so clients fall back to inspectable IPv4 TCP.
+  DNS (port 53) still works.
+- L7 cannot reach vhosts hosted on loopback/RFC1918/link-local addresses
+  (the SSRF floor blocks them) -- consistent with the sandbox's default
+  LAN-deny posture.
 
 ## Configuration
 

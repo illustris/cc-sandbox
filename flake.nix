@@ -499,6 +499,7 @@
 					--replace-fail "@runtimeDir@" "${runtimeDir}" \
 					--replace-fail "@runner@" "${runner'}" \
 					--replace-fail "@netfilter@" "$out/lib/libnetfilter.so" \
+					--replace-fail "@cogbox@" "$out/bin/cogbox" \
 					--replace-fail "@flakeSource@" "${self}" \
 					--replace-fail "@nixpkgsSource@" "${nixpkgs}"
 				chmod +x $out/libexec/cogbox-launch.sh
