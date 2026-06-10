@@ -433,31 +433,41 @@ through. Re-resolution is the point: the guest's chosen IP is discarded, so
 cogbox l7 add allow api.example.com        # only this vhost on its LB
 ```
 
-Because it runs outside the `LD_PRELOAD` shim, the proxy re-applies egress
-policy to every re-resolved IP, in two layers:
+#### How L7 composes with L4
 
-- a **non-overridable hard floor** -- it never connects to loopback,
-  this-network (`0.0.0.0/8`), or link-local (incl. cloud metadata
-  `169.254.169.254`); these are never legitimate targets and stay blocked
-  even with a broad `allow`; and
-- the **instance's own CIDR policy** -- private ranges (RFC1918 / CGNAT /
-  ULA) are default-denied by the seeded rules, but you can reach an internal
-  vhost on a private LB by adding an explicit `allow` for its IP, exactly as
-  you would for a direct L4 connection.
+The proxy re-resolves the allowed name **host-side** (it never trusts the
+guest's IP or a guest-supplied Host/SNI as a destination), so an L7 rule
+refines the L4 IP policy by name. For each re-resolved IP, on funneled web
+traffic:
 
-Scope that L4 `allow` to the web ports (`tcp …:443`/`:80`) rather than a bare
-`/32`, so you don't also open every other port/proto on that host. Those ports
-are funneled through the proxy (which still enforces the SNI allowlist), and
-everything else on the IP stays default-denied:
+| vhost vs. L7 rules | decision |
+|---|---|
+| explicitly **allowed** | **dial** -- supersedes an L4 IP *block* |
+| explicitly **denied** | **drop** -- supersedes an L4 IP *allow* |
+| **not in any rule** | defer to L4 (dial if the IP is allowed, drop if blocked) |
+
+…and a **non-overridable hard floor** (loopback, this-network `0.0.0.0/8`,
+and link-local incl. cloud metadata `169.254.169.254`) is *always* dropped,
+even for an allowed vhost.
+
+So to reach an internal vhost on a private LB, you just allow the **name** --
+no L4 IP rule, and you never open that IP for anything else:
 
 ```sh
-# internal vhost on a private LB -- minimal grant:
-cogbox l7 add allow data-wiki.example.internal
-cogbox rules add allow 'tcp 10.251.5.215/32:443' --at 1   # + ':80' for HTTP
+# 10.10.10.10 hosts a.internal and b.internal; reach ONLY a.internal:
+cogbox l7 add allow a.internal          # leave 10.10.10.10 blocked (default deny 10/8)
+# a.internal -> allowed -> dialed;  b.internal -> unlisted -> IP blocked -> dropped
 ```
 
-A bare `cogbox rules add allow 10.251.5.215/32` would work too, but it opens
-*all* ports/protos on that IP -- only the web ports are mediated by L7.
+Conversely, sibling isolation only applies where the LB's **IP is blocked**.
+On a public LB reachable via `allow 0.0.0.0/0`, an unlisted sibling falls back
+to L4 and is allowed; block the IP (or `l7 add deny sibling`) to restrict it.
+
+> **Wildcard caveat.** A `*.suffix` allow trusts that whole domain's DNS --
+> if an attacker can create `evil.suffix` pointing at an internal IP, it would
+> be dialed (metadata/loopback/link-local still blocked by the hard floor).
+> Exact-name allows have no such exposure (you control that name's DNS); only
+> wildcard a suffix whose DNS you trust.
 
 **v1 caveats** (documented, not silently assumed safe):
 

@@ -646,18 +646,27 @@ pub const L7Rule = struct {
 	}
 };
 
+/// Result of evaluating a vhost against the L7 rules. Distinct from a bare
+/// allow/deny so the proxy can compose with the L4 layer: an explicit `allow`
+/// supersedes an L4 IP block, an explicit `deny` supersedes an L4 IP allow,
+/// and `no_match` defers to the instance's L4 CIDR policy.
+pub const L7Verdict = enum { allow, deny, no_match };
+
 pub const L7RuleSet = struct {
-	// Instance floor: when true, every L7-governed host is handled in the
-	// terminating tier even if its rule doesn't say `terminate`.
+	// Instance floor: when true, every L7-governed host that matches an
+	// allow rule is handled in the terminating tier even if its rule doesn't
+	// say `terminate`. (Unlisted hosts are NOT terminated -- they fall back
+	// to the L4 passthrough decision.)
 	mode_terminate: bool = false,
 	rules: [max_l7_rules]L7Rule = undefined,
 	len: usize = 0,
 
-	/// First-match allow/deny over (host[, path]); default deny. `path` is
-	/// the request path the proxy already normalized (percent-decoded,
+	/// First-match allow/deny over (host[, path]); `no_match` when no rule
+	/// matches (the caller then defers to the L4 CIDR policy). `path` is the
+	/// request path the proxy already normalized (percent-decoded,
 	/// dot-segments collapsed, query stripped). When `path` is null (HTTPS
 	/// passthrough, host-only), rules that require a path simply don't match.
-	pub fn evaluate(self: *const L7RuleSet, host: []const u8, path: ?[]const u8) Action {
+	pub fn evaluate(self: *const L7RuleSet, host: []const u8, path: ?[]const u8) L7Verdict {
 		const h = stripRootDot(host);
 		for (self.rules[0..self.len]) |r| {
 			if (!matchDnsPattern(r.host, h)) continue;
@@ -665,22 +674,28 @@ pub const L7RuleSet = struct {
 				const p = path orelse continue;
 				if (!pathPrefixMatches(r.pathSlice().?, p)) continue;
 			}
-			return r.action;
+			return switch (r.action) {
+				.allow => .allow,
+				.deny => .deny,
+			};
 		}
-		return .deny;
+		return .no_match;
 	}
 
-	/// Should this host be served through the terminating tier? True if the
-	/// instance floor is terminate, or any host-matching rule asks for
-	/// termination (explicit flag, or a path constraint that is only
-	/// enforceable on a terminated/plaintext stream).
+	/// Should this host be served through the terminating tier (MITM)? Only
+	/// hosts that MATCH a rule are candidates -- unlisted hosts are passed
+	/// through (L4-governed), never intercepted. Among matching rules:
+	/// terminate if any carries a path constraint or explicit `terminate`, or
+	/// the instance floor is terminate and the host matches an allow rule.
 	pub fn needsTerminate(self: *const L7RuleSet, host: []const u8) bool {
-		if (self.mode_terminate) return true;
 		const h = stripRootDot(host);
+		var matched_allow = false;
 		for (self.rules[0..self.len]) |r| {
-			if (matchDnsPattern(r.host, h) and (r.terminate or r.has_path)) return true;
+			if (!matchDnsPattern(r.host, h)) continue;
+			if (r.has_path or r.terminate) return true;
+			if (r.action == .allow) matched_allow = true;
 		}
-		return false;
+		return self.mode_terminate and matched_allow;
 	}
 };
 
@@ -1182,28 +1197,42 @@ test "pathPrefixMatches boundary-aware" {
 	try std.testing.expect(!pathPrefixMatches("/v1/", "/v1"));
 }
 
-test "L7 evaluate first-match, default-deny, sibling host denied" {
+test "L7 evaluate first-match: allow / deny / no_match" {
 	var rs: L7RuleSet = undefined;
 	parseL7Rules(
 		\\mode passthrough
 		\\allow vhost-a.test
 		\\allow *.cdn.test
-		\\deny *
+		\\deny telemetry.test
 	, &rs);
-	try std.testing.expectEqual(Action.allow, rs.evaluate("vhost-a.test", null));
-	try std.testing.expectEqual(Action.allow, rs.evaluate("x.cdn.test", null));
-	// sibling on the same LB is NOT granted by allowing vhost-a
-	try std.testing.expectEqual(Action.deny, rs.evaluate("vhost-b.test", null));
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("vhost-a.test", null));
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("x.cdn.test", null));
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluate("telemetry.test", null));
+	// a sibling not in any rule is NO_MATCH -> the proxy defers to L4
+	// (so allowing vhost-a does not by itself grant vhost-b; vhost-b is only
+	// reachable if its IP is L4-allowed)
+	try std.testing.expectEqual(L7Verdict.no_match, rs.evaluate("vhost-b.test", null));
 	// trailing root dot is stripped
-	try std.testing.expectEqual(Action.allow, rs.evaluate("vhost-a.test.", null));
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("vhost-a.test.", null));
 	try std.testing.expect(!rs.mode_terminate);
 }
 
-test "L7 evaluate default-deny with no catch-all" {
+test "L7 evaluate no_match falls through (no implicit deny)" {
 	var rs: L7RuleSet = undefined;
 	parseL7Rules("allow only.test", &rs);
-	try std.testing.expectEqual(Action.allow, rs.evaluate("only.test", null));
-	try std.testing.expectEqual(Action.deny, rs.evaluate("other.test", null));
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("only.test", null));
+	try std.testing.expectEqual(L7Verdict.no_match, rs.evaluate("other.test", null));
+}
+
+test "L7 explicit deny * supersedes L4 (catch-all)" {
+	var rs: L7RuleSet = undefined;
+	parseL7Rules(
+		\\allow a.test
+		\\deny *
+	, &rs);
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("a.test", null));
+	// deny * makes everything else an explicit deny, not no_match
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluate("b.test", null));
 }
 
 test "L7 path rules + needsTerminate" {
@@ -1214,17 +1243,18 @@ test "L7 path rules + needsTerminate" {
 		\\allow plain.test
 		\\deny *
 	, &rs);
-	// host with a path rule needs the terminating tier
+	// host with a path rule needs the terminating tier; a plain allow doesn't
 	try std.testing.expect(rs.needsTerminate("api.example.com"));
 	try std.testing.expect(!rs.needsTerminate("plain.test"));
+	// an unlisted host is never terminated (passthrough / L4)
+	try std.testing.expect(!rs.needsTerminate("unlisted.test"));
 	// path enforcement: only /v1/* allowed for api.example.com
-	try std.testing.expectEqual(Action.allow, rs.evaluate("api.example.com", "/v1/x"));
-	try std.testing.expectEqual(Action.deny, rs.evaluate("api.example.com", "/v2/x"));
-	// host-only check (passthrough, no path) does not match a path-required rule
-	try std.testing.expectEqual(Action.deny, rs.evaluate("api.example.com", null));
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("api.example.com", "/v1/x"));
+	// /v2/x doesn't match the path rule, but `deny *` catches it
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluate("api.example.com", "/v2/x"));
 }
 
-test "L7 mode terminate floor" {
+test "L7 mode terminate floor applies to matched allow hosts only" {
 	var rs: L7RuleSet = undefined;
 	parseL7Rules(
 		\\mode terminate
@@ -1232,6 +1262,8 @@ test "L7 mode terminate floor" {
 	, &rs);
 	try std.testing.expect(rs.mode_terminate);
 	try std.testing.expect(rs.needsTerminate("a.test"));
+	// unlisted host is NOT terminated even under the mode floor
+	try std.testing.expect(!rs.needsTerminate("unlisted.test"));
 }
 
 test "parseL7Line rejects malformed" {
