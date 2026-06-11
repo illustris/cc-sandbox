@@ -231,14 +231,15 @@ While `rules` whitelists a destination *IP*, `l7` whitelists individual
 | Form | Description |
 |---|---|
 | `cogbox l7 list [-n NAME]` | List current L7 rules and the instance mode |
-| `cogbox l7 add allow\|deny HOST [--at N] [-n NAME]` | Add a rule. `HOST` is an exact name, a `*.suffix` wildcard, or a bare `*`. |
+| `cogbox l7 add allow\|deny HOST [--path P] [--terminate] [--at N] [-n NAME]` | Add a rule. `HOST` is an exact name, a `*.suffix` wildcard, or a bare `*`. `--path` / `--terminate` opt the host into the terminate tier (`--path` implies `--terminate`). |
 | `cogbox l7 del INDEX [-n NAME]` | Delete a rule by index |
 | `cogbox l7 set [-n NAME]` | Replace all rules from stdin (one `allow\|deny HOST` per line) |
-| `cogbox l7 mode passthrough [-n NAME]` | Set the tier (only `passthrough` in v1) |
+| `cogbox l7 mode passthrough\|terminate [-n NAME]` | Set the instance tier floor |
 
 ```sh
-cogbox l7 add allow api.example.com
+cogbox l7 add allow api.example.com                       # passthrough (SNI)
 cogbox l7 add allow '*.pages.example.com'
+cogbox l7 add allow api.example.com --path /v1/           # terminate + path
 ```
 
 L7 rules live under `.network.l7` and require the instance's network mode
@@ -457,8 +458,8 @@ the constraint would be silently bypassed whenever the IP is independently
 L4-allowed (the usual "allow the internet at L4, restrict vhosts at L7" setup).
 A `deny` rule with a path (`deny api.example.com /admin/`) only blocks that
 prefix and leaves other paths to L4, since you're carving out a hole, not
-whitelisting. Cleartext HTTP paths are enforced inline; HTTPS path enforcement
-needs the terminate tier (see phase 2).
+whitelisting. On HTTPS this is enforced by the terminate tier; on cleartext
+HTTP the proxy enforces it inline from the request line.
 
 So to reach an internal vhost on a private LB, you just allow the **name** --
 no L4 IP rule, and you never open that IP for anything else:
@@ -479,19 +480,66 @@ to L4 and is allowed; block the IP (or `l7 add deny sibling`) to restrict it.
 > Exact-name allows have no such exposure (you control that name's DNS); only
 > wildcard a suffix whose DNS you trust.
 
-**v1 caveats** (documented, not silently assumed safe):
+There are two tiers, chosen per host:
 
-- **Passthrough only** -- TLS is *not* intercepted, so cert pinning is
+- **Passthrough (default)** -- TLS is *not* intercepted, so cert pinning is
   preserved, but the proxy trusts the SNI it sees. A shared ingress that
-  routes by the inner `Host:`/HTTP-2 `:authority` could still be steered to
-  a sibling on a single connection. A future terminate tier (per-instance
-  CA) will close this and add URL path rules; it is not in v1.
+  routes by the inner `Host:`/HTTP-2 `:authority` could still be steered to a
+  sibling on a single connection, and URL paths can't be inspected on HTTPS.
+- **Terminate** (opt-in via `--terminate`/`--path`, or `l7 mode terminate`) --
+  see ["L7 terminate tier"](#l7-terminate-tier).
+
+**Caveats** (documented, not silently assumed safe):
+
 - **QUIC / UDP-443 and all guest IPv6** are denied while L7 is active (the
   funnel is IPv4/TCP-only), so clients fall back to inspectable IPv4 TCP.
   DNS (port 53) still works.
 - Loopback, this-network, and link-local/metadata vhosts are never reachable
   through the proxy (the hard floor) -- consistent with the sandbox's LAN
   posture for those specific ranges.
+
+#### L7 terminate tier
+
+Marking a host `--terminate` (or giving it a `--path` prefix, which implies
+terminate) routes it through a TLS-terminating proxy ([mitmproxy](https://mitmproxy.org/))
+so cogbox can see inside HTTPS. This closes the passthrough gaps:
+
+- enforces `Host == SNI` (a connection whose decrypted `Host:`/`:authority`
+  disagrees with the negotiated SNI is rejected with `403`), and
+- enforces **URL path prefixes** (`--path /v1/`), boundary-aware and applied
+  to the normalized, percent-decoded path.
+
+```sh
+cogbox l7 add allow git.example.com --path /myorg/   # only this path prefix
+cogbox l7 mode terminate                             # terminate every L7 host
+```
+
+How it works: when any terminate rule exists, cogbox runs mitmproxy with a
+**per-instance CA** (auto-generated under `~/.config/cogbox/instances/<name>/l7-ca/`,
+key stays host-side at mode `0600`). The CA **certificate** (never the key) is
+injected into the guest at boot via `fw_cfg` and assembled into
+`/run/cogbox/ca-bundle.crt`; the harness launchers and login shells point
+`SSL_CERT_FILE`/`CURL_CA_BUNDLE`/`GIT_SSL_CAINFO`/`REQUESTS_CA_BUNDLE`/
+`NODE_EXTRA_CA_CERTS` at it. The Zig proxy still does all SSRF/CIDR vetting
+and hands mitmproxy only a pre-vetted IP; mitmproxy mints a per-SNI leaf,
+applies the rules, and re-originates upstream TLS validated against the
+*real* system trust.
+
+Terminate caveats:
+
+- This is an **intentional MITM**: for terminate hosts the proxy sees
+  plaintext (host-process-only, never persisted). Cert pinning is **broken**
+  for those hosts -- clients that pin a specific cert/CA (some Go and mobile
+  apps) will fail; leave them on passthrough.
+- Clients that ship their **own** trust store and ignore the OS store + env
+  vars (e.g. Rust `rustls` pinned to the bundled `webpki-roots` crate) won't
+  trust the instance CA. The `codex` harness is Rust and uses `rustls`, but
+  it links `rustls-native-certs`/`native-tls` and references `SSL_CERT_FILE`
+  with **no** bundled `webpki-roots` (per binary inspection of 0.139.0), so it
+  loads system roots and should honor the injected CA -- worth a quick runtime
+  check. Passthrough is unaffected regardless.
+- HTTP/2 to the client is disabled (http/1.1 only) so every request's
+  authority is checked against the SNI.
 
 ## Configuration
 

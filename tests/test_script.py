@@ -675,6 +675,89 @@ serve(80, handle_http)
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop l7-origin")
 
+with subtest("Phase L: L7 terminate tier (CA injection + Host/path enforcement)"):
+    # Terminate tier: mitmproxy MITMs terminate-marked hosts with a
+    # per-instance CA injected into the guest. We prove the in-guest
+    # integration -- the guest TRUSTS the minted leaf (curl WITHOUT -k, via the
+    # injected bundle) and the addon enforces Host==SNI + path. The addon's
+    # deny/anti-fronting 403s short-circuit BEFORE any upstream connection, so
+    # this stays hermetic (no trusted upstream needed); the allowed-path 200
+    # against a real trusted upstream is covered by local tests. 203.0.113.5
+    # has no listener here, so an allowed path yields mitmproxy's 502 -- still
+    # over a trusted TLS connection, just not a cogbox 403.
+    # Origin IP stays L4-BLOCKED; the terminate-host allow supersedes it just
+    # like the passthrough tier (firstVettedAddr is gated only by the hard floor).
+    machine.succeed(as_user(
+        "printf 'deny 203.0.113.0/24\\nallow 0.0.0.0/0\\n' | cogbox rules set --name work"
+    ))
+    machine.succeed(as_user("printf '' | cogbox l7 set --name work"))  # clear Phase K rules
+    machine.succeed(as_user("cogbox l7 add allow vhost-a.test --path /allowed/ --name work"))
+
+    boot_and_wait("cc-work", "--name work", ssh_port=2223)
+    rt = "/run/user/1000/cogbox-work"
+
+    # The mitmproxy terminate backend is running.
+    machine.succeed(f"test -f {rt}/l7mitm.pid && kill -0 $(cat {rt}/l7mitm.pid)")
+    # netfilter-rules still funnels (terminate is a superset of L7 active).
+    nf = machine.succeed(f"cat {rt}/netfilter-rules")
+    assert "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443" in nf, nf
+    # l7-rules carries the terminate marker.
+    l7r = machine.succeed(f"cat {rt}/l7-rules")
+    assert "allow vhost-a.test /allowed/" in l7r, l7r
+
+    # CA CERT injected into the guest -- certificate present, key absent.
+    machine.succeed(as_user("cogbox ssh --name work 'test -s /run/cogbox/l7-ca.crt'"))
+    machine.succeed(as_user(
+        "cogbox ssh --name work 'grep -q \"BEGIN CERTIFICATE\" /run/cogbox/l7-ca.crt'"
+    ))
+    machine.fail(as_user(
+        "cogbox ssh --name work 'grep -q \"PRIVATE KEY\" /run/cogbox/l7-ca.crt'"
+    ))
+    # Trust bundle assembled (system store + instance CA).
+    machine.succeed(as_user("cogbox ssh --name work 'test -s /run/cogbox/ca-bundle.crt'"))
+
+    def gterm(extra):
+        cmd = (
+            "curl -sS -o /dev/null -w '%{http_code}' --max-time 12 "
+            "--cacert /run/cogbox/ca-bundle.crt "
+            "--resolve vhost-a.test:443:203.0.113.5 " + extra
+        )
+        return machine.execute(as_user("cogbox ssh --name work " + shlex.quote(cmd)))
+
+    def gterm_body(extra):
+        cmd = (
+            "curl -sS --max-time 12 --cacert /run/cogbox/ca-bundle.crt "
+            "--resolve vhost-a.test:443:203.0.113.5 " + extra
+        )
+        return machine.execute(as_user("cogbox ssh --name work " + shlex.quote(cmd)))
+
+    # Denied path -> addon 403 over a TRUSTED TLS connection (no -k). rc==0
+    # proves the guest validated the minted leaf via the injected CA; the body
+    # identifies cogbox (not an upstream 403).
+    rc, code = gterm("https://vhost-a.test/denied")
+    assert rc == 0 and code.strip().endswith("403"), f"path-deny rc={rc} code={code!r}"
+    _, body = gterm_body("https://vhost-a.test/denied")
+    assert "cogbox-l7" in body, body
+
+    # Allowed path -> addon passes (upstream absent -> 502), NOT a cogbox 403.
+    _, body = gterm_body("https://vhost-a.test/allowed/x")
+    assert "cogbox-l7" not in body, f"allowed path should pass the addon: {body!r}"
+
+    # Host==SNI anti-fronting: SNI=vhost-a.test, inner Host=vhost-b.test -> 403.
+    rc, code = gterm("-H 'Host: vhost-b.test' https://vhost-a.test/allowed/")
+    assert rc == 0 and code.strip().endswith("403"), f"anti-fronting rc={rc} code={code!r}"
+
+    # Negative-CA control: the minted leaf must NOT validate against the system
+    # store alone -- proving trust came from the injected instance CA, not -k.
+    rc, _ = machine.execute(as_user("cogbox ssh --name work " + shlex.quote(
+        "curl -sS -o /dev/null --max-time 12 "
+        "--cacert /etc/ssl/certs/ca-certificates.crt "
+        "--resolve vhost-a.test:443:203.0.113.5 https://vhost-a.test/allowed/"
+    )))
+    assert rc != 0, "minted leaf must not validate against the system store alone"
+
+    stop_instance("cc-work", name="work")
+
 with subtest("Phase G: CLI parser regressions and stub-friendly verbs"):
     # cogbox writes errors to stderr; the test driver's machine.execute()
     # captures only stdout, so we redirect 2>&1 to assert on the message
