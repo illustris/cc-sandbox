@@ -165,8 +165,8 @@ pub const STOP =
 	\\  --force               After 10s of SIGTERM with no exit, send SIGKILL
 	\\  -h, --help            Show this help and exit
 	\\
-	\\Idempotent: if no PID file exists or the process is already dead,
-	\\stop is a no-op exit 0.
+	\\Idempotent: if the instance isn't running (no PID file, or the process is
+	\\already dead), stop prints "instance 'NAME' is not running" and exits 0.
 	\\
 ;
 
