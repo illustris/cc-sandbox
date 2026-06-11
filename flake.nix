@@ -562,6 +562,7 @@
 					--replace-fail "@cogbox@" "$out/bin/cogbox" \
 					--replace-fail "@mitmdump@" "${pkgs.mitmproxy}/bin/mitmdump" \
 					--replace-fail "@l7addon@" "$out/libexec/l7-mitm-addon.py" \
+					--replace-fail "@flock@" "${pkgs.util-linux}/bin/flock" \
 					--replace-fail "@flakeSource@" "${self}" \
 					--replace-fail "@nixpkgsSource@" "${nixpkgs}"
 				chmod +x $out/libexec/cogbox-launch.sh

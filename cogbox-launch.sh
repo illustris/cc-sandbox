@@ -634,19 +634,23 @@ else
 fi
 
 # -- Set up runtime symlink directory for QEMU ---------------------
-# Atomic single-starter guard. The lock lives beside (not inside) $RUNTIME so
-# the rm -rf below cannot clear it. Two near-simultaneous `cogbox start` for
-# the same instance would otherwise both wipe + recreate $RUNTIME and boot two
-# QEMUs against the same overlay image (corruption). `set -C` (noclobber) makes
-# the create fail if another starter holds the lock; a lock whose owner is dead
-# is reclaimed as stale.
+# Single-starter guard. The lock lives beside (not inside) $RUNTIME so the
+# rm -rf below cannot clear it. Two near-simultaneous `cogbox start` for the
+# same instance would otherwise both wipe + recreate $RUNTIME and boot two
+# QEMUs against the same overlay image (corruption).
+#
+# We hold an exclusive flock on $LOCK for this daemon's ENTIRE lifetime: the
+# fd stays open through the final `wait "$QEMU_PID"`, so the kernel keeps the
+# lock until the daemon (and the QEMU/passt it spawned, which inherit the fd)
+# is gone. flock -n fails immediately for any concurrent or already-running
+# starter -> exit 75. This is race-free where the old pid-file dance was not:
+# the kernel arbitrates the single winner atomically, and a crashed start
+# releases the lock automatically (fd closed on death) with no stale-pid
+# bookkeeping to get wrong.
 LOCK="${RUNTIME}.lock"
-if ! ( set -C; echo "$$" > "$LOCK" ) 2>/dev/null; then
-	owner=$(cat "$LOCK" 2>/dev/null)
-	if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-		die "instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is already running or starting." 75
-	fi
-	echo "$$" > "$LOCK"
+exec {LOCK_FD}>"$LOCK" || die "cannot open start lock $LOCK" 70
+if ! @flock@ -n "$LOCK_FD"; then
+	die "instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is already running or starting." 75
 fi
 
 if [ -e "$RUNTIME" ]; then
@@ -699,7 +703,10 @@ cogbox_cleanup() {
 	[ -n "$L7PROXY_PID" ] && kill "$L7PROXY_PID" 2>/dev/null
 	[ -n "$L7MITM_PID" ] && kill "$L7MITM_PID" 2>/dev/null
 	rm -rf "$RUNTIME"
-	[ -n "${LOCK:-}" ] && rm -f "$LOCK"
+	# Leave $LOCK in place: it is an flock target, not a pid file. Our held
+	# fd is released when this process exits (kernel-managed); unlinking it
+	# here would only risk a new starter racing on a fresh inode. The empty
+	# file lingers harmlessly in the tmpfs runtime base (cleared on logout).
 }
 trap cogbox_cleanup EXIT
 # SIGTERM/SIGINT -> exit -> EXIT trap fires cogbox_cleanup. Interrupts the

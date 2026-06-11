@@ -962,3 +962,140 @@ with subtest("Phase J: bare `cogbox start` waits for sshd then auto-SSHes in"):
     rc, out = machine.execute(as_user("cogbox start --no-ssh 2>&1"))
     assert rc == 75, f"expected already-running (75), got {rc}; out={out!r}"
     stop_instance("cc-default")
+
+with subtest("Phase O: guest UDP egress is filtered (CIDR deny + QUIC/UDP-443 funnel deny)"):
+    # The LD_PRELOAD shim gates UDP egress (sendto/sendmsg/sendmmsg + connected
+    # UDP) the same way it gates TCP connect(), and the L7 funnel additionally
+    # fail-closes UDP/443+UDP/80 (QUIC / HTTP-3) so cert-pinned clients can't
+    # tunnel past the inspectable IPv4-TCP funnel. Every other phase only ever
+    # sends TCP, so the entire UDP enforcement path was integration-untested --
+    # a regression in the UDP hooks would silently fail OPEN. We drive real
+    # guest UDP datagrams and assert host-side delivery (or non-delivery).
+    #
+    # A host UDP sink binds 0.0.0.0 on :9000 (general egress) and :443 (QUIC)
+    # and appends every datagram's payload to a hit log. The guest reaches it
+    # via the same 10.99.0.{1,2} loopback addresses the TCP phases use; passt
+    # re-issues the guest's UDP send host-side, where the shim (LD_PRELOAD'd
+    # into passt) enforces the rule before the packet leaves the node.
+    udp_sink = r'''
+import socket, threading, time
+HITLOG = "/tmp/udp-hits.log"
+open(HITLOG, "w").close()
+lock = threading.Lock()
+def loghit(s):
+    with lock:
+        with open(HITLOG, "a") as f:
+            f.write(s + "\n")
+def serve(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    loghit("listen %d" % port)
+    while True:
+        data, _ = s.recvfrom(2048)
+        loghit("port=%d payload=%s" % (port, data.decode("latin1").strip()))
+for p in (9000, 443):
+    threading.Thread(target=serve, args=(p,), daemon=True).start()
+while True:
+    time.sleep(3600)
+'''
+    machine.succeed("cat > /tmp/udp-sink.py << 'PY_EOF'\n" + udp_sink + "\nPY_EOF")
+    machine.succeed("systemd-run --unit=udp-sink --collect python3 /tmp/udp-sink.py")
+    machine.wait_until_succeeds("grep -q 'listen 9000' /tmp/udp-hits.log", timeout=10)
+    machine.wait_until_succeeds("grep -q 'listen 443' /tmp/udp-hits.log", timeout=10)
+
+    # Guest-side single-datagram send via bash /dev/udp (same bash feature the
+    # TCP probes use). The guest never sees the host-side drop, so this always
+    # succeeds in the guest; the host hit log is the ground truth.
+    def guest_udp(ip, port, marker):
+        cmd = f"bash -c 'echo {marker} >/dev/udp/{ip}/{port}'"
+        machine.succeed(as_user("cogbox ssh --name work " + shlex.quote(cmd)))
+
+    def sink_has(marker):
+        rc, _ = machine.execute(f"grep -q 'payload={marker}$' /tmp/udp-hits.log")
+        return rc == 0
+
+    # Pure-L4 UDP: one IP allowed, the sibling default-denied. No L7 rules, so
+    # no funnel is rendered -- this isolates the plain UDP CIDR path.
+    machine.succeed(as_user("printf '' | cogbox l7 set --name work"))
+    machine.succeed(as_user("printf 'allow 10.99.0.1/32\\n' | cogbox rules set --name work"))
+    boot_and_wait("cc-work", "--name work", ssh_port=2223)
+
+    # Allowed IP: the datagram reaches the sink. (Truncate first so the earlier
+    # `listen` markers don't interfere with payload greps.)
+    machine.succeed("truncate -s 0 /tmp/udp-hits.log")
+    guest_udp("10.99.0.1", 9000, "udp-allowed")
+    machine.wait_until_succeeds("grep -q 'payload=udp-allowed$' /tmp/udp-hits.log", timeout=15)
+
+    # Denied IP: the shim drops the send. Use a tracer to a DIFFERENT allowed
+    # target -- once the tracer (sent AFTER) lands, the pipeline has flushed,
+    # so a still-absent denied marker proves a real drop, not a slow packet.
+    guest_udp("10.99.0.2", 9000, "udp-denied")
+    guest_udp("10.99.0.2", 9000, "udp-denied")
+    guest_udp("10.99.0.1", 9000, "udp-tracer1")
+    machine.wait_until_succeeds("grep -q 'payload=udp-tracer1$' /tmp/udp-hits.log", timeout=15)
+    assert not sink_has("udp-denied"), "UDP to a default-denied IP must be dropped by the shim"
+
+    # QUIC fail-closed: hot-enable L7 (adds the funnel + `deny udp .../443,:80`
+    # + `deny udp ::/0`). The origin IP stays L4-allowed, so the ONLY reason a
+    # UDP/443 datagram is dropped is the funnel's QUIC deny -- while general UDP
+    # egress (port 9000) to the same allowed IP still works.
+    machine.succeed(as_user("cogbox l7 add allow vhost-a.test --name work"))
+    l7nf = machine.succeed("cat /run/user/1000/cogbox-work/netfilter-rules")
+    assert "deny udp 0.0.0.0/0:443" in l7nf and "deny udp ::/0" in l7nf, l7nf
+    guest_udp("10.99.0.1", 443, "quic-denied")
+    guest_udp("10.99.0.1", 443, "quic-denied")
+    guest_udp("10.99.0.1", 9000, "udp-tracer2")
+    machine.wait_until_succeeds("grep -q 'payload=udp-tracer2$' /tmp/udp-hits.log", timeout=15)
+    assert not sink_has("quic-denied"), "UDP/443 (QUIC) must be denied while L7 is active"
+    assert sink_has("udp-tracer2"), "general UDP egress to an allowed IP must still work under L7"
+
+    stop_instance("cc-work", name="work")
+    machine.succeed("systemctl stop udp-sink")
+
+with subtest("Phase P: concurrent `cogbox start` boots exactly one VM (single-starter lock)"):
+    # The flock single-starter guard exists so two near-simultaneous starts of
+    # the same instance can't both wipe+recreate the runtime and boot two QEMUs
+    # against one overlay image (corruption). Phase J only covers the SEQUENTIAL
+    # already-running case (pid-file detected); this drives the actual race.
+    machine.succeed(as_user("cogbox init -y --network none"))  # fast, isolated boot
+
+    # Fire three starts at once; capture each one's exit code independently.
+    machine.succeed(
+        as_user(
+            "rm -f /tmp/cs*.rc; "
+            "for i in 1 2 3; do "
+            "( cogbox start --no-ssh >/tmp/cs$i.log 2>&1; echo $? >/tmp/cs$i.rc ) & "
+            "done; wait"
+        ),
+        timeout=600,
+    )
+    rcs = [int(machine.succeed(f"cat /tmp/cs{i}.rc").strip()) for i in (1, 2, 3)]
+    # At least one start must win and report success; losers abort with the
+    # already-running code (75) or, if their parent observed the winner's
+    # daemon, the generic come-up failure (70) -- never a crash or 0-from-both
+    # double boot. The decisive invariant is the QEMU count below.
+    assert rcs.count(0) >= 1, f"no start succeeded: {rcs}; logs in /tmp/cs*.log"
+    assert all(c in (0, 70, 75) for c in rcs), f"unexpected start exit codes: {rcs}"
+
+    # Single-winner: exactly ONE cogbox QEMU is running (the lock blocked the
+    # losers before they reached QEMU). A regression in the lock shows up here
+    # as 2+. Match on comm (`qemu-system`, truncated to 15 chars by the kernel)
+    # the same way Phase I does -- the cmdline is `exec -a microvm@nixos`.
+    machine.wait_until_succeeds(as_user("cogbox status"), timeout=120)
+    n = int(machine.succeed("pgrep -c qemu-system || true").strip() or "0")
+    assert n == 1, f"expected exactly one QEMU after concurrent start, found {n}"
+
+    # The winner's overlay is intact and the VM is usable. `cogbox status` only
+    # proves the daemon/QEMU is up, not that sshd is accepting yet, so wait for
+    # the guest's sshd before probing it (matches Phase J's readiness wait).
+    machine.wait_until_succeeds(
+        as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 true"), timeout=600
+    )
+    out = machine.succeed(as_user(f"ssh {SSH_OPTS} -p 2222 root@127.0.0.1 uname -n"))
+    assert "cogbox-default" in out, out
+
+    # Steady state: the held lock makes a fresh start report already-running.
+    rc, out = machine.execute(as_user("cogbox start --no-ssh 2>&1"))
+    assert rc == 75, f"expected already-running (75) once booted, got {rc}; out={out!r}"
+    stop_instance("cc-default")
