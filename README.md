@@ -231,7 +231,7 @@ While `rules` whitelists a destination *IP*, `l7` whitelists individual
 | Form | Description |
 |---|---|
 | `cogbox l7 list [-n NAME]` | List current L7 rules and the instance mode |
-| `cogbox l7 add allow\|deny HOST [--path P] [--terminate] [--at N] [-n NAME]` | Add a rule. `HOST` is an exact name, a `*.suffix` wildcard, or a bare `*`. `--path` / `--terminate` opt the host into the terminate tier (`--path` implies `--terminate`). |
+| `cogbox l7 add allow\|deny HOST [--path P] [--terminate] [--insecure-upstream] [--at N] [-n NAME]` | Add a rule. `HOST` is an exact name, a `*.suffix` wildcard, or a bare `*`. `--path` / `--terminate` / `--insecure-upstream` opt the host into the terminate tier (each implies `--terminate`). `--insecure-upstream` skips upstream cert verification for that host. |
 | `cogbox l7 del INDEX [-n NAME]` | Delete a rule by index |
 | `cogbox l7 set [-n NAME]` | Replace all rules from stdin (one `allow\|deny HOST` per line) |
 | `cogbox l7 mode passthrough\|terminate [-n NAME]` | Set the instance tier floor |
@@ -524,6 +524,26 @@ injected into the guest at boot via `fw_cfg` and assembled into
 and hands mitmproxy only a pre-vetted IP; mitmproxy mints a per-SNI leaf,
 applies the rules, and re-originates upstream TLS validated against the
 *real* system trust.
+
+**Upstream cert verification (`--insecure-upstream`).** Because the proxy
+re-originates TLS, it -- not the guest -- validates the upstream certificate
+(against the real system trust, by SNI). The guest's `curl -k` can't relax
+this: `-k` only covers the guest<->proxy leg, which is the always-valid minted
+leaf. So a terminate host whose upstream has a self-signed or name-mismatched
+cert fails with mitmproxy's `502 Bad Gateway -- Certificate verify failed`
+(common for internal services). Mark such a host `--insecure-upstream` to skip
+verification on **its** proxy<->upstream leg only -- the operator's per-host
+equivalent of `curl -k`:
+
+```sh
+cogbox l7 add allow internal.svc --insecure-upstream    # MITM, don't verify its upstream cert
+cogbox l7 add allow internal.svc --path /v1/ --insecure-upstream
+```
+
+Verification stays **on** for every other host (fail closed); the flag is a
+deliberate per-target exception. If you only need to *whitelist* a bad-cert
+host (no path/`Host` enforcement), prefer passthrough instead -- there the
+guest keeps end-to-end TLS and its own `curl -k`.
 
 Terminate caveats:
 

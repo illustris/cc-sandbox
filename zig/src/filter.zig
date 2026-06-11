@@ -643,6 +643,10 @@ pub const L7Rule = struct {
 	path_buf: [max_l7_path_len]u8 = undefined,
 	path_len: u16 = 0,
 	terminate: bool = false,
+	// Skip upstream TLS cert verification for this host in the terminate tier
+	// (the operator's per-host equivalent of `curl -k` on the proxy->upstream
+	// leg). Only meaningful for terminated hosts; implies terminate.
+	insecure_upstream: bool = false,
 
 	pub fn pathSlice(self: *const L7Rule) ?[]const u8 {
 		if (!self.has_path) return null;
@@ -709,7 +713,7 @@ pub const L7RuleSet = struct {
 		var matched_allow = false;
 		for (self.rules[0..self.len]) |r| {
 			if (!matchDnsPattern(r.host, h)) continue;
-			if (r.has_path or r.terminate) return true;
+			if (r.has_path or r.terminate or r.insecure_upstream) return true;
 			if (r.action == .allow) matched_allow = true;
 		}
 		return self.mode_terminate and matched_allow;
@@ -741,10 +745,11 @@ pub const L7Line = union(enum) {
 
 /// Parse a single `l7-rules` line:
 ///   mode passthrough|terminate
-///   allow|deny  <host-pattern>  [<path>]  [terminate]
+///   allow|deny  <host-pattern>  [<path>]  [terminate]  [insecure]
 /// Tokens are whitespace-separated. A token starting with `/` is the path;
-/// the literal token `terminate` sets the flag. Order of the trailing tokens
-/// is not significant. Malformed lines return `.none` (dropped, fail-closed).
+/// the literal token `terminate` sets the flag; `insecure` skips upstream
+/// cert verification (terminate tier only). Order of the trailing tokens is
+/// not significant. Malformed lines return `.none` (dropped, fail-closed).
 pub fn parseL7Line(line: []const u8) L7Line {
 	const trimmed = std.mem.trim(u8, line, " \t\r\n");
 	if (trimmed.len == 0 or trimmed[0] == '#') return .none;
@@ -775,6 +780,8 @@ pub fn parseL7Line(line: []const u8) L7Line {
 	while (it.next()) |tok| {
 		if (std.mem.eql(u8, tok, "terminate")) {
 			rule.terminate = true;
+		} else if (std.mem.eql(u8, tok, "insecure")) {
+			rule.insecure_upstream = true;
 		} else if (tok.len > 0 and tok[0] == '/') {
 			if (rule.has_path) return .none; // duplicate path
 			if (tok.len > max_l7_path_len) return .none;
@@ -1323,4 +1330,26 @@ test "parseL7Line rejects malformed" {
 	try std.testing.expect(r == .rule);
 	try std.testing.expect(r.rule.terminate);
 	try std.testing.expectEqualStrings("/p/", r.rule.pathSlice().?);
+}
+
+test "parseL7Line insecure token + needsTerminate" {
+	// `insecure` parses, is order-independent, and on its own implies the
+	// terminate tier (it only governs the proxy<->upstream TLS leg).
+	const r = parseL7Line("allow internal.svc insecure");
+	try std.testing.expect(r == .rule);
+	try std.testing.expect(r.rule.insecure_upstream);
+	try std.testing.expect(!r.rule.has_path);
+
+	const r2 = parseL7Line("allow internal.svc /api/ insecure terminate");
+	try std.testing.expect(r2 == .rule);
+	try std.testing.expect(r2.rule.insecure_upstream);
+	try std.testing.expect(r2.rule.terminate);
+	try std.testing.expectEqualStrings("/api/", r2.rule.pathSlice().?);
+
+	// a host whose only flag is `insecure` (no path, no explicit terminate)
+	// is still routed through the terminating tier.
+	var rs: L7RuleSet = undefined;
+	parseL7Rules("allow internal.svc insecure", &rs);
+	try std.testing.expect(rs.needsTerminate("internal.svc"));
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("internal.svc", null));
 }

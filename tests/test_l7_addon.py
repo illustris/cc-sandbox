@@ -58,12 +58,30 @@ class _R:
         self.mode_terminate = mode_terminate
 
 
-rs = _R([("allow", "api.example.com", "/v1/"), ("allow", "plain.test", None), ("deny", "*", None)])
+rs = _R([
+    ("allow", "api.example.com", "/v1/", False),
+    ("allow", "plain.test", None, False),
+    ("deny", "*", None, False),
+])
 check(m.evaluate(rs, "api.example.com", "/v1/x") == "allow", "path allow")
 check(m.evaluate(rs, "api.example.com", "/v2/x") == "deny", "path deny")
 check(m.evaluate(rs, "plain.test", "/anything") == "allow", "host allow")
 check(m.evaluate(rs, "other.test", "/") == "deny", "default deny via catch-all")
-check(m.evaluate(_R([("allow", "only.test", None)]), "x.test", "/") == "deny", "default deny")
+check(m.evaluate(_R([("allow", "only.test", None, False)]), "x.test", "/") == "deny", "default deny")
+
+# host_insecure: only allow-rules flagged insecure match; host-level (path-independent)
+ri = _R([
+    ("allow", "internal.svc", "/api/", True),
+    ("allow", "secure.svc", None, False),
+    ("deny", "nope.svc", None, True),
+    ("allow", "*.lab.test", None, True),
+])
+check(m.host_insecure(ri, "internal.svc"), "insecure host flagged")
+check(m.host_insecure(ri, "internal.svc."), "insecure host flagged (trailing dot)")
+check(not m.host_insecure(ri, "secure.svc"), "non-insecure host not flagged")
+check(not m.host_insecure(ri, "nope.svc"), "deny rule never insecure-allows")
+check(not m.host_insecure(ri, "unlisted.svc"), "unlisted host not insecure")
+check(m.host_insecure(ri, "box.lab.test"), "insecure wildcard host")
 
 if fails:
     print("FAIL:", *fails, sep="\n  ")

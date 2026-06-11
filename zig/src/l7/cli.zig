@@ -24,6 +24,7 @@ pub const AddArgs = struct {
 	pos: ?usize = null, // 1-based; null = append
 	path: ?[]const u8 = null, // URL path prefix; implies terminate
 	terminate: bool = false, // route this host through the terminate tier
+	insecure: bool = false, // skip upstream cert verification; implies terminate
 };
 
 pub const DelArgs = struct {
@@ -102,6 +103,7 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 	var pos: ?usize = null;
 	var path: ?[]const u8 = null;
 	var terminate = false;
+	var insecure = false;
 
 	var i: usize = 2;
 	while (i < args.len) : (i += 1) {
@@ -117,19 +119,22 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 			if (path.?.len == 0 or path.?[0] != '/') return error.InvalidArgs;
 		} else if (std.mem.eql(u8, args[i], "--terminate")) {
 			terminate = true;
+		} else if (std.mem.eql(u8, args[i], "--insecure-upstream")) {
+			insecure = true;
 		} else {
 			return error.InvalidArgs;
 		}
 	}
 
-	// A path constraint is only enforceable on a terminated stream, so it
-	// implies terminate.
-	if (path != null) terminate = true;
+	// A path constraint is only enforceable on a terminated stream, and
+	// skipping upstream cert verification only makes sense when we terminate
+	// (it governs the proxy<->upstream TLS leg); both imply terminate.
+	if (path != null or insecure) terminate = true;
 
 	return .{
 		.config_path = cfg,
 		.runtime_path = rt,
-		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate } },
+		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate, .insecure = insecure } },
 	};
 }
 
@@ -204,6 +209,20 @@ test "add --path implies terminate" {
 test "add --terminate without path" {
 	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "api.test", "--terminate" });
 	try t.expect(a.cmd.add.path == null);
+	try t.expect(a.cmd.add.terminate);
+}
+
+test "add --insecure-upstream implies terminate" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "internal.svc", "--insecure-upstream" });
+	try t.expect(a.cmd.add.insecure);
+	try t.expect(a.cmd.add.terminate);
+	try t.expect(a.cmd.add.path == null);
+}
+
+test "add --insecure-upstream composes with --path" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "internal.svc", "--path", "/api/", "--insecure-upstream" });
+	try t.expectEqualStrings("/api/", a.cmd.add.path.?);
+	try t.expect(a.cmd.add.insecure);
 	try t.expect(a.cmd.add.terminate);
 }
 

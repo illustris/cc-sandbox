@@ -118,7 +118,15 @@ fn cmdList(allocator: std.mem.Allocator, io: std.Io, l7: std.json.Value, rules_a
 		if (r.object.get("terminate")) |tv| {
 			if (tv == .bool and tv.bool) is_terminate = true;
 		}
+		var is_insecure = false;
+		if (r.object.get("insecure_upstream")) |iv| {
+			if (iv == .bool and iv.bool) {
+				is_insecure = true;
+				is_terminate = true; // insecure-upstream only applies under terminate
+			}
+		}
 		if (is_terminate) try out.appendSlice(allocator, " [terminate]");
+		if (is_insecure) try out.appendSlice(allocator, " [insecure]");
 		if (rule.ruleComment(r.object)) |co| {
 			try out.appendSlice(allocator, "  # ");
 			try out.appendSlice(allocator, co);
@@ -139,13 +147,13 @@ fn cmdAdd(
 ) !void {
 	const tree_alloc = loaded.treeAllocator();
 	if (a.pos) |p| {
-		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, a.path, a.terminate) catch |err| switch (err) {
+		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, a.path, a.terminate, a.insecure) catch |err| switch (err) {
 			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
 			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
 			else => return err,
 		};
 	} else {
-		_ = rule.append(tree_alloc, rules_arr, a.action, a.host, a.path, a.terminate) catch |err| switch (err) {
+		_ = rule.append(tree_alloc, rules_arr, a.action, a.host, a.path, a.terminate, a.insecure) catch |err| switch (err) {
 			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
 			else => return err,
 		};
@@ -156,13 +164,15 @@ fn cmdAdd(
 		.allow => "allow",
 		.deny => "deny",
 	};
-	const suffix = if (a.path) |p|
-		try std.fmt.allocPrint(allocator, " {s} [terminate]", .{p})
-	else if (a.terminate)
-		try allocator.dupe(u8, " [terminate]")
-	else
-		try allocator.dupe(u8, "");
-	defer allocator.free(suffix);
+	var suffix_buf: std.ArrayList(u8) = .empty;
+	defer suffix_buf.deinit(allocator);
+	if (a.path) |p| {
+		try suffix_buf.append(allocator, ' ');
+		try suffix_buf.appendSlice(allocator, p);
+	}
+	if (a.terminate) try suffix_buf.appendSlice(allocator, " [terminate]");
+	if (a.insecure) try suffix_buf.appendSlice(allocator, " [insecure]");
+	const suffix = suffix_buf.items;
 	if (a.pos) |p| {
 		try announce(allocator, io, "Added: {s} {s}{s} at position {d}", .{ action_str, a.host, suffix, p });
 	} else {

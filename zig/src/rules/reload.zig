@@ -95,7 +95,7 @@ pub fn renderRules(allocator: std.mem.Allocator, network: std.json.Value, out: *
 
 /// Render `.network.l7` to the proxy's `l7-rules` wire format. Pure -- no I/O.
 ///   mode passthrough|terminate
-///   allow|deny  <host>  [<path>]  [terminate]
+///   allow|deny  <host>  [<path>]  [terminate]  [insecure]
 pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std.ArrayList(u8)) !void {
 	if (network != .object) return;
 	const l7 = network.object.getPtr("l7") orelse return;
@@ -134,6 +134,9 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 		}
 		if (r.object.getPtr("terminate")) |tv| {
 			if (tv.* == .bool and tv.bool) try out.appendSlice(allocator, " terminate");
+		}
+		if (r.object.getPtr("insecure_upstream")) |iv| {
+			if (iv.* == .bool and iv.bool) try out.appendSlice(allocator, " insecure");
 		}
 		try out.append(allocator, '\n');
 	}
@@ -202,4 +205,38 @@ fn signalPidfile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const 
 	std.posix.kill(pid, sig_zero) catch return false;
 	std.posix.kill(pid, sig) catch return false;
 	return true;
+}
+
+test "renderL7 wire format incl. insecure token" {
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"l7":{"mode":"terminate","rules":[
+		\\  {"allow":"plain.test"},
+		\\  {"allow":"api.test","path":"/v1/"},
+		\\  {"allow":"internal.svc","terminate":true,"insecure_upstream":true},
+		\\  {"allow":"lab.svc","path":"/api/","insecure_upstream":true}
+		\\]}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, parsed.value, &out);
+	const s = out.items;
+
+	const has = struct {
+		fn f(hay: []const u8, needle: []const u8) bool {
+			return std.mem.indexOf(u8, hay, needle) != null;
+		}
+	}.f;
+	try std.testing.expect(has(s, "mode terminate\n"));
+	// insecure (no path) -> emitted after the terminate marker
+	try std.testing.expect(has(s, "allow internal.svc terminate insecure\n"));
+	// insecure + path -> path carries terminate, insecure trails
+	try std.testing.expect(has(s, "allow lab.svc /api/ insecure\n"));
+	// plain / path-only rules carry no insecure token
+	try std.testing.expect(has(s, "allow plain.test\n"));
+	try std.testing.expect(has(s, "allow api.test /v1/\n"));
+	try std.testing.expect(!has(s, "plain.test insecure"));
 }
