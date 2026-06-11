@@ -85,7 +85,10 @@ nix run github:illustris/cogbox -- list
 
 Ports are auto-assigned when an instance is first created (default starts
 at SSH 2222 / HTTP 8080; each new instance increments by one). You can
-override ports by editing the instance config.
+override ports by editing the instance config. Each instance is also assigned
+its own L7 loopback-port triple (`l7PortBase` in config.json, default 18443),
+so multiple L7-enabled instances coexist without colliding -- see
+["L7 host filtering"](#l7-host-filtering).
 
 Harness authentication and base config are shared across all instances:
 
@@ -433,6 +436,14 @@ through. Re-resolution is the point: the guest's chosen IP is discarded, so
 ```sh
 cogbox l7 add allow api.example.com        # only this vhost on its LB
 ```
+
+The proxy and its mitmproxy terminate backend bind **per-instance** loopback
+ports (a contiguous triple from each instance's `l7PortBase`: TLS funnel /
+HTTP funnel / terminate hop), so several L7-enabled instances run on one host
+without one instance's guest traffic funnelling into another's proxy. If the
+proxy can't bind its ports (a stale proxy or another process holding them),
+`cogbox start` **aborts** rather than booting a VM whose funnel can't reach
+its proxy.
 
 #### How L7 composes with L4
 

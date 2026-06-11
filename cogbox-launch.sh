@@ -258,19 +258,27 @@ next_available_ports() {
 	# not yet exist (i.e. 2222/8080 stays reserved for the default).
 	local max_ssh=2222
 	local max_http=8080
+	# Seed one triple below the canonical L7 base so the first named instance
+	# auto-assigns to 18446 (the default keeps 18443/18444/18445).
+	local max_l7=18440
 
 	if [ -d "$CONFIG_DIR/instances" ]; then
 		for cfg in "$CONFIG_DIR/instances"/*/config.json; do
 			[ -f "$cfg" ] || continue
-			local s h
+			local s h l
 			s=$(jq -r '.sshPort // 0' "$cfg")
 			h=$(jq -r '.httpPort // 0' "$cfg")
+			l=$(jq -r '.l7PortBase // 0' "$cfg")
 			[ "$s" -gt "$max_ssh" ] && max_ssh=$s
 			[ "$h" -gt "$max_http" ] && max_http=$h
+			[ "$l" -gt "$max_l7" ] && max_l7=$l
 		done
 	fi
 
-	echo "$(( max_ssh + 1 )) $(( max_http + 1 ))"
+	# Each instance gets a contiguous L7 port triple (base / base+1 / base+2 =
+	# TLS funnel / HTTP funnel / mitmproxy hop), so multiple L7 instances never
+	# share a port. Step by 3 to keep triples disjoint.
+	echo "$(( max_ssh + 1 )) $(( max_http + 1 )) $(( max_l7 + 3 ))"
 }
 
 # -- Harness state detection ---------------------------------------
@@ -460,8 +468,9 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		if [ -z "$INSTANCE_NAME" ]; then
 			INIT_SSH=2222
 			INIT_HTTP=8080
+			INIT_L7=18443
 		else
-			read -r INIT_SSH INIT_HTTP <<< "$(next_available_ports)"
+			read -r INIT_SSH INIT_HTTP INIT_L7 <<< "$(next_available_ports)"
 		fi
 		jq -n --tab \
 			--argjson vcpu "$INIT_VCPU" \
@@ -469,17 +478,19 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 			--argjson network "$NETWORK_JQ" \
 			--argjson ssh "$INIT_SSH" \
 			--argjson http "$INIT_HTTP" \
+			--argjson l7base "$INIT_L7" \
 			'{
 				vcpu: $vcpu,
 				mem: $mem,
 				sshPort: $ssh,
 				httpPort: $http,
+				l7PortBase: $l7base,
 				overlaySize: "128M",
 				storeOverlaySize: "16G",
 				bindAddr: "127.0.0.1",
 				network: $network
 			}' > "$INSTANCE_CONFIG_DIR/config.json"
-		[ -n "$INSTANCE_NAME" ] && echo "Instance \"$INSTANCE_NAME\" ports: SSH=$INIT_SSH HTTP=$INIT_HTTP"
+		[ -n "$INSTANCE_NAME" ] && echo "Instance \"$INSTANCE_NAME\" ports: SSH=$INIT_SSH HTTP=$INIT_HTTP L7=$INIT_L7"
 	fi
 
 	if [ ! -f "$INSTANCE_FLAKE_DIR/flake.nix" ]; then
@@ -591,6 +602,11 @@ VCPU="${FLAG_VCPU:-$(jq -r '.vcpu // 16' "$ACTIVE_CONFIG")}"
 MEM="${FLAG_MEM:-$(jq -r '.mem // 32768' "$ACTIVE_CONFIG")}"
 SSH_PORT=$(jq -r '.sshPort // 2222' "$ACTIVE_CONFIG")
 HTTP_PORT=$(jq -r '.httpPort // 8080' "$ACTIVE_CONFIG")
+# Per-instance L7 loopback port base (default = canonical 18443 for instances
+# created before per-instance ports existed). The proxy binds base/base+1 and
+# reaches the mitmproxy terminate backend on base+2; mirrors filter.l7PortsForBase.
+L7_BASE=$(jq -r '.l7PortBase // 18443' "$ACTIVE_CONFIG")
+L7_MITM_PORT=$(( L7_BASE + 2 ))
 OVERLAY_SIZE=$(jq -r '.overlaySize // "128M"' "$ACTIVE_CONFIG")
 STORE_OVERLAY_SIZE=$(jq -r '.storeOverlaySize // "16G"' "$ACTIVE_CONFIG")
 BIND_ADDR=$(jq -r '.bindAddr // "127.0.0.1"' "$ACTIVE_CONFIG")
@@ -818,17 +834,23 @@ wait_for_passt() {
 # path. Started for EVERY rules-mode instance (it is a cheap, idle loopback
 # listener until the funnel diverts to it), so that enabling L7 on an
 # already-running instance via `cogbox l7 add` works without a restart -- the
-# funnel hot-reloads into passt and the proxy is already listening. Failure is
-# non-fatal: a dead proxy makes the funnel remap fail closed (EHOSTUNREACH).
+# funnel hot-reloads into passt and the proxy is already listening. Failure to
+# bind is FATAL: we abort the start (per-instance ports mean a bind failure is a
+# real conflict, not a benign race), so the instance never boots with a funnel
+# that can't reach its proxy.
 start_l7proxy() {
-	@cogbox@ __l7proxy "$RUNTIME" &
+	@cogbox@ __l7proxy "$RUNTIME" "$L7_BASE" &
 	L7PROXY_PID=$!
 	echo "$L7PROXY_PID" > "$RUNTIME/l7proxy.pid"
-	# Brief liveness check: if it died immediately (e.g. port in use), warn.
+	# Brief liveness check, then FAIL CLOSED. The proxy binds this instance's
+	# per-instance loopback ports ($L7_BASE / +1); if it can't (a stale proxy
+	# or another process holds them) we abort the start rather than boot a VM
+	# whose L7 funnel points at a dead/foreign port. die() trips the cleanup
+	# trap, tearing down passt/mitmproxy/QEMU.
 	sleep 0.2
 	if ! kill -0 "$L7PROXY_PID" 2>/dev/null; then
-		echo "cogbox-launch: warning: L7 proxy failed to start; guest 80/443 will be blocked." >&2
 		L7PROXY_PID=""
+		die "L7 proxy failed to bind 127.0.0.1:${L7_BASE}/$(( L7_BASE + 1 )) -- is a stale proxy or another process holding those ports? Aborting start." 75
 	fi
 }
 
@@ -845,7 +867,7 @@ start_l7mitm() {
 	# upstream (and a deny to an unreachable upstream still returns 403 rather
 	# than dropping the client's TLS handshake).
 	COGBOX_L7_RULES="$RUNTIME/l7-rules" \
-	@mitmdump@ --mode "socks5@18444" --listen-host 127.0.0.1 \
+	@mitmdump@ --mode "socks5@${L7_MITM_PORT}" --listen-host 127.0.0.1 \
 		--set confdir="$ca_dir" --set http2=false --set connection_strategy=lazy \
 		-s "@l7addon@" -q &
 	L7MITM_PID=$!

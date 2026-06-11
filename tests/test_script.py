@@ -606,9 +606,18 @@ serve(80, handle_http)
 
     boot_and_wait("cc-work", "--name work", ssh_port=2223)
 
+    # `work` is a NAMED instance, so it got an allocated per-instance L7 port
+    # base (not the canonical 18443 the default keeps). Derive the expected
+    # funnel ports from its config rather than hardcoding the allocation order.
+    work_base = int(machine.succeed(
+        "jq -r '.l7PortBase' /home/testuser/.config/cogbox/instances/work/config.json"
+    ).strip())
+    work_tls, work_http = work_base, work_base + 1
+    assert work_base >= 18446, f"named instance should allocate above the default's 18443: {work_base}"
+
     nf = machine.succeed("cat /run/user/1000/cogbox-work/netfilter-rules")
-    assert "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443" in nf, nf
-    assert "remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:18081" in nf, nf
+    assert f"remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:{work_tls}" in nf, nf
+    assert f"remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:{work_http}" in nf, nf
     assert "deny udp 0.0.0.0/0:443" in nf, nf
     assert "deny tcp ::/0" in nf, nf
     l7r = machine.succeed("cat /run/user/1000/cogbox-work/l7-rules")
@@ -655,7 +664,7 @@ serve(80, handle_http)
     out = machine.succeed(as_user("cogbox l7 add allow vhost-b.test --name work"))
     assert "Rules reloaded" in out, out
     nf2 = machine.succeed("cat /run/user/1000/cogbox-work/netfilter-rules")
-    assert "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443" in nf2, nf2
+    assert f"remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:{work_tls}" in nf2, nf2
     rc, out = gcurl("--resolve vhost-b.test:443:203.0.113.5 https://vhost-b.test/")
     assert rc == 0 and out.strip().endswith("200"), f"vhost-b should now be allowed rc={rc} out={out!r}"
 
@@ -700,7 +709,7 @@ with subtest("Phase L: L7 terminate tier (CA injection + Host/path enforcement)"
     machine.succeed(f"test -f {rt}/l7mitm.pid && kill -0 $(cat {rt}/l7mitm.pid)")
     # netfilter-rules still funnels (terminate is a superset of L7 active).
     nf = machine.succeed(f"cat {rt}/netfilter-rules")
-    assert "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443" in nf, nf
+    assert f"remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:{work_tls}" in nf, nf
     # l7-rules carries the terminate marker.
     l7r = machine.succeed(f"cat {rt}/l7-rules")
     assert "allow vhost-a.test /allowed/" in l7r, l7r
@@ -800,6 +809,50 @@ with subtest("Phase M: terminate --insecure-upstream skips upstream cert verific
 
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop l7-origin")
+
+with subtest("Phase N: per-instance L7 ports (isolation + fail-closed bind)"):
+    # The cross-instance bleed bug: with a single shared port, instance B's
+    # funnel pointed at instance A's proxy. Per-instance ports fix it. We prove
+    # the two mechanisms directly -- no second guest VM needed (the node only
+    # has 8G; the funnel->proxy->policy path is already covered by Phase K):
+    #   (1) the RENDERER targets each instance's own allocated base, and
+    #   (2) the PROXY binds per-instance ports and FAILS CLOSED on a conflict.
+
+    # (1) A second L7 instance renders its funnel to its OWN base, never the
+    # default's 18443 nor work's base.
+    machine.succeed(as_user("cogbox init -y --name work2 --network rules"))
+    machine.succeed(as_user("cogbox l7 add allow vhost-b.test --name work2"))
+    w2cfg = "/home/testuser/.config/cogbox/instances/work2/config.json"
+    w2_base = int(machine.succeed(f"jq -r '.l7PortBase' {w2cfg}").strip())
+    assert w2_base >= 18446 and w2_base != work_base, \
+        f"work2 base {w2_base} must be distinct + allocated (work={work_base})"
+    # Runtime dir must be owned by testuser -- the renderer runs as_user and
+    # writes netfilter-rules into it.
+    machine.succeed(as_user("mkdir -p /run/user/1000/cogbox-work2"))
+    machine.succeed(as_user(f"cogbox __render-rules {w2cfg} /run/user/1000/cogbox-work2"))
+    nf2 = machine.succeed("cat /run/user/1000/cogbox-work2/netfilter-rules")
+    assert f"127.0.0.1:{w2_base}" in nf2, nf2
+    assert "127.0.0.1:18443" not in nf2 and f"127.0.0.1:{work_base}" not in nf2, \
+        f"work2 funnel must not target the default's or work's port: {nf2!r}"
+
+    # (2) The L7 proxy is a host binary that binds base/base+1. Two proxies on
+    # DISTINCT bases coexist; a third on a TAKEN base fails closed (the old bug
+    # would silently share the port and bleed policy across instances).
+    machine.succeed(as_user("mkdir -p /tmp/pna /tmp/pnb /tmp/pnc"))
+    a, b = 19443, 19446
+    pa = machine.succeed(as_user(
+        f"setsid cogbox __l7proxy /tmp/pna {a} >/tmp/pna.log 2>&1 & echo $!")).strip()
+    pb = machine.succeed(as_user(
+        f"setsid cogbox __l7proxy /tmp/pnb {b} >/tmp/pnb.log 2>&1 & echo $!")).strip()
+    machine.wait_until_succeeds(f"ss -tln | grep -q '127.0.0.1:{a} '", timeout=10)
+    machine.wait_until_succeeds(f"ss -tln | grep -q '127.0.0.1:{b} '", timeout=10)
+    # both HTTP listeners (base+1) up too
+    machine.succeed(f"ss -tln | grep -q '127.0.0.1:{a + 1} '")
+    machine.succeed(f"ss -tln | grep -q '127.0.0.1:{b + 1} '")
+    # A third proxy on a taken base must exit non-zero (fail-closed bind).
+    rc, _ = machine.execute(as_user(f"cogbox __l7proxy /tmp/pnc {a}"))
+    assert rc != 0, "proxy on a taken port must fail closed, not silently share it"
+    machine.succeed(f"kill {pa} {pb} 2>/dev/null || true")
 
 with subtest("Phase G: CLI parser regressions and stub-friendly verbs"):
     # cogbox writes errors to stderr; the test driver's machine.execute()

@@ -3,6 +3,22 @@ pub const cli = @import("cli.zig");
 pub const config = @import("config.zig");
 pub const rule = @import("rule.zig");
 pub const reload = @import("reload.zig");
+const filter = @import("filter");
+
+/// The instance's L7 port base from config.json (`l7PortBase`), defaulting to
+/// the canonical base. The funnel remap targets, the proxy's listeners, and
+/// the mitmproxy hop all derive from this base (base / base+1 / base+2), so
+/// multiple L7-enabled instances coexist without colliding on a shared port.
+fn l7Base(loaded: *config.Loaded) u16 {
+	const root = loaded.root().*;
+	if (root == .object) {
+		if (root.object.get("l7PortBase")) |v| {
+			// Cap so base+2 stays a valid port.
+			if (v == .integer and v.integer > 0 and v.integer <= 65533) return @intCast(v.integer);
+		}
+	}
+	return filter.l7_default_base;
+}
 
 /// Entry point for the rules verb. The new top-level cogbox CLI parses
 /// `--name` itself and constructs `--config`/`--runtime` from the active
@@ -67,7 +83,7 @@ pub fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []con
 	std.Io.Dir.cwd().access(io, pid_path, .{}) catch return;
 
 	const net = try loaded.network();
-	try reload.writeRuntimeRules(allocator, io, runtime_path, net.*);
+	try reload.writeRuntimeRules(allocator, io, runtime_path, net.*, l7Base(loaded));
 	try reload.writeL7Rules(allocator, io, runtime_path, net.*);
 	const sent = try reload.maybeSignalPasst(allocator, io, runtime_path);
 	_ = try reload.maybeSignalL7proxy(allocator, io, runtime_path);
@@ -81,13 +97,14 @@ pub fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []con
 pub fn renderFiles(allocator: std.mem.Allocator, io: std.Io, config_path: []const u8, runtime_path: []const u8) !void {
 	var loaded = try config.load(allocator, io, config_path);
 	defer loaded.deinit();
+	const base = l7Base(&loaded);
 	const net = loaded.network() catch {
 		// "full"/"none" mode carries no rules; emit empty files defensively.
-		try reload.writeRuntimeRules(allocator, io, runtime_path, .null);
+		try reload.writeRuntimeRules(allocator, io, runtime_path, .null, base);
 		try reload.writeL7Rules(allocator, io, runtime_path, .null);
 		return;
 	};
-	try reload.writeRuntimeRules(allocator, io, runtime_path, net.*);
+	try reload.writeRuntimeRules(allocator, io, runtime_path, net.*, base);
 	try reload.writeL7Rules(allocator, io, runtime_path, net.*);
 }
 

@@ -18,6 +18,7 @@ const l7_verb = @import("verbs/l7.zig");
 const run_verb = @import("verbs/run.zig");
 const rules_module = @import("rules_module");
 const l7proxy_module = @import("l7proxy_module");
+const filter_mod = @import("filter");
 const start_verb = @import("verbs/start.zig");
 const attach_verb = @import("verbs/attach_verb.zig");
 const attach = @import("attach.zig");
@@ -105,8 +106,14 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "remap")) return remap_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "l7")) return l7_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "__l7proxy")) {
-		if (rest.len < 1) util.die(allocator, io, null, exit_codes.usage, "__l7proxy requires a runtime dir", .{});
-		return l7proxy_module.run(allocator, rest[0]);
+		if (rest.len < 1) util.die(allocator, io, null, exit_codes.usage, "__l7proxy requires a runtime dir [l7-base-port]", .{});
+		// Optional L7 port base (default canonical); the launcher passes the
+		// instance's allocated base so per-instance ports don't collide.
+		const base: u16 = if (rest.len >= 2)
+			std.fmt.parseInt(u16, rest[1], 10) catch filter_mod.l7_default_base
+		else
+			filter_mod.l7_default_base;
+		return l7proxy_module.run(allocator, rest[0], base);
 	}
 	if (std.mem.eql(u8, verb, "__render-rules")) {
 		if (rest.len < 2) util.die(allocator, io, null, exit_codes.usage, "__render-rules requires <config> <runtime>", .{});

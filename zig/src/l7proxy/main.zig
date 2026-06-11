@@ -59,6 +59,10 @@ const max_conns: usize = 512;
 var runtime_dir_buf: [4096]u8 = undefined;
 var runtime_dir_len: usize = 0;
 
+// Loopback port of this instance's mitmproxy terminate backend (base + 2),
+// set in run() from the instance's L7 port base.
+var mitm_port: u16 = filter.l7_default_base + 2;
+
 // Tiny test-and-set spinlock guarding the two rulesets. Critical sections are
 // microsecond-short memory scans; reloads (the only writer, in the accept
 // thread) are rare, so spinning is cheaper than a futex.
@@ -76,7 +80,7 @@ fn unlockRules() void {
 var reload_pending = std.atomic.Value(bool).init(false);
 var conn_count = std.atomic.Value(usize).init(0);
 
-pub fn run(_: std.mem.Allocator, runtime_dir: []const u8) !void {
+pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16) !void {
 	if (runtime_dir.len >= runtime_dir_buf.len) return error.PathTooLong;
 	@memcpy(runtime_dir_buf[0..runtime_dir.len], runtime_dir);
 	runtime_dir_len = runtime_dir.len;
@@ -84,10 +88,17 @@ pub fn run(_: std.mem.Allocator, runtime_dir: []const u8) !void {
 	installSignals();
 	loadRules();
 
-	const tls_fd = try listenLoopback(filter.l7_tls_port);
-	const http_fd = try listenLoopback(filter.l7_http_port);
+	// Per-instance loopback ports (base / base+1 / base+2). Binding is
+	// fail-closed: if a port is already taken (e.g. another instance picked
+	// the same base, or a stale proxy), listenLoopback returns error.Bind and
+	// the process exits non-zero -- the launcher treats that as a hard failure
+	// and aborts the start rather than leaving the funnel pointed elsewhere.
+	const ports = filter.l7PortsForBase(l7_base);
+	mitm_port = ports.mitm;
+	const tls_fd = try listenLoopback(ports.tls);
+	const http_fd = try listenLoopback(ports.http);
 
-	logLine("l7proxy: listening on 127.0.0.1:{d} (tls) and :{d} (http)", .{ filter.l7_tls_port, filter.l7_http_port });
+	logLine("l7proxy: listening on 127.0.0.1:{d} (tls) :{d} (http); terminate backend :{d}", .{ ports.tls, ports.http, ports.mitm });
 
 	const th = try std.Thread.spawn(.{}, acceptLoop, .{http_fd});
 	th.detach();
@@ -271,7 +282,7 @@ fn terminateHandoff(client_fd: c_int, host: []const u8, orig: Orig, buffered: []
 		return;
 	};
 
-	const mfd = connectLoopback(filter.l7_terminate_port) orelse {
+	const mfd = connectLoopback(mitm_port) orelse {
 		logReject(orig, host, "terminate-backend-down");
 		return;
 	};

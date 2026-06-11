@@ -626,15 +626,32 @@ pub fn parseRules(content: []const u8) RuleSet {
 pub const max_l7_rules = 128;
 pub const max_l7_path_len = 256;
 
-// Fixed loopback ports the L7 proxy listens on, and the funnel remap targets.
-// Single source of truth shared by the proxy, the rules renderer, and the
-// launch script. 18080 is intentionally avoided (the test SOCKS5 stub uses it).
-pub const l7_tls_port: u16 = 18443;
-pub const l7_http_port: u16 = 18081;
-// Loopback port of the terminate-tier backend (mitmproxy, socks5 mode). The
-// Zig proxy hands vetted terminate-host connections here. Kept behind one
-// constant so a future in-process (OpenSSL) terminator can take the same port.
-pub const l7_terminate_port: u16 = 18444;
+// Loopback ports the L7 proxy listens on, and the funnel remap targets.
+// PER-INSTANCE: each instance is assigned a contiguous triple derived from a
+// base port (`l7PortBase` in config.json, default `l7_default_base`), so
+// multiple L7-enabled instances coexist on one host without colliding on a
+// shared port (which would funnel one instance's guest traffic into another
+// instance's proxy -- a cross-instance policy bleed). The renderer, the proxy
+// and the launch script all derive the same triple from the base:
+//
+//   tls  = base       (HTTPS funnel listener / remap target for :443)
+//   http = base + 1    (HTTP funnel listener / remap target for :80)
+//   mitm = base + 2    (proxy -> mitmproxy terminate-backend SOCKS5 hop)
+//
+// 18080 is intentionally avoided as a base (the test SOCKS5 stub uses it).
+// The default instance keeps the canonical base; named instances allocate
+// above it in steps of 3. The mitm slot is the swappable seam a future
+// in-process (OpenSSL) terminator can take.
+pub const l7_default_base: u16 = 18443;
+
+pub const L7Ports = struct { tls: u16, http: u16, mitm: u16 };
+
+/// The contiguous loopback-port triple for the instance whose L7 base is
+/// `base`. Single source of truth for the renderer and the proxy (the bash
+/// launcher mirrors `base + 2` for the mitmproxy invocation).
+pub fn l7PortsForBase(base: u16) L7Ports {
+	return .{ .tls = base, .http = base +| 1, .mitm = base +| 2 };
+}
 
 pub const L7Rule = struct {
 	action: Action,
@@ -1305,6 +1322,18 @@ test "L7 deny-path rule does not fail closed for other paths" {
 	, &rs);
 	try std.testing.expectEqual(L7Verdict.deny, rs.evaluate("api.example.com", "/admin/panel"));
 	try std.testing.expectEqual(L7Verdict.no_match, rs.evaluate("api.example.com", "/public/"));
+}
+
+test "l7PortsForBase: contiguous triple, no cross-instance overlap" {
+	const a = l7PortsForBase(l7_default_base); // default instance
+	try std.testing.expectEqual(@as(u16, 18443), a.tls);
+	try std.testing.expectEqual(@as(u16, 18444), a.http);
+	try std.testing.expectEqual(@as(u16, 18445), a.mitm);
+	// next instance's base is +3, so its triple is disjoint from the default's
+	const b = l7PortsForBase(l7_default_base + 3);
+	try std.testing.expectEqual(@as(u16, 18446), b.tls);
+	try std.testing.expectEqual(@as(u16, 18448), b.mitm);
+	try std.testing.expect(b.tls > a.mitm); // no overlap
 }
 
 test "L7 mode terminate floor applies to matched allow hosts only" {

@@ -32,7 +32,7 @@ pub fn l7Active(network: std.json.Value) bool {
 ///   - guest UDP/443 + UDP/80 (QUIC / HTTP-3) is denied, forcing a downgrade
 ///     to inspectable TCP;
 ///   - guest TCP/443 + TCP/80 is remapped to the proxy (remap-implies-allow).
-pub fn renderRules(allocator: std.mem.Allocator, network: std.json.Value, out: *std.ArrayList(u8)) !void {
+pub fn renderRules(allocator: std.mem.Allocator, network: std.json.Value, l7_base: u16, out: *std.ArrayList(u8)) !void {
 	if (network != .object) return;
 	const l7 = l7Active(network);
 
@@ -85,10 +85,13 @@ pub fn renderRules(allocator: std.mem.Allocator, network: std.json.Value, out: *
 	if (l7) {
 		// Funnel remaps LAST so a power user's explicit per-host remap above
 		// wins by first-match and can deliberately route around the proxy.
+		// Targets are this instance's per-instance loopback ports so multiple
+		// L7 instances coexist without funnelling into each other's proxy.
+		const ports = filter.l7PortsForBase(l7_base);
 		var buf: [96]u8 = undefined;
-		const tls_line = try std.fmt.bufPrint(&buf, "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:{d}\n", .{filter.l7_tls_port});
+		const tls_line = try std.fmt.bufPrint(&buf, "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:{d}\n", .{ports.tls});
 		try out.appendSlice(allocator, tls_line);
-		const http_line = try std.fmt.bufPrint(&buf, "remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:{d}\n", .{filter.l7_http_port});
+		const http_line = try std.fmt.bufPrint(&buf, "remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:{d}\n", .{ports.http});
 		try out.appendSlice(allocator, http_line);
 	}
 }
@@ -142,10 +145,10 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 	}
 }
 
-pub fn writeRuntimeRules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, network: std.json.Value) !void {
+pub fn writeRuntimeRules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, network: std.json.Value, l7_base: u16) !void {
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
-	try renderRules(allocator, network, &out);
+	try renderRules(allocator, network, l7_base, &out);
 	try writeRuntimeFile(allocator, io, runtime_dir, "netfilter-rules", out.items);
 }
 
@@ -239,4 +242,21 @@ test "renderL7 wire format incl. insecure token" {
 	try std.testing.expect(has(s, "allow plain.test\n"));
 	try std.testing.expect(has(s, "allow api.test /v1/\n"));
 	try std.testing.expect(!has(s, "plain.test insecure"));
+}
+
+test "renderRules funnel targets the per-instance base ports" {
+	const gpa = std.testing.allocator;
+	const src = "{\"l7\":{\"mode\":\"passthrough\",\"rules\":[{\"allow\":\"x.test\"}]}}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	// A named instance's base (default keeps 18443); funnel must target it.
+	try renderRules(gpa, parsed.value, 18446, &out);
+	const s = out.items;
+	try std.testing.expect(std.mem.indexOf(u8, s, "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18446\n") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:18447\n") != null);
+	// this instance's render never mentions the default base
+	try std.testing.expect(std.mem.indexOf(u8, s, "18443") == null);
 }

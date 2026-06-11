@@ -35,11 +35,17 @@ pub fn run(
 	defer allocator.free(pid_path);
 
 	const pid = readPid(allocator, io, pid_path) catch {
-		// No pid file or unreadable: idempotent no-op.
+		// No pid file or unreadable: not running. Idempotent (exit 0), but
+		// report it so `stop` on a stopped instance isn't a silent no-op.
+		try reportNotRunning(allocator, io, name);
 		return;
 	};
 	const sig_zero: std.posix.SIG = @enumFromInt(0);
-	std.posix.kill(pid, sig_zero) catch return;
+	std.posix.kill(pid, sig_zero) catch {
+		// Stale pid file (process already gone): same -- report, exit 0.
+		try reportNotRunning(allocator, io, name);
+		return;
+	};
 
 	std.posix.kill(pid, std.posix.SIG.TERM) catch |err| {
 		util.die(allocator, io, "stop", exit_codes.software, "kill SIGTERM pid {d}: {s}", .{ pid, @errorName(err) });
@@ -61,6 +67,13 @@ pub fn run(
 	}
 
 	util.die(allocator, io, "stop", exit_codes.software, "process pid {d} did not exit within 10s. Pass --force to send SIGKILL.", .{pid});
+}
+
+fn reportNotRunning(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
+	const disp = name orelse "default";
+	const msg = try std.fmt.allocPrint(allocator, "instance '{s}' is not running\n", .{disp});
+	defer allocator.free(msg);
+	try util.writeStdout(io, msg);
 }
 
 fn nameFlag(parsed: *const parse.Parsed, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
