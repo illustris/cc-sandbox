@@ -631,6 +631,10 @@ pub const max_l7_path_len = 256;
 // launch script. 18080 is intentionally avoided (the test SOCKS5 stub uses it).
 pub const l7_tls_port: u16 = 18443;
 pub const l7_http_port: u16 = 18081;
+// Loopback port of the terminate-tier backend (mitmproxy, socks5 mode). The
+// Zig proxy hands vetted terminate-host connections here. Kept behind one
+// constant so a future in-process (OpenSSL) terminator can take the same port.
+pub const l7_terminate_port: u16 = 18444;
 
 pub const L7Rule = struct {
 	action: Action,

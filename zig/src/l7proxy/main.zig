@@ -233,8 +233,13 @@ fn worker(client_fd: c_int) void {
 	unlockRules();
 
 	if (is_tls and needs_term) {
-		// Terminate tier (path rules / Host==SNI) is Phase 2. Fail closed.
-		logReject(orig, host, "terminate-tier-unavailable");
+		// Terminate tier: re-resolve + vet here (SSRF/CIDR stays authoritative
+		// in this proxy), then hand the VETTED IP to the mitmproxy backend over
+		// SOCKS5. mitmproxy mints a per-SNI leaf from the instance CA, decrypts,
+		// and an addon enforces allow/deny + path + Host==SNI. The allow/deny
+		// decision for terminate hosts is made there (it needs the path), not
+		// here -- so we do NOT consult `action` on this branch.
+		terminateHandoff(client_fd, host, orig, buf[0..buffered]);
 		return;
 	}
 	if (verdict == .deny) {
@@ -254,6 +259,125 @@ fn worker(client_fd: c_int) void {
 
 	if (!writeAll(up_fd, buf[0..buffered])) return;
 	relay(client_fd, up_fd);
+}
+
+// --- terminate-tier handoff to the mitmproxy backend ---
+
+fn terminateHandoff(client_fd: c_int, host: []const u8, orig: Orig, buffered: []const u8) void {
+	// Pick the first re-resolved address that clears the SSRF floor + instance
+	// CIDR policy. vet-then-pin: mitmproxy connects to exactly this IP.
+	const vetted = firstVettedAddr(host, orig.port) orelse {
+		logReject(orig, host, "no-vetted-upstream");
+		return;
+	};
+
+	const mfd = connectLoopback(filter.l7_terminate_port) orelse {
+		logReject(orig, host, "terminate-backend-down");
+		return;
+	};
+	defer _ = c.close(mfd);
+	setTimeouts(mfd);
+
+	// SOCKS5 client to mitmproxy carrying the vetted IP as the CONNECT target.
+	if (!socks5ClientHandshake(mfd, vetted, orig.port)) {
+		logReject(orig, host, "terminate-socks-failed");
+		return;
+	}
+	if (!writeAll(mfd, buffered)) return;
+	relay(client_fd, mfd);
+}
+
+/// First resolved address for a terminate host, gated only by the
+/// non-overridable hard floor. Terminate hosts always matched an explicit L7
+/// `allow` (needsTerminate is true only for matched hosts), so the name allow
+/// supersedes the L4 IP deny-list -- same composition as the passthrough
+/// `dialUpstream(..., supersede_l4=true)` path. Does NOT connect (the backend does).
+fn firstVettedAddr(host: []const u8, port: u16) ?filter.IpAddr {
+	_ = port;
+	var name_z: [256]u8 = undefined;
+	if (host.len >= name_z.len) return null;
+	@memcpy(name_z[0..host.len], host);
+	name_z[host.len] = 0;
+
+	var hints: c.struct_addrinfo = std.mem.zeroes(c.struct_addrinfo);
+	hints.ai_family = c.AF_UNSPEC;
+	hints.ai_socktype = c.SOCK_STREAM;
+
+	var res: ?*c.struct_addrinfo = null;
+	if (c.getaddrinfo(@ptrCast(&name_z), null, &hints, &res) != 0) return null;
+	const list = res orelse return null;
+	defer c.freeaddrinfo(list);
+
+	var it: ?*c.struct_addrinfo = list;
+	while (it) |ai| : (it = ai.ai_next) {
+		const sa = ai.ai_addr orelse continue;
+		const ip = sockaddrToIp(sa) orelse continue;
+		if (filter.isHardBlocked(ip)) continue;
+		return ip;
+	}
+	return null;
+}
+
+fn connectLoopback(port: u16) ?c_int {
+	const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+	if (fd < 0) return null;
+	var sa: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+	sa.sin_family = c.AF_INET;
+	sa.sin_port = std.mem.nativeToBig(u16, port);
+	sa.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7f000001);
+	if (c_connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0) {
+		_ = c.close(fd);
+		return null;
+	}
+	return fd;
+}
+
+/// Minimal SOCKS5 CONNECT client (no-auth) used to reach the mitmproxy
+/// backend, carrying the vetted upstream IP as the target.
+fn socks5ClientHandshake(fd: c_int, ip: filter.IpAddr, port: u16) bool {
+	if (!writeAll(fd, &.{ 0x05, 0x01, 0x00 })) return false;
+	var sel: [2]u8 = undefined;
+	if (!readExact(fd, &sel)) return false;
+	if (sel[0] != 0x05 or sel[1] != 0x00) return false;
+
+	var req: [22]u8 = undefined;
+	req[0] = 0x05;
+	req[1] = 0x01;
+	req[2] = 0x00;
+	var n: usize = 4;
+	switch (ip) {
+		.ipv4 => |b| {
+			req[3] = 0x01;
+			@memcpy(req[4..8], &b);
+			n = 8;
+		},
+		.ipv6 => |b| {
+			req[3] = 0x04;
+			@memcpy(req[4..20], &b);
+			n = 20;
+		},
+	}
+	req[n] = @intCast((port >> 8) & 0xff);
+	req[n + 1] = @intCast(port & 0xff);
+	n += 2;
+	if (!writeAll(fd, req[0..n])) return false;
+
+	var head: [4]u8 = undefined;
+	if (!readExact(fd, &head)) return false;
+	if (head[0] != 0x05 or head[1] != 0x00) return false;
+	const tail_len: usize = switch (head[3]) {
+		0x01 => 4 + 2,
+		0x04 => 16 + 2,
+		0x03 => blk: {
+			var lb: [1]u8 = undefined;
+			if (!readExact(fd, &lb)) return false;
+			break :blk @as(usize, lb[0]) + 2;
+		},
+		else => return false,
+	};
+	var tail: [256 + 2]u8 = undefined;
+	if (tail_len > tail.len) return false;
+	return readExact(fd, tail[0..tail_len]);
 }
 
 // --- SOCKS5 server side ---

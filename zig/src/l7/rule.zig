@@ -28,7 +28,7 @@ pub fn validateHost(host: []const u8) bool {
 	return filter.parseDnsPattern(host) != null;
 }
 
-pub fn newRuleObject(allocator: std.mem.Allocator, action: Action, host: []const u8) !std.json.Value {
+pub fn newRuleObject(allocator: std.mem.Allocator, action: Action, host: []const u8, path: ?[]const u8, terminate: bool) !std.json.Value {
 	var obj: std.json.ObjectMap = .empty;
 	const action_key = try allocator.dupe(u8, switch (action) {
 		.allow => "allow",
@@ -36,20 +36,28 @@ pub fn newRuleObject(allocator: std.mem.Allocator, action: Action, host: []const
 	});
 	const host_dup = try allocator.dupe(u8, host);
 	try obj.put(allocator, action_key, .{ .string = host_dup });
+	if (path) |p| {
+		try obj.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, p) });
+	}
+	// A path implies terminate; only emit the flag when there's no path
+	// carrying the same signal, to keep the object minimal.
+	if (terminate and path == null) {
+		try obj.put(allocator, try allocator.dupe(u8, "terminate"), .{ .bool = true });
+	}
 	return .{ .object = obj };
 }
 
-pub fn append(allocator: std.mem.Allocator, arr: *std.json.Array, action: Action, host: []const u8) !usize {
+pub fn append(allocator: std.mem.Allocator, arr: *std.json.Array, action: Action, host: []const u8, path: ?[]const u8, terminate: bool) !usize {
 	if (!validateHost(host)) return error.InvalidHost;
-	const obj = try newRuleObject(allocator, action, host);
+	const obj = try newRuleObject(allocator, action, host, path, terminate);
 	try arr.append(obj);
 	return arr.items.len;
 }
 
-pub fn insertAt(allocator: std.mem.Allocator, arr: *std.json.Array, pos: usize, action: Action, host: []const u8) !void {
+pub fn insertAt(allocator: std.mem.Allocator, arr: *std.json.Array, pos: usize, action: Action, host: []const u8, path: ?[]const u8, terminate: bool) !void {
 	if (pos < 1 or pos > arr.items.len + 1) return error.IndexOutOfRange;
 	if (!validateHost(host)) return error.InvalidHost;
-	const obj = try newRuleObject(allocator, action, host);
+	const obj = try newRuleObject(allocator, action, host, path, terminate);
 	try arr.insert(pos - 1, obj);
 }
 
@@ -62,7 +70,7 @@ pub fn replaceAll(allocator: std.mem.Allocator, arr: *std.json.Array, items: []c
 	arr.clearRetainingCapacity();
 	for (items) |p| {
 		if (!validateHost(p.host)) return error.InvalidHost;
-		const obj = try newRuleObject(allocator, p.action, p.host);
+		const obj = try newRuleObject(allocator, p.action, p.host, null, false);
 		try arr.append(obj);
 	}
 }

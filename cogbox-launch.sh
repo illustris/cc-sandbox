@@ -657,6 +657,7 @@ echo "$$" > "$RUNTIME/pid"
 echo "$SSH_PORT $BIND_ADDR" > "$RUNTIME/ssh-endpoint"
 PASST_PID=""
 L7PROXY_PID=""
+L7MITM_PID=""
 QEMU_PID=""
 CLEANED=0
 # The VM is always a background daemon now, so this script's only job after
@@ -680,6 +681,7 @@ cogbox_cleanup() {
 	fi
 	[ -n "$PASST_PID" ] && kill "$PASST_PID" 2>/dev/null
 	[ -n "$L7PROXY_PID" ] && kill "$L7PROXY_PID" 2>/dev/null
+	[ -n "$L7MITM_PID" ] && kill "$L7MITM_PID" 2>/dev/null
 	rm -rf "$RUNTIME"
 	[ -n "${LOCK:-}" ] && rm -f "$LOCK"
 }
@@ -738,10 +740,19 @@ done
 # so boot output and edit output can never drift. L7_ACTIVE drives
 # whether the L7 proxy is launched below.
 L7_ACTIVE=0
+L7_TERMINATE=0
+# The fw_cfg CA device is ALWAYS present (the flake emits it unconditionally),
+# so seed an empty stub; the terminate path overwrites it with the real cert.
+: > "$RUNTIME/system-l7ca"
 if [ "$NETWORK_MODE" = "rules" ]; then
 	@cogbox@ __render-rules "$ACTIVE_CONFIG" "$RUNTIME"
 	if [ "$(jq -r '(.network.l7.rules // []) | length' "$ACTIVE_CONFIG")" -gt 0 ]; then
 		L7_ACTIVE=1
+	fi
+	# Terminate tier is needed if mode is terminate or any rule opts in
+	# (explicit terminate flag or a path constraint).
+	if [ "$(jq -r '[(.network.l7.mode == "terminate"), (.network.l7.rules[]? | (has("path") or (.terminate == true)))] | any' "$ACTIVE_CONFIG")" = "true" ]; then
+		L7_TERMINATE=1
 	fi
 fi
 
@@ -821,6 +832,43 @@ start_l7proxy() {
 	fi
 }
 
+# -- Helper: start the L7 terminate backend (mitmproxy) ------------
+# Runs mitmdump in SOCKS5 mode with a PERSISTENT per-instance CA confdir (so
+# the guest-trusted cert survives reboots) and our enforcement addon. The Zig
+# proxy hands vetted terminate-host connections here. After the CA materializes
+# we stage its CERT (never the key) into the fw_cfg slot for guest injection.
+start_l7mitm() {
+	local ca_dir="$INSTANCE_CONFIG_DIR/l7-ca"
+	mkdir -p "$ca_dir"
+	# connection_strategy=lazy: defer the upstream connection until AFTER the
+	# addon has decided, so a denied request never opens a connection to the
+	# upstream (and a deny to an unreachable upstream still returns 403 rather
+	# than dropping the client's TLS handshake).
+	COGBOX_L7_RULES="$RUNTIME/l7-rules" \
+	@mitmdump@ --mode "socks5@18444" --listen-host 127.0.0.1 \
+		--set confdir="$ca_dir" --set http2=false --set connection_strategy=lazy \
+		-s "@l7addon@" -q &
+	L7MITM_PID=$!
+	echo "$L7MITM_PID" > "$RUNTIME/l7mitm.pid"
+	# Wait for mitmproxy to generate its CA (first run) or confirm it exists.
+	for _ in $(seq 1 100); do
+		[ -s "$ca_dir/mitmproxy-ca-cert.pem" ] && break
+		kill -0 "$L7MITM_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	if ! kill -0 "$L7MITM_PID" 2>/dev/null || [ ! -s "$ca_dir/mitmproxy-ca-cert.pem" ]; then
+		echo "cogbox-launch: warning: L7 terminate backend failed to start; terminate hosts will be blocked." >&2
+		L7MITM_PID=""
+		return
+	fi
+	# Stage the CA CERT (cert only) for fw_cfg. Guard against ever leaking the
+	# private key into the guest.
+	if grep -q "PRIVATE KEY" "$ca_dir/mitmproxy-ca-cert.pem"; then
+		die "refusing to stage L7 CA: mitmproxy-ca-cert.pem contains a private key" 70
+	fi
+	cp "$ca_dir/mitmproxy-ca-cert.pem" "$RUNTIME/system-l7ca"
+}
+
 # Launch QEMU as a background child and wait for it. Backgrounding (rather
 # than a bare foreground exec) is what lets the TERM/INT traps above signal
 # QEMU so `cogbox stop` shuts the VM down cleanly.
@@ -845,6 +893,10 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
+	# Start the terminate backend first so its CA is staged into the fw_cfg
+	# slot BEFORE QEMU reads fw_cfg at launch. (Terminate hot-enable still
+	# needs a restart; passthrough does not -- see below.)
+	[ "$L7_TERMINATE" = "1" ] && start_l7mitm
 	# Always run the L7 proxy in rules mode so L7 can be enabled on a live
 	# instance without a restart (the funnel only diverts to it once a rule
 	# exists; until then it idles). L7_ACTIVE still gates whether the funnel

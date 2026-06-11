@@ -22,6 +22,8 @@ pub const AddArgs = struct {
 	action: rule.Action,
 	host: []const u8,
 	pos: ?usize = null, // 1-based; null = append
+	path: ?[]const u8 = null, // URL path prefix; implies terminate
+	terminate: bool = false, // route this host through the terminate tier
 };
 
 pub const DelArgs = struct {
@@ -98,6 +100,8 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 	const action = parseAction(args[0]) orelse return error.InvalidAction;
 	const host = args[1];
 	var pos: ?usize = null;
+	var path: ?[]const u8 = null;
+	var terminate = false;
 
 	var i: usize = 2;
 	while (i < args.len) : (i += 1) {
@@ -106,15 +110,26 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 			if (i >= args.len) return error.InvalidArgs;
 			pos = std.fmt.parseInt(usize, args[i], 10) catch return error.InvalidIndex;
 			if (pos.? == 0) return error.InvalidIndex;
+		} else if (std.mem.eql(u8, args[i], "--path")) {
+			i += 1;
+			if (i >= args.len) return error.InvalidArgs;
+			path = args[i];
+			if (path.?.len == 0 or path.?[0] != '/') return error.InvalidArgs;
+		} else if (std.mem.eql(u8, args[i], "--terminate")) {
+			terminate = true;
 		} else {
 			return error.InvalidArgs;
 		}
 	}
 
+	// A path constraint is only enforceable on a terminated stream, so it
+	// implies terminate.
+	if (path != null) terminate = true;
+
 	return .{
 		.config_path = cfg,
 		.runtime_path = rt,
-		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos } },
+		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate } },
 	};
 }
 
@@ -178,6 +193,27 @@ test "add with --at" {
 test "add rejects bad action and --at 0" {
 	try t.expectError(error.InvalidAction, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "permit", "a.test" }));
 	try t.expectError(error.InvalidIndex, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "a.test", "--at", "0" }));
+}
+
+test "add --path implies terminate" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "api.test", "--path", "/v1/" });
+	try t.expectEqualStrings("/v1/", a.cmd.add.path.?);
+	try t.expect(a.cmd.add.terminate);
+}
+
+test "add --terminate without path" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "api.test", "--terminate" });
+	try t.expect(a.cmd.add.path == null);
+	try t.expect(a.cmd.add.terminate);
+}
+
+test "add rejects malformed --path" {
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "a.test", "--path", "noslash" }));
+}
+
+test "mode terminate parses (no longer rejected at parse)" {
+	const m = try parse(&.{ "--config", "/c", "--runtime", "/r", "mode", "terminate" });
+	try t.expect(m.cmd.mode.terminate);
 }
 
 test "del + mode parse" {

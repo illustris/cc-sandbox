@@ -262,9 +262,25 @@
 				workDir = h: k: "/var/lib/harness-rw/${h}/${k}/work";
 				ephemeralSrc = h: k: "/var/lib/harness-rw/${h}/${k}";
 
+				# CA bundle the L7 terminate tier injects. cogbox-l7-trust.service
+				# assembles it at boot from the system trust store plus the
+				# per-instance MITM CA (if terminate is active); when terminate is
+				# off it is just the system bundle, so pointing tools at it
+				# unconditionally is safe.
+				l7CaBundle = "/run/cogbox/ca-bundle.crt";
+				l7CaEnv = {
+					SSL_CERT_FILE = l7CaBundle;
+					NIX_SSL_CERT_FILE = l7CaBundle;
+					CURL_CA_BUNDLE = l7CaBundle;
+					GIT_SSL_CAINFO = l7CaBundle;
+					REQUESTS_CA_BUNDLE = l7CaBundle;
+					NODE_EXTRA_CA_CERTS = l7CaBundle;
+				};
+
 				mkLauncher = h: pkgs.writeScriptBin h.launcher.name (
 					let
-						envParts = lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") h.launcher.env;
+						# CA env first so a harness can still override it.
+						envParts = lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") (l7CaEnv // h.launcher.env);
 						envStr = lib.concatStringsSep " " envParts;
 						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
 					in ''exec env ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
@@ -277,6 +293,11 @@
 					(overlayPaths ++ ephemeralPaths);
 			in {
 				nixpkgs.config.allowUnfree = true;
+
+				# Point login-shell TLS tools at the L7 CA bundle too (the
+				# harness launchers also bake these in for non-login `cogbox
+				# ssh -- c` invocations).
+				environment.variables = l7CaEnv;
 
 				services.openssh.enable = true;
 
@@ -322,7 +343,14 @@
 					] ++ lib.concatMap (p: [
 						"-fw_cfg"
 						"name=opt/${tag p.harness p.pathkey},file=${sentinel p.harness p.pathkey}"
-					]) fwCfgPaths;
+					]) fwCfgPaths ++ [
+						# System (instance-level, not per-harness) fw_cfg carrying
+						# the L7 terminate CA cert. ALWAYS emitted -- the launcher
+						# stages an empty stub when terminate is off -- so the guest
+						# image stays byte-identical regardless of L7 state.
+						"-fw_cfg"
+						"name=opt/system-l7ca,file=${runtimeDir}/system-l7ca"
+					];
 				};
 
 				# Per-fw_cfg copy services. Each one materializes a single
@@ -339,6 +367,36 @@
 						};
 					}
 				) fwCfgPaths) // {
+					# Assemble the L7 CA trust bundle: system store + the injected
+					# per-instance MITM CA (when terminate is active). Always
+					# produces ${l7CaBundle} so the CA env vars resolve even when
+					# terminate is off (then it is just the system bundle).
+					cogbox-l7-trust = {
+						description = "Assemble the L7 terminate-tier CA trust bundle";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "multi-user.target" "sshd.service" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = pkgs.writeShellScript "cogbox-l7-trust" ''
+								set -e
+								mkdir -p /run/cogbox
+								raw=/sys/firmware/qemu_fw_cfg/by_name/opt/system-l7ca/raw
+								ca=/run/cogbox/l7-ca.crt
+								bundle=${l7CaBundle}
+								sys=/etc/ssl/certs/ca-certificates.crt
+								[ -r "$sys" ] || sys=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+								: > "$ca"
+								[ -r "$raw" ] && cp "$raw" "$ca" || true
+								if [ -s "$ca" ] && grep -q "BEGIN CERTIFICATE" "$ca"; then
+									cat "$sys" "$ca" > "$bundle"
+								else
+									cp "$sys" "$bundle"
+								fi
+								chmod 0644 "$bundle"
+							'';
+						};
+					};
 					load-ssh-keys = {
 						description = "Load SSH authorized keys from shared config";
 						wantedBy = [ "multi-user.target" ];
@@ -493,6 +551,8 @@
 				chmod +w $out/bin/cogbox
 				cp ${self.packages.${system}.cogbox-tools}/lib/libnetfilter.so $out/lib/libnetfilter.so
 
+				# L7 terminate-tier enforcement addon for mitmproxy.
+				cp ${./l7-mitm-addon.py} $out/libexec/l7-mitm-addon.py
 				cp ${./cogbox-launch.sh} $out/libexec/cogbox-launch.sh
 				chmod +w $out/libexec/cogbox-launch.sh
 				substituteInPlace $out/libexec/cogbox-launch.sh \
@@ -500,6 +560,8 @@
 					--replace-fail "@runner@" "${runner'}" \
 					--replace-fail "@netfilter@" "$out/lib/libnetfilter.so" \
 					--replace-fail "@cogbox@" "$out/bin/cogbox" \
+					--replace-fail "@mitmdump@" "${pkgs.mitmproxy}/bin/mitmdump" \
+					--replace-fail "@l7addon@" "$out/libexec/l7-mitm-addon.py" \
 					--replace-fail "@flakeSource@" "${self}" \
 					--replace-fail "@nixpkgsSource@" "${nixpkgs}"
 				chmod +x $out/libexec/cogbox-launch.sh
