@@ -271,7 +271,9 @@ pub const RULES =
 	\\
 	\\Rules apply only when the instance's network mode is "rules". The
 	\\evaluator walks the list top-down and stops at the first match; an
-	\\unmatched destination is allowed.
+	\\unmatched destination is DENIED. (`cogbox init` seeds a trailing
+	\\`allow 0.0.0.0/0`, so out of the box only explicit denies bite;
+	\\remove that catch-all for a default-deny allowlist.)
 	\\
 	\\If the instance is running, edits hot-reload via SIGUSR1 to passt
 	\\(no VM restart needed).
@@ -311,18 +313,20 @@ pub const L7 =
 	\\
 	\\Usage:
 	\\  cogbox l7 [-n NAME] list
-	\\  cogbox l7 [-n NAME] add allow|deny HOST [--path P] [--terminate]
-	\\                              [--insecure-upstream] [--at N]
+	\\  cogbox l7 [-n NAME] add allow|deny HOST [--passthrough | --path P
+	\\                              | --terminate [--insecure-upstream]] [--at N]
 	\\  cogbox l7 [-n NAME] del INDEX
 	\\  cogbox l7 [-n NAME] set                  (reads HOST rules from stdin)
 	\\  cogbox l7 [-n NAME] mode passthrough|terminate
 	\\
 	\\Options:
 	\\  -n, --name NAME        Instance name (default: "default")
+	\\      --passthrough      Opt this host OUT of the terminate default: SNI-only
+	\\                         passthrough, TLS not intercepted (cert pinning kept).
+	\\                         For cert-pinned clients. (Excludes the flags below.)
 	\\      --path P           Restrict the host to URL paths under prefix P
 	\\                         (boundary-aware, e.g. /v1/; implies --terminate)
-	\\      --terminate        MITM this host's TLS via a per-instance CA so the
-	\\                         proxy can enforce Host==SNI and URL paths
+	\\      --terminate        Force MITM for this host (already the default)
 	\\      --insecure-upstream  Skip upstream cert verification for this host
 	\\                         (implies --terminate; the proxy-side equivalent of
 	\\                         curl -k, for internal self-signed/mismatched certs)
@@ -342,22 +346,26 @@ pub const L7 =
 	\\the same IP, and DNS-based load balancing keeps working. Requires the
 	\\instance's network mode to be "rules".
 	\\
-	\\Two tiers, chosen per host:
-	\\  passthrough (default)  TLS is not intercepted (cert pinning preserved);
-	\\                         the proxy trusts the SNI and cannot see URL paths.
-	\\  terminate  (--terminate / --path / `mode terminate`)  MITM via a
-	\\                         per-instance CA injected into the guest trust
-	\\                         store; enforces Host==SNI and URL path prefixes.
+	\\Two tiers. TERMINATE is the DEFAULT (per host, or `mode passthrough` to
+	\\flip an instance):
+	\\  terminate (default)  MITM via a per-instance CA injected into the guest
+	\\                       trust store; enforces Host==SNI and URL path prefixes.
+	\\                       Breaks cert-pinned clients -- use --passthrough there.
+	\\  passthrough (--passthrough)  TLS not intercepted (cert pinning preserved);
+	\\                       the proxy trusts the SNI and cannot see URL paths.
+	\\
+	\\Harness API endpoints (api.anthropic.com, api.openai.com, chatgpt.com, ...)
+	\\are auto-kept in passthrough so the in-guest agents keep working and their
+	\\tokens stay end-to-end; an explicit --terminate on such a host overrides it.
 	\\
 	\\QUIC/UDP-443 and all guest IPv6 are denied while L7 is active (clients
 	\\fall back to inspectable IPv4 TCP).
 	\\
 	\\Examples:
-	\\  cogbox l7 add allow api.example.com                  passthrough (SNI)
-	\\  cogbox l7 add allow '*.pages.example.com'
+	\\  cogbox l7 add allow api.example.com                  terminate (default)
+	\\  cogbox l7 add allow pinned.example.com --passthrough SNI-only (pinned)
 	\\  cogbox l7 add allow api.example.com --path /v1/      terminate + path
-	\\  cogbox l7 add allow internal.svc --insecure-upstream terminate, skip
-	\\                                                        upstream cert verify
+	\\  cogbox l7 add allow internal.svc --insecure-upstream skip upstream verify
 	\\  cogbox l7 add deny '*' --at 1
 	\\
 	\\If the instance is running, edits hot-reload the proxy via SIGHUP and

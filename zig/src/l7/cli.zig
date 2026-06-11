@@ -25,6 +25,7 @@ pub const AddArgs = struct {
 	path: ?[]const u8 = null, // URL path prefix; implies terminate
 	terminate: bool = false, // route this host through the terminate tier
 	insecure: bool = false, // skip upstream cert verification; implies terminate
+	passthrough: bool = false, // opt OUT of the terminate default (SNI-only)
 };
 
 pub const DelArgs = struct {
@@ -104,6 +105,7 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 	var path: ?[]const u8 = null;
 	var terminate = false;
 	var insecure = false;
+	var passthrough = false;
 
 	var i: usize = 2;
 	while (i < args.len) : (i += 1) {
@@ -121,6 +123,8 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 			terminate = true;
 		} else if (std.mem.eql(u8, args[i], "--insecure-upstream")) {
 			insecure = true;
+		} else if (std.mem.eql(u8, args[i], "--passthrough")) {
+			passthrough = true;
 		} else {
 			return error.InvalidArgs;
 		}
@@ -131,10 +135,14 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 	// (it governs the proxy<->upstream TLS leg); both imply terminate.
 	if (path != null or insecure) terminate = true;
 
+	// --passthrough is the opt-OUT of the terminate default; it can't be
+	// combined with anything that forces (or implies) terminate.
+	if (passthrough and (terminate or path != null or insecure)) return error.InvalidArgs;
+
 	return .{
 		.config_path = cfg,
 		.runtime_path = rt,
-		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate, .insecure = insecure } },
+		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate, .insecure = insecure, .passthrough = passthrough } },
 	};
 }
 
@@ -228,6 +236,16 @@ test "add --insecure-upstream composes with --path" {
 
 test "add rejects malformed --path" {
 	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "a.test", "--path", "noslash" }));
+}
+
+test "add --passthrough opts out, and rejects mixing with terminate flags" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "pinned.test", "--passthrough" });
+	try t.expect(a.cmd.add.passthrough);
+	try t.expect(!a.cmd.add.terminate);
+	// --passthrough can't be combined with anything that forces terminate
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "x.test", "--passthrough", "--terminate" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "x.test", "--passthrough", "--path", "/v1/" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "x.test", "--passthrough", "--insecure-upstream" }));
 }
 
 test "mode terminate parses (no longer rejected at parse)" {

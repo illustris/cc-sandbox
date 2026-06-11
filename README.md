@@ -234,14 +234,14 @@ While `rules` whitelists a destination *IP*, `l7` whitelists individual
 | Form | Description |
 |---|---|
 | `cogbox l7 list [-n NAME]` | List current L7 rules and the instance mode |
-| `cogbox l7 add allow\|deny HOST [--path P] [--terminate] [--insecure-upstream] [--at N] [-n NAME]` | Add a rule. `HOST` is an exact name, a `*.suffix` wildcard, or a bare `*`. `--path` / `--terminate` / `--insecure-upstream` opt the host into the terminate tier (each implies `--terminate`). `--insecure-upstream` skips upstream cert verification for that host. |
+| `cogbox l7 add allow\|deny HOST [--passthrough \| --path P \| --terminate [--insecure-upstream]] [--at N] [-n NAME]` | Add a rule. `HOST` is an exact name, a `*.suffix` wildcard, or a bare `*`. Hosts **terminate by default**; `--passthrough` opts a host out (SNI-only, for cert-pinned clients). `--path`/`--terminate` force terminate; `--insecure-upstream` skips upstream cert verification (implies terminate). |
 | `cogbox l7 del INDEX [-n NAME]` | Delete a rule by index |
 | `cogbox l7 set [-n NAME]` | Replace all rules from stdin (one `allow\|deny HOST` per line) |
-| `cogbox l7 mode passthrough\|terminate [-n NAME]` | Set the instance tier floor |
+| `cogbox l7 mode passthrough\|terminate [-n NAME]` | Set the instance default tier (terminate if unset) |
 
 ```sh
-cogbox l7 add allow api.example.com                       # passthrough (SNI)
-cogbox l7 add allow '*.pages.example.com'
+cogbox l7 add allow api.example.com                       # terminate (default)
+cogbox l7 add allow pinned.example.com --passthrough      # SNI-only (cert pinned)
 cogbox l7 add allow api.example.com --path /v1/           # terminate + path
 ```
 
@@ -491,14 +491,25 @@ to L4 and is allowed; block the IP (or `l7 add deny sibling`) to restrict it.
 > Exact-name allows have no such exposure (you control that name's DNS); only
 > wildcard a suffix whose DNS you trust.
 
-There are two tiers, chosen per host:
+There are two tiers, chosen per host. **Terminate is the default**:
 
-- **Passthrough (default)** -- TLS is *not* intercepted, so cert pinning is
-  preserved, but the proxy trusts the SNI it sees. A shared ingress that
-  routes by the inner `Host:`/HTTP-2 `:authority` could still be steered to a
-  sibling on a single connection, and URL paths can't be inspected on HTTPS.
-- **Terminate** (opt-in via `--terminate`/`--path`, or `l7 mode terminate`) --
-  see ["L7 terminate tier"](#l7-terminate-tier).
+- **Terminate (default)** -- the proxy MITMs the host's TLS via a per-instance
+  CA so it can enforce `Host == SNI` and URL paths -- see
+  ["L7 terminate tier"](#l7-terminate-tier). This breaks cert-pinned clients,
+  so opt those out with `--passthrough`.
+- **Passthrough** (`--passthrough` per host, or `l7 mode passthrough` for the
+  whole instance) -- TLS is *not* intercepted, so cert pinning is preserved,
+  but the proxy trusts the SNI it sees: a shared ingress that routes by the
+  inner `Host:`/HTTP-2 `:authority` could still be steered to a sibling on a
+  single connection, and URL paths can't be inspected on HTTPS.
+
+**Harness API endpoints auto-passthrough.** Because terminate is the default,
+the in-guest agents' own control-plane endpoints (`api.anthropic.com`,
+`api.openai.com`, `chatgpt.com`, ...) are automatically kept in passthrough, so
+the harnesses keep working out of the box (notably rustls clients that may not
+honor the injected CA) and their API tokens stay end-to-end. An explicit
+`--terminate` on such a host overrides it; provider-agnostic harnesses (e.g.
+opencode) should `--passthrough` their configured provider host.
 
 **Caveats** (documented, not silently assumed safe):
 
@@ -511,9 +522,10 @@ There are two tiers, chosen per host:
 
 #### L7 terminate tier
 
-Marking a host `--terminate` (or giving it a `--path` prefix, which implies
-terminate) routes it through a TLS-terminating proxy ([mitmproxy](https://mitmproxy.org/))
-so cogbox can see inside HTTPS. This closes the passthrough gaps:
+By default every allowed host is routed through a TLS-terminating proxy
+([mitmproxy](https://mitmproxy.org/)) so cogbox can see inside HTTPS (use
+`--passthrough` to opt a host out, or a `--path` prefix to add path
+enforcement). This closes the passthrough gaps:
 
 - enforces `Host == SNI` (a connection whose decrypted `Host:`/`:authority`
   disagrees with the negotiated SNI is rejected with `403`), and
@@ -525,9 +537,11 @@ cogbox l7 add allow git.example.com --path /myorg/   # only this path prefix
 cogbox l7 mode terminate                             # terminate every L7 host
 ```
 
-How it works: when any terminate rule exists, cogbox runs mitmproxy with a
-**per-instance CA** (auto-generated under `~/.config/cogbox/instances/<name>/l7-ca/`,
-key stays host-side at mode `0600`). The CA **certificate** (never the key) is
+How it works: every rules-mode instance runs mitmproxy with a **per-instance
+CA** (auto-generated under `~/.config/cogbox/instances/<name>/l7-ca/`, key
+stays host-side at mode `0600`) -- started at every boot, even with no L7
+rules yet, so that hot-added rules terminate immediately and the CA is in the
+guest trust store from the start (it can only be injected at launch). The CA **certificate** (never the key) is
 injected into the guest at boot via `fw_cfg` and assembled into
 `/run/cogbox/ca-bundle.crt`; the harness launchers and login shells point
 `SSL_CERT_FILE`/`CURL_CA_BUNDLE`/`GIT_SSL_CAINFO`/`REQUESTS_CA_BUNDLE`/

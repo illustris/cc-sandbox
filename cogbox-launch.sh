@@ -753,23 +753,12 @@ done
 # Render BOTH the LD_PRELOAD filter's netfilter-rules (CIDR + remap +
 # the auto-injected L7 funnel lines) and the L7 proxy's l7-rules from
 # config.json, using the same Zig renderer the hot-reload path uses --
-# so boot output and edit output can never drift. L7_ACTIVE drives
-# whether the L7 proxy is launched below.
-L7_ACTIVE=0
-L7_TERMINATE=0
+# so boot output and edit output can never drift.
 # The fw_cfg CA device is ALWAYS present (the flake emits it unconditionally),
-# so seed an empty stub; the terminate path overwrites it with the real cert.
+# so seed an empty stub; rules mode overwrites it with the real cert.
 : > "$RUNTIME/system-l7ca"
 if [ "$NETWORK_MODE" = "rules" ]; then
 	@cogbox@ __render-rules "$ACTIVE_CONFIG" "$RUNTIME"
-	if [ "$(jq -r '(.network.l7.rules // []) | length' "$ACTIVE_CONFIG")" -gt 0 ]; then
-		L7_ACTIVE=1
-	fi
-	# Terminate tier is needed if mode is terminate or any rule opts in
-	# (explicit terminate flag or a path constraint).
-	if [ "$(jq -r '[(.network.l7.mode == "terminate"), (.network.l7.rules[]? | (has("path") or (.terminate == true)))] | any' "$ACTIVE_CONFIG")" = "true" ]; then
-		L7_TERMINATE=1
-	fi
 fi
 
 # -- Patch the microvm runner with runtime QEMU settings -----------
@@ -916,13 +905,17 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
 	# Start the terminate backend first so its CA is staged into the fw_cfg
-	# slot BEFORE QEMU reads fw_cfg at launch. (Terminate hot-enable still
-	# needs a restart; passthrough does not -- see below.)
-	[ "$L7_TERMINATE" = "1" ] && start_l7mitm
+	# slot BEFORE QEMU reads fw_cfg at launch. It runs for EVERY rules-mode
+	# instance, not just those with L7 rules at boot: rules are hot-addable
+	# (`cogbox l7 add` on a live instance), terminate is the default tier,
+	# and the CA can only enter the guest trust store at launch -- so gating
+	# this on boot-time rule presence broke the first hot-added rule (the
+	# proxy handed TLS to a backend that was never started and failed
+	# closed). An idle backend on L4-only instances is the accepted cost.
+	start_l7mitm
 	# Always run the L7 proxy in rules mode so L7 can be enabled on a live
 	# instance without a restart (the funnel only diverts to it once a rule
-	# exists; until then it idles). L7_ACTIVE still gates whether the funnel
-	# is rendered into netfilter-rules.
+	# exists; until then it idles).
 	start_l7proxy
 	launch_vm
 elif [ "$NETWORK_MODE" != "none" ]; then

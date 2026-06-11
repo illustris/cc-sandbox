@@ -61,11 +61,12 @@ pub fn dispatch(
 	}
 }
 
-/// Ensure `.network.l7` is `{ "mode": "passthrough", "rules": [] }`-shaped.
+/// Ensure `.network.l7` is `{ "rules": [] }`-shaped. No `mode` is written:
+/// an absent mode means the default tier (terminate), and `l7 mode passthrough`
+/// writes it explicitly when the operator opts the instance out.
 fn ensureL7Object(net: *std.json.Value, arena: std.mem.Allocator) !*std.json.Value {
 	if (net.object.getPtr("l7") == null) {
 		var obj: std.json.ObjectMap = .empty;
-		try obj.put(arena, try arena.dupe(u8, "mode"), .{ .string = try arena.dupe(u8, "passthrough") });
 		try obj.put(arena, try arena.dupe(u8, "rules"), .{ .array = std.json.Array.init(arena) });
 		try net.object.put(arena, try arena.dupe(u8, "l7"), .{ .object = obj });
 	}
@@ -78,11 +79,13 @@ fn ensureL7Object(net: *std.json.Value, arena: std.mem.Allocator) !*std.json.Val
 	return l7;
 }
 
+/// The instance's default tier. Terminate is the default; only an explicit
+/// `mode: passthrough` opts the whole instance out.
 fn modeTerminate(l7: std.json.Value) bool {
 	if (l7.object.get("mode")) |m| {
-		if (m == .string and std.mem.eql(u8, m.string, "terminate")) return true;
+		if (m == .string and std.mem.eql(u8, m.string, "passthrough")) return false;
 	}
-	return false;
+	return true;
 }
 
 fn cmdList(allocator: std.mem.Allocator, io: std.Io, l7: std.json.Value, rules_arr: std.json.Array) !void {
@@ -125,8 +128,16 @@ fn cmdList(allocator: std.mem.Allocator, io: std.Io, l7: std.json.Value, rules_a
 				is_terminate = true; // insecure-upstream only applies under terminate
 			}
 		}
-		if (is_terminate) try out.appendSlice(allocator, " [terminate]");
-		if (is_insecure) try out.appendSlice(allocator, " [insecure]");
+		var is_passthrough = false;
+		if (r.object.get("passthrough")) |pv| {
+			if (pv == .bool and pv.bool) is_passthrough = true;
+		}
+		if (is_passthrough) {
+			try out.appendSlice(allocator, " [passthrough]");
+		} else {
+			if (is_terminate) try out.appendSlice(allocator, " [terminate]");
+			if (is_insecure) try out.appendSlice(allocator, " [insecure]");
+		}
 		if (rule.ruleComment(r.object)) |co| {
 			try out.appendSlice(allocator, "  # ");
 			try out.appendSlice(allocator, co);
@@ -147,13 +158,13 @@ fn cmdAdd(
 ) !void {
 	const tree_alloc = loaded.treeAllocator();
 	if (a.pos) |p| {
-		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, a.path, a.terminate, a.insecure) catch |err| switch (err) {
+		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, a.path, a.terminate, a.insecure, a.passthrough) catch |err| switch (err) {
 			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
 			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
 			else => return err,
 		};
 	} else {
-		_ = rule.append(tree_alloc, rules_arr, a.action, a.host, a.path, a.terminate, a.insecure) catch |err| switch (err) {
+		_ = rule.append(tree_alloc, rules_arr, a.action, a.host, a.path, a.terminate, a.insecure, a.passthrough) catch |err| switch (err) {
 			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
 			else => return err,
 		};
@@ -170,8 +181,12 @@ fn cmdAdd(
 		try suffix_buf.append(allocator, ' ');
 		try suffix_buf.appendSlice(allocator, p);
 	}
-	if (a.terminate) try suffix_buf.appendSlice(allocator, " [terminate]");
-	if (a.insecure) try suffix_buf.appendSlice(allocator, " [insecure]");
+	if (a.passthrough) {
+		try suffix_buf.appendSlice(allocator, " [passthrough]");
+	} else {
+		if (a.terminate) try suffix_buf.appendSlice(allocator, " [terminate]");
+		if (a.insecure) try suffix_buf.appendSlice(allocator, " [insecure]");
+	}
 	const suffix = suffix_buf.items;
 	if (a.pos) |p| {
 		try announce(allocator, io, "Added: {s} {s}{s} at position {d}", .{ action_str, a.host, suffix, p });

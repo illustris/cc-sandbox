@@ -664,6 +664,11 @@ pub const L7Rule = struct {
 	// (the operator's per-host equivalent of `curl -k` on the proxy->upstream
 	// leg). Only meaningful for terminated hosts; implies terminate.
 	insecure_upstream: bool = false,
+	// Opt this host OUT of the terminate tier (back to SNI-only passthrough:
+	// TLS not intercepted, cert pinning preserved). Default is terminate, so
+	// this is the escape hatch for cert-pinned clients. Mutually exclusive with
+	// path/terminate/insecure_upstream.
+	passthrough: bool = false,
 
 	pub fn pathSlice(self: *const L7Rule) ?[]const u8 {
 		if (!self.has_path) return null;
@@ -678,11 +683,12 @@ pub const L7Rule = struct {
 pub const L7Verdict = enum { allow, deny, no_match };
 
 pub const L7RuleSet = struct {
-	// Instance floor: when true, every L7-governed host that matches an
-	// allow rule is handled in the terminating tier even if its rule doesn't
-	// say `terminate`. (Unlisted hosts are NOT terminated -- they fall back
-	// to the L4 passthrough decision.)
-	mode_terminate: bool = false,
+	// Instance default tier. TRUE (the default) means every matched allow host
+	// is MITM-terminated unless its rule says `passthrough`; FALSE (set by a
+	// `mode passthrough` line) means hosts pass through unless their rule says
+	// `terminate`/`path`/`insecure`. (Unlisted hosts are never intercepted --
+	// they fall back to the L4 decision.)
+	mode_terminate: bool = true,
 	rules: [max_l7_rules]L7Rule = undefined,
 	len: usize = 0,
 
@@ -721,21 +727,48 @@ pub const L7RuleSet = struct {
 	}
 
 	/// Should this host be served through the terminating tier (MITM)? Only
-	/// hosts that MATCH a rule are candidates -- unlisted hosts are passed
-	/// through (L4-governed), never intercepted. Among matching rules:
-	/// terminate if any carries a path constraint or explicit `terminate`, or
-	/// the instance floor is terminate and the host matches an allow rule.
+	/// matched allow hosts are candidates -- unlisted hosts are never
+	/// intercepted (L4-governed). Precedence, first-match over the rules:
+	///   1. explicit `passthrough` on the rule  -> NO  (cert-pinning escape)
+	///   2. explicit `path`/`terminate`/`insecure` -> YES
+	///   3. a built-in harness API endpoint      -> NO  (keep agents working,
+	///      tokens end-to-end; an explicit per-host flag in 1/2 still wins)
+	///   4. otherwise the instance default (`mode_terminate`, default TRUE)
 	pub fn needsTerminate(self: *const L7RuleSet, host: []const u8) bool {
 		const h = stripRootDot(host);
 		var matched_allow = false;
 		for (self.rules[0..self.len]) |r| {
 			if (!matchDnsPattern(r.host, h)) continue;
+			if (r.passthrough) return false;
 			if (r.has_path or r.terminate or r.insecure_upstream) return true;
 			if (r.action == .allow) matched_allow = true;
 		}
+		if (matched_allow and isHarnessPassthroughHost(h)) return false;
 		return self.mode_terminate and matched_allow;
 	}
 };
+
+/// Harness control-plane API endpoints auto-kept in passthrough under the
+/// terminate-by-default tier, so the in-guest agents keep working (notably
+/// rustls clients that may not honor the injected CA) and their API tokens
+/// stay end-to-end (never decrypted by the host proxy). The operator must
+/// still `allow` these; this only governs the tier, not allow/deny. An
+/// explicit per-host `--terminate` overrides it. Provider-agnostic harnesses
+/// (e.g. opencode) should `--passthrough` their configured provider host.
+const harness_passthrough_hosts = [_][]const u8{
+	"api.anthropic.com", // claude-code
+	"api.openai.com", // codex
+	"chatgpt.com", // codex (ChatGPT auth/backend)
+	"auth.openai.com", // codex auth
+};
+
+pub fn isHarnessPassthroughHost(host: []const u8) bool {
+	const h = stripRootDot(host);
+	for (harness_passthrough_hosts) |hh| {
+		if (std.ascii.eqlIgnoreCase(h, hh)) return true;
+	}
+	return false;
+}
 
 fn stripRootDot(host: []const u8) []const u8 {
 	if (host.len > 0 and host[host.len - 1] == '.') return host[0 .. host.len - 1];
@@ -762,11 +795,12 @@ pub const L7Line = union(enum) {
 
 /// Parse a single `l7-rules` line:
 ///   mode passthrough|terminate
-///   allow|deny  <host-pattern>  [<path>]  [terminate]  [insecure]
+///   allow|deny  <host-pattern>  [<path>]  [terminate|passthrough]  [insecure]
 /// Tokens are whitespace-separated. A token starting with `/` is the path;
-/// the literal token `terminate` sets the flag; `insecure` skips upstream
-/// cert verification (terminate tier only). Order of the trailing tokens is
-/// not significant. Malformed lines return `.none` (dropped, fail-closed).
+/// `terminate` forces the terminate tier, `passthrough` forces SNI-only
+/// passthrough, `insecure` skips upstream cert verification (terminate tier
+/// only). Order of the trailing tokens is not significant. Malformed lines
+/// return `.none` (dropped, fail-closed).
 pub fn parseL7Line(line: []const u8) L7Line {
 	const trimmed = std.mem.trim(u8, line, " \t\r\n");
 	if (trimmed.len == 0 or trimmed[0] == '#') return .none;
@@ -797,6 +831,8 @@ pub fn parseL7Line(line: []const u8) L7Line {
 	while (it.next()) |tok| {
 		if (std.mem.eql(u8, tok, "terminate")) {
 			rule.terminate = true;
+		} else if (std.mem.eql(u8, tok, "passthrough")) {
+			rule.passthrough = true;
 		} else if (std.mem.eql(u8, tok, "insecure")) {
 			rule.insecure_upstream = true;
 		} else if (tok.len > 0 and tok[0] == '/') {
@@ -1346,6 +1382,41 @@ test "L7 mode terminate floor applies to matched allow hosts only" {
 	try std.testing.expect(rs.needsTerminate("a.test"));
 	// unlisted host is NOT terminated even under the mode floor
 	try std.testing.expect(!rs.needsTerminate("unlisted.test"));
+}
+
+test "L7 terminate-by-default + passthrough opt-out + harness safety" {
+	var rs: L7RuleSet = undefined;
+	// No mode line -> the instance default tier is TERMINATE.
+	parseL7Rules(
+		\\allow plain.test
+		\\allow pinned.test passthrough
+		\\allow api.anthropic.com
+		\\allow api.openai.com terminate
+	, &rs);
+	try std.testing.expect(rs.mode_terminate); // default tier is terminate
+	// a bare allow host is terminated by default
+	try std.testing.expect(rs.needsTerminate("plain.test"));
+	// --passthrough opts a host out (cert-pinning escape)
+	try std.testing.expect(!rs.needsTerminate("pinned.test"));
+	// a harness API endpoint stays passthrough automatically...
+	try std.testing.expect(!rs.needsTerminate("api.anthropic.com"));
+	try std.testing.expect(isHarnessPassthroughHost("API.Anthropic.Com")); // case-insensitive
+	// ...unless explicitly --terminate'd
+	try std.testing.expect(rs.needsTerminate("api.openai.com"));
+	// unlisted host is never terminated
+	try std.testing.expect(!rs.needsTerminate("unlisted.test"));
+}
+
+test "L7 mode passthrough flips the default back" {
+	var rs: L7RuleSet = undefined;
+	parseL7Rules(
+		\\mode passthrough
+		\\allow plain.test
+		\\allow api.test /v1/ terminate
+	, &rs);
+	try std.testing.expect(!rs.mode_terminate);
+	try std.testing.expect(!rs.needsTerminate("plain.test")); // passthrough default
+	try std.testing.expect(rs.needsTerminate("api.test")); // explicit terminate still wins
 }
 
 test "parseL7Line rejects malformed" {

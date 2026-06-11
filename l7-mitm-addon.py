@@ -10,7 +10,9 @@ addon then, on every decrypted request:
      upstream cert validation would fail;
   2. enforces Host == SNI (anti-fronting / HTTP-2 cross-authority);
   3. allow/deny by host pattern + boundary-aware path prefix, first match,
-     default deny -- mirroring filter.zig's L7RuleSet semantics exactly.
+     default deny -- mirroring filter.zig's L7RuleSet ENFORCEMENT semantics
+     (tier selection -- terminate vs passthrough -- stays in the Zig proxy,
+     so the `terminate`/`passthrough` rule tokens are ignored here).
 
 Separately, on the upstream TLS handshake (`tls_start_server`), it disables
 proxy->upstream cert verification for hosts explicitly marked `insecure` in

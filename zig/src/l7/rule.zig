@@ -1,8 +1,8 @@
 // Rule operations on the `.network.l7.rules` array. Each rule object has
 // exactly one of `allow` or `deny` keyed to an SNI/Host pattern (the same
 // grammar as DNS patterns: exact / *.suffix / *), and may optionally carry a
-// `comment`. Path/terminate fields are reserved for the Phase 2 terminate
-// tier and are not written by the Phase 1 CLI.
+// `comment` plus the tier fields (`path`, `terminate`, `insecure_upstream`,
+// `passthrough`) written by the corresponding `l7 add` flags.
 
 const std = @import("std");
 const filter = @import("filter");
@@ -28,7 +28,7 @@ pub fn validateHost(host: []const u8) bool {
 	return filter.parseDnsPattern(host) != null;
 }
 
-pub fn newRuleObject(allocator: std.mem.Allocator, action: Action, host: []const u8, path: ?[]const u8, terminate: bool, insecure: bool) !std.json.Value {
+pub fn newRuleObject(allocator: std.mem.Allocator, action: Action, host: []const u8, path: ?[]const u8, terminate: bool, insecure: bool, passthrough: bool) !std.json.Value {
 	var obj: std.json.ObjectMap = .empty;
 	const action_key = try allocator.dupe(u8, switch (action) {
 		.allow => "allow",
@@ -47,20 +47,23 @@ pub fn newRuleObject(allocator: std.mem.Allocator, action: Action, host: []const
 	if (insecure) {
 		try obj.put(allocator, try allocator.dupe(u8, "insecure_upstream"), .{ .bool = true });
 	}
+	if (passthrough) {
+		try obj.put(allocator, try allocator.dupe(u8, "passthrough"), .{ .bool = true });
+	}
 	return .{ .object = obj };
 }
 
-pub fn append(allocator: std.mem.Allocator, arr: *std.json.Array, action: Action, host: []const u8, path: ?[]const u8, terminate: bool, insecure: bool) !usize {
+pub fn append(allocator: std.mem.Allocator, arr: *std.json.Array, action: Action, host: []const u8, path: ?[]const u8, terminate: bool, insecure: bool, passthrough: bool) !usize {
 	if (!validateHost(host)) return error.InvalidHost;
-	const obj = try newRuleObject(allocator, action, host, path, terminate, insecure);
+	const obj = try newRuleObject(allocator, action, host, path, terminate, insecure, passthrough);
 	try arr.append(obj);
 	return arr.items.len;
 }
 
-pub fn insertAt(allocator: std.mem.Allocator, arr: *std.json.Array, pos: usize, action: Action, host: []const u8, path: ?[]const u8, terminate: bool, insecure: bool) !void {
+pub fn insertAt(allocator: std.mem.Allocator, arr: *std.json.Array, pos: usize, action: Action, host: []const u8, path: ?[]const u8, terminate: bool, insecure: bool, passthrough: bool) !void {
 	if (pos < 1 or pos > arr.items.len + 1) return error.IndexOutOfRange;
 	if (!validateHost(host)) return error.InvalidHost;
-	const obj = try newRuleObject(allocator, action, host, path, terminate, insecure);
+	const obj = try newRuleObject(allocator, action, host, path, terminate, insecure, passthrough);
 	try arr.insert(pos - 1, obj);
 }
 
@@ -73,7 +76,7 @@ pub fn replaceAll(allocator: std.mem.Allocator, arr: *std.json.Array, items: []c
 	arr.clearRetainingCapacity();
 	for (items) |p| {
 		if (!validateHost(p.host)) return error.InvalidHost;
-		const obj = try newRuleObject(allocator, p.action, p.host, null, false, false);
+		const obj = try newRuleObject(allocator, p.action, p.host, null, false, false, false);
 		try arr.append(obj);
 	}
 }
@@ -95,8 +98,8 @@ pub fn parseSetLine(line: []const u8) !?Pair {
 	return error.InvalidLine;
 }
 
-/// Read action+host from a rule object, ignoring path/terminate for the
-/// Phase 1 `list` view (it returns the host string only).
+/// Read action+host from a rule object, ignoring the tier fields (the
+/// `list` view renders those markers separately).
 pub fn ruleAction(obj: std.json.ObjectMap) ?Pair {
 	if (obj.get("allow")) |v| {
 		if (v == .string) return .{ .action = .allow, .host = v.string };

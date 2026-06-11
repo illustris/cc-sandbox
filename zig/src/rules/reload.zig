@@ -98,15 +98,17 @@ pub fn renderRules(allocator: std.mem.Allocator, network: std.json.Value, l7_bas
 
 /// Render `.network.l7` to the proxy's `l7-rules` wire format. Pure -- no I/O.
 ///   mode passthrough|terminate
-///   allow|deny  <host>  [<path>]  [terminate]  [insecure]
+///   allow|deny  <host>  [<path>]  [terminate|passthrough]  [insecure]
 pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std.ArrayList(u8)) !void {
 	if (network != .object) return;
 	const l7 = network.object.getPtr("l7") orelse return;
 	if (l7.* != .object) return;
 
-	var mode_terminate = false;
+	// Terminate is the default tier; only an explicit `mode: passthrough`
+	// opts the whole instance out.
+	var mode_terminate = true;
 	if (l7.object.getPtr("mode")) |m| {
-		if (m.* == .string and std.mem.eql(u8, m.string, "terminate")) mode_terminate = true;
+		if (m.* == .string and std.mem.eql(u8, m.string, "passthrough")) mode_terminate = false;
 	}
 	try out.appendSlice(allocator, if (mode_terminate) "mode terminate\n" else "mode passthrough\n");
 
@@ -137,6 +139,9 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 		}
 		if (r.object.getPtr("terminate")) |tv| {
 			if (tv.* == .bool and tv.bool) try out.appendSlice(allocator, " terminate");
+		}
+		if (r.object.getPtr("passthrough")) |pv| {
+			if (pv.* == .bool and pv.bool) try out.appendSlice(allocator, " passthrough");
 		}
 		if (r.object.getPtr("insecure_upstream")) |iv| {
 			if (iv.* == .bool and iv.bool) try out.appendSlice(allocator, " insecure");

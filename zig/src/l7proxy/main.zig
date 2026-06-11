@@ -12,8 +12,10 @@
 // getaddrinfo()+connect() reach the real internet -- which is exactly why
 // the SSRF/CIDR re-check below is mandatory.
 //
-// Phase 1 implements the passthrough tier (no TLS termination). A host that
-// needs termination (path rules / Host==SNI) is denied here until Phase 2.
+// Two tiers: passthrough hosts are spliced without TLS termination; hosts
+// needing the terminate tier (the instance default; path rules / Host==SNI
+// enforcement) are handed to the per-instance mitmproxy backend over SOCKS5
+// (see terminateHandoff).
 
 const std = @import("std");
 const filter = @import("filter");

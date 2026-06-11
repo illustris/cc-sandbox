@@ -601,6 +601,10 @@ serve(80, handle_http)
     machine.succeed(as_user(
         "printf 'deny 203.0.113.0/24\\nallow 0.0.0.0/0\\n' | cogbox rules set --name work"
     ))
+    # Terminate is the DEFAULT tier now, so this phase (which exercises the
+    # passthrough tier against a self-signed origin via `curl -k`) opts the
+    # instance into passthrough explicitly. Bare allows are then SNI-only.
+    machine.succeed(as_user("cogbox l7 mode passthrough --name work"))
     # Seed the L7 allowlist with vhost-a only (vhost-b is the sibling).
     machine.succeed(as_user("cogbox l7 add allow vhost-a.test --name work"))
 
@@ -767,44 +771,69 @@ with subtest("Phase L: L7 terminate tier (CA injection + Host/path enforcement)"
 
     stop_instance("cc-work", name="work")
 
-with subtest("Phase M: terminate --insecure-upstream skips upstream cert verification"):
-    # The terminate tier verifies the UPSTREAM cert against the system trust by
-    # default; the guest's -k can't reach that leg (it only covers the minted
-    # leaf). For internal services with self-signed/mismatched certs, a per-host
-    # `--insecure-upstream` relaxes ONLY the proxy->upstream leg. Proof is an A/B
-    # on the SAME self-signed origin: default terminate -> mitmproxy 502 (cert
-    # verify fails, untrusted issuer); --insecure-upstream -> 200 from the origin.
+with subtest("Phase M: terminate-by-default + --passthrough + --insecure-upstream"):
+    # Terminate is the DEFAULT tier. Against ONE self-signed origin we prove the
+    # three behaviors: (A) a bare allow is MITM'd -> 502 (upstream verify fails);
+    # (B) --passthrough opts back out -> end-to-end TLS, curl -k reaches it (200);
+    # (C) --insecure-upstream stays terminate but skips upstream verify -> 200.
     machine.succeed("systemctl reset-failed l7-origin 2>/dev/null || true")
     machine.succeed("systemd-run --unit=l7-origin --collect python3 /tmp/l7-origin.py")
     machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
 
-    # A) default terminate (verify on) -> self-signed upstream is rejected -> 502.
-    machine.succeed(as_user("printf '' | cogbox l7 set --name work"))
-    machine.succeed(as_user("cogbox l7 add allow vhost-a.test --terminate --name work"))
-    boot_and_wait("cc-work", "--name work", ssh_port=2223)
+    # Undo Phase K's `mode passthrough` so the DEFAULT tier (terminate) applies.
+    machine.succeed(as_user("cogbox l7 mode terminate --name work"))
     rt = "/run/user/1000/cogbox-work"
-
     code_probe = (
         "curl -sS -o /dev/null -w '%{http_code}' --max-time 12 "
         "--cacert /run/cogbox/ca-bundle.crt "
         "--resolve vhost-a.test:443:203.0.113.5 https://vhost-a.test/"
     )
-    rc, code = machine.execute(as_user("cogbox ssh --name work " + shlex.quote(code_probe)))
-    assert rc == 0 and code.strip().endswith("502"), \
-        f"default terminate must 502 on a self-signed upstream: rc={rc} code={code!r}"
 
-    # B) hot-swap to --insecure-upstream -> verification skipped -> 200 from origin.
-    # (Proxy SIGHUP + addon mtime reload propagate asynchronously, so retry.)
+    # A) terminate by DEFAULT, enabled HOT: boot with ZERO L7 rules, then add
+    #    a bare allow on the LIVE instance. The terminate backend + CA staging
+    #    must not depend on boot-time rule presence -- the regression was an
+    #    instance booted before its first `l7 add` handing TLS to a backend
+    #    that was never started (fail-closed EOF mid-handshake). The hot-added
+    #    bare allow is then MITM'd, so the self-signed upstream is rejected
+    #    (verify on) -> 502 over a TRUSTED client TLS leg.
+    machine.succeed(as_user("printf '' | cogbox l7 set --name work"))
+    boot_and_wait("cc-work", "--name work", ssh_port=2223)
+    # Backend up + CA injected even though the instance booted with no rules.
+    machine.succeed(f"test -f {rt}/l7mitm.pid && kill -0 $(cat {rt}/l7mitm.pid)")
+    machine.succeed(as_user("cogbox ssh --name work 'test -s /run/cogbox/l7-ca.crt'"))
+    machine.succeed(as_user("cogbox l7 add allow vhost-a.test --name work"))
+    l7r = machine.succeed(f"cat {rt}/l7-rules")
+    assert "mode terminate" in l7r and "allow vhost-a.test\n" in l7r, l7r  # bare, no token
+    machine.wait_until_succeeds(
+        as_user("cogbox ssh --name work " + shlex.quote(code_probe + " | grep -q 502")),
+        timeout=20,
+    )
+
+    # B) --passthrough opts the host back out: TLS is end-to-end to the
+    #    (self-signed) origin, so curl -k reaches it (200) and it's NOT MITM'd.
+    machine.succeed(as_user("printf '' | cogbox l7 set --name work"))
+    machine.succeed(as_user("cogbox l7 add allow vhost-a.test --passthrough --name work"))
+    l7r = machine.succeed(f"cat {rt}/l7-rules")
+    assert "allow vhost-a.test passthrough" in l7r, l7r
+    pt_probe = (
+        "curl -sS -o /dev/null -w '%{http_code}' --max-time 12 -k "
+        "--resolve vhost-a.test:443:203.0.113.5 https://vhost-a.test/"
+    )
+    machine.wait_until_succeeds(
+        as_user("cogbox ssh --name work " + shlex.quote(pt_probe + " | grep -q 200")),
+        timeout=20,
+    )
+
+    # C) --insecure-upstream: still terminate, but skip upstream verify -> 200
+    #    over the trusted bundle (no -k), reaching the origin.
     machine.succeed(as_user("printf '' | cogbox l7 set --name work"))
     machine.succeed(as_user("cogbox l7 add allow vhost-a.test --insecure-upstream --name work"))
     l7r = machine.succeed(f"cat {rt}/l7-rules")
-    # insecure implies terminate, so the wire line carries both tokens.
     assert "allow vhost-a.test terminate insecure" in l7r, l7r
     machine.wait_until_succeeds(
         as_user("cogbox ssh --name work " + shlex.quote(code_probe + " | grep -q 200")),
         timeout=20,
     )
-    # And it really reached the origin (hit logged), not a cached/forged 200.
     machine.succeed("grep -q 'host=vhost-a.test' /tmp/origin-hits.log")
 
     stop_instance("cc-work", name="work")
