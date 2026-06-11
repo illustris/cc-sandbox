@@ -311,18 +311,28 @@ pub const L7 =
 	\\
 	\\Usage:
 	\\  cogbox l7 [-n NAME] list
-	\\  cogbox l7 [-n NAME] add allow|deny HOST [--at N]
+	\\  cogbox l7 [-n NAME] add allow|deny HOST [--path P] [--terminate]
+	\\                              [--insecure-upstream] [--at N]
 	\\  cogbox l7 [-n NAME] del INDEX
-	\\  cogbox l7 [-n NAME] set                  (reads rules from stdin)
-	\\  cogbox l7 [-n NAME] mode passthrough     (terminate tier: not in v1)
+	\\  cogbox l7 [-n NAME] set                  (reads HOST rules from stdin)
+	\\  cogbox l7 [-n NAME] mode passthrough|terminate
 	\\
 	\\Options:
-	\\  -n, --name NAME       Instance name (default: "default")
-	\\  -h, --help            Show this help and exit
+	\\  -n, --name NAME        Instance name (default: "default")
+	\\      --path P           Restrict the host to URL paths under prefix P
+	\\                         (boundary-aware, e.g. /v1/; implies --terminate)
+	\\      --terminate        MITM this host's TLS via a per-instance CA so the
+	\\                         proxy can enforce Host==SNI and URL paths
+	\\      --insecure-upstream  Skip upstream cert verification for this host
+	\\                         (implies --terminate; the proxy-side equivalent of
+	\\                         curl -k, for internal self-signed/mismatched certs)
+	\\      --at N             Insert at 1-based position N (default: append)
+	\\  -h, --help             Show this help and exit
 	\\
 	\\HOST is an SNI/Host pattern: an exact name (api.example.com), a left
-	\\wildcard (*.example.com), or a bare * catch-all. Rules are first-match,
-	\\default deny.
+	\\wildcard (*.example.com), or a bare * catch-all. Rules are first-match;
+	\\an allowed vhost SUPERSEDES an L4 IP block, a denied one supersedes an L4
+	\\allow, and an unmatched host defers to the L4 policy.
 	\\
 	\\While L4 rules whitelist a destination IP, L7 rules whitelist individual
 	\\vhosts behind a shared load-balancer IP. When any L7 rule exists, all
@@ -332,14 +342,22 @@ pub const L7 =
 	\\the same IP, and DNS-based load balancing keeps working. Requires the
 	\\instance's network mode to be "rules".
 	\\
-	\\v1 caveats: passthrough (no TLS interception) only -- it trusts the SNI,
-	\\so a shared ingress that routes by inner Host can still be reached for a
-	\\sibling on a single connection; QUIC/UDP-443 and all guest IPv6 are
-	\\denied while L7 is active (clients fall back to inspectable IPv4 TCP).
+	\\Two tiers, chosen per host:
+	\\  passthrough (default)  TLS is not intercepted (cert pinning preserved);
+	\\                         the proxy trusts the SNI and cannot see URL paths.
+	\\  terminate  (--terminate / --path / `mode terminate`)  MITM via a
+	\\                         per-instance CA injected into the guest trust
+	\\                         store; enforces Host==SNI and URL path prefixes.
+	\\
+	\\QUIC/UDP-443 and all guest IPv6 are denied while L7 is active (clients
+	\\fall back to inspectable IPv4 TCP).
 	\\
 	\\Examples:
-	\\  cogbox l7 add allow api.example.com
+	\\  cogbox l7 add allow api.example.com                  passthrough (SNI)
 	\\  cogbox l7 add allow '*.pages.example.com'
+	\\  cogbox l7 add allow api.example.com --path /v1/      terminate + path
+	\\  cogbox l7 add allow internal.svc --insecure-upstream terminate, skip
+	\\                                                        upstream cert verify
 	\\  cogbox l7 add deny '*' --at 1
 	\\
 	\\If the instance is running, edits hot-reload the proxy via SIGHUP and
