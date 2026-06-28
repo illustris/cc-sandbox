@@ -253,12 +253,65 @@
 			] ++ extraModules;
 		};
 
+		# Container-native backend: boot the
+		# SAME guest userland as an unprivileged OCI container -- no QEMU, passt,
+		# 9p, or fw_cfg. Reuses cogboxModules with target = "container" (the
+		# VM-only plumbing is gated off there). The result's
+		# config.system.build.toplevel is streamed into the agent-image below;
+		# its /init is systemd PID1, which runs the reused brain/trust/l7-trust
+		# oneshots to multi-user.target.
+		mkContainer = system: name: { extraModules ? [] }: nixpkgs.lib.nixosSystem {
+			inherit system;
+			modules = [
+				({ pkgs, lib, ... }: {
+					# microvm.nixosModules.microvm is intentionally NOT imported for
+					# the container. The shared guest module still carries a
+					# `microvm = lib.mkIf isVm {...}` definition, so declare an inert,
+					# invisible sink option to give it a home (isVm is false here, so
+					# the definition is dropped and this stays {}).
+					options.microvm = lib.mkOption {
+						type = lib.types.attrs;
+						default = {};
+						visible = false;
+						description = "Inert sink for the container target (no microvm).";
+					};
+					config = {
+						boot.isContainer = true;
+						system.stateVersion = "25.11";
+						users.users.root.password = "";
+						# Land login + non-login shells in ~/work, same as the VM
+						# (mkForce: no plugin appends a competing cd). Falls back to
+						# the mounted state root before the brain oneshot has run.
+						programs.bash.loginShellInit = lib.mkForce ''
+							cd /root/work 2>/dev/null || cd /var/lib/cogbox-state/data/cogbox
+						'';
+						nix = {
+							nixPath = [ "nixpkgs=${pkgs.path}" ];
+							# NixOS owns /etc/nix/nix.conf, so express the cogbox-pod-image
+							# nix.conf (single-user builds, no sandbox, public caches) as
+							# options rather than a baked file.
+							settings = {
+								experimental-features = [ "nix-command" "flakes" ];
+								build-users-group = "";
+								sandbox = false;
+								substituters = [ "https://cache.nixos.org" "https://cache.numtide.com" ];
+								trusted-public-keys = [
+									"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+									"niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g="
+								];
+							};
+						};
+					};
+				})
+			] ++ extraModules;
+		};
+
 		# `userExt` defaults to the no-op userExtensions input but can be
 		# overridden by tests to inject a known module in the same list
 		# position the runtime override-input would, so the resulting
 		# microvm runner has a deterministic .drvPath that matches what
 		# `nix run --override-input userExtensions ...` produces.
-		cogboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default }: let
+		cogboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default, target ? "vm" }: let
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
 			inputs.nixfs.nixosModules.nixfs
@@ -312,6 +365,30 @@
 			({ config, pkgs, lib, utils, ... }: let
 				harnesses = mkHarnesses system pkgs;
 				cfg = config.cogbox;
+
+				# Build target: "vm" (the QEMU microvm, default) or "container"
+				# (the unprivileged OCI agent image). The same guest module tree -- packages, harness
+				# launchers, brain/trust/l7-trust oneshots -- serves both; the
+				# VM-only plumbing below (microvm runner, 9p shares, fw_cfg
+				# copies, harness overlay/loop filesystems, docker, sshd) is
+				# gated to "vm" so the container drops it.
+				isVm = target == "vm";
+				isContainer = target == "container";
+				# Container backend: the state volume mounts here, mirroring the
+				# cogworx k8s pod env (XDG_CONFIG_HOME/COGBOX_DATA).
+				stateRoot = "/var/lib/cogbox-state";
+				cogboxData = "${stateRoot}/data/cogbox";
+				# The VM's guest oneshots order after the 9p data mount; the
+				# container has no such mount, so they order after the state-prep
+				# oneshot that symlinks /var/lib/cogbox into the mounted state
+				# (so ~/work resolves identically to the VM).
+				stateUnit = if isVm then "var-lib-cogbox.mount" else "cogbox-container-state.service";
+				# L7 trust CA source: fw_cfg in the VM, a mounted file in the
+				# container (absent in Phase 0 -> the unit yields the system
+				# bundle, which is the no-enforcement default).
+				l7CaSource = if isVm
+					then "/sys/firmware/qemu_fw_cfg/by_name/opt/system-l7ca/raw"
+					else "/run/cogbox/ca.crt";
 
 				# Flatten harnesses into a list of paths annotated with
 				# their owning harness name and path key.
@@ -640,7 +717,7 @@
 				# ssh -- c` invocations).
 				environment.variables = l7CaEnv;
 
-				services.openssh.enable = true;
+				services.openssh.enable = lib.mkIf isVm true;
 				# `cogbox ssh` pins to a single key with IdentitiesOnly +
 				# IdentityAgent=none (see zig/src/cli/verbs/ssh.zig), so its
 				# default path makes exactly one auth attempt and can't exhaust
@@ -650,7 +727,7 @@
 				# default 6 attempts before a working key is reached. This guest
 				# is a local, ephemeral, single-user sandbox (sshd bound to
 				# 127.0.0.1), so a generous cap is safe.
-				services.openssh.settings.MaxAuthTries = 50;
+				services.openssh.settings.MaxAuthTries = lib.mkIf isVm 50;
 
 				environment.systemPackages = with pkgs; [
 					git
@@ -685,7 +762,7 @@
 					bpftrace
 				];
 
-				microvm = {
+				microvm = lib.mkIf isVm {
 					writableStoreOverlay = "/nix/.rw-store";
 					forwardPorts = [
 						{ from = "host"; host.port = 2222; host.address = "127.0.0.1"; guest.port = 22; }
@@ -722,7 +799,11 @@
 
 				# Per-fw_cfg copy services. Each one materializes a single
 				# host file (auth token, etc.) into its guest path at boot.
-				systemd.services = lib.listToAttrs (map (p:
+				# fw_cfg copy units are a VM-only mechanism (the container has no
+				# /sys/firmware/qemu_fw_cfg); gate the whole generated set off so
+				# the container drops them. optionalAttrs (not mkIf) so the keys
+				# vanish entirely rather than evaluate to dropped definitions.
+				systemd.services = lib.optionalAttrs isVm (lib.listToAttrs (map (p:
 					lib.nameValuePair "${p.harness}-${p.pathkey}" {
 						description = "Copy ${p.harness}/${p.pathkey} from fw_cfg";
 						wantedBy = [ "multi-user.target" ];
@@ -740,14 +821,14 @@
 							RemainAfterExit = true;
 						};
 					}
-				) fwCfgPaths) // {
+				) fwCfgPaths)) // {
 					cogbox-brain-materialize = {
 						description = "Materialize the cogbox plugin brain into ~/work";
 						wantedBy = [ "multi-user.target" ];
 						before = [ "multi-user.target" "sshd.service" ];
-						after = [ "var-lib-cogbox.mount" ]
-							++ lib.optional (harnesses ? "codex") "${utils.escapeSystemdPath "/root/.codex"}.mount";
-						requires = [ "var-lib-cogbox.mount" ];
+						after = [ stateUnit ]
+							++ lib.optional (isVm && harnesses ? "codex") "${utils.escapeSystemdPath "/root/.codex"}.mount";
+						requires = [ stateUnit ];
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
@@ -758,8 +839,8 @@
 						description = "Pre-accept Claude Code workspace trust for ~/work";
 						wantedBy = [ "multi-user.target" ];
 						before = [ "multi-user.target" "sshd.service" ];
-						after = [ "var-lib-cogbox.mount" "cogbox-brain-materialize.service" ]
-							++ lib.optional (harnesses ? "claude-code") "claude-code-auth.service";
+						after = [ stateUnit "cogbox-brain-materialize.service" ]
+							++ lib.optional (isVm && harnesses ? "claude-code") "claude-code-auth.service";
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
@@ -780,7 +861,7 @@
 							ExecStart = pkgs.writeShellScript "cogbox-l7-trust" ''
 								set -e
 								mkdir -p /run/cogbox
-								raw=/sys/firmware/qemu_fw_cfg/by_name/opt/system-l7ca/raw
+								raw=${l7CaSource}
 								ca=/run/cogbox/l7-ca.crt
 								bundle=${l7CaBundle}
 								sys=/etc/ssl/certs/ca-certificates.crt
@@ -816,7 +897,7 @@
 							'';
 						};
 					};
-					load-ssh-keys = {
+					load-ssh-keys = lib.mkIf isVm {
 						description = "Load SSH authorized keys from shared config";
 						wantedBy = [ "multi-user.target" ];
 						before = [ "sshd.service" ];
@@ -836,7 +917,7 @@
 							'';
 						};
 					};
-					harness-overlay-img = {
+					harness-overlay-img = lib.mkIf isVm {
 						description = "Create ext4 image for harness overlay";
 						wantedBy = [ "var-lib-harness\\x2drw.mount" ];
 						before = [ "var-lib-harness\\x2drw.mount" ];
@@ -870,7 +951,7 @@
 						};
 					};
 
-					harness-setup-dirs = {
+					harness-setup-dirs = lib.mkIf isVm {
 						description = "Create per-harness subdirs in harness overlay";
 						wantedBy = harnessMountUnits;
 						before = harnessMountUnits;
@@ -903,7 +984,7 @@
 						};
 					};
 
-					resize-store-overlay = {
+					resize-store-overlay = lib.mkIf isVm {
 						description = "Resize writable nix store overlay from config";
 						wantedBy = [ "multi-user.target" ];
 						after = [ "var-lib-cogbox.mount" ];
@@ -920,11 +1001,31 @@
 							'';
 						};
 					};
+
+					# Container backend: prepare the mounted state volume and make
+					# ~/work resolve like it does in the VM. The brain/trust oneshots
+					# (reused verbatim) hardcode /var/lib/cogbox as the data dir, so
+					# symlink it into the mounted state before they run.
+					cogbox-container-state = lib.mkIf isContainer {
+						description = "Prepare mounted state + ~/work resolution (container backend)";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "multi-user.target" ];
+						unitConfig.DefaultDependencies = false;
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = pkgs.writeShellScript "cogbox-container-state" ''
+								set -e
+								mkdir -p ${cogboxData} ${stateRoot}/config /run/cogbox
+								ln -sfn ${cogboxData} /var/lib/cogbox
+							'';
+						};
+					};
 				};
 
-				virtualisation.docker.enable = true;
+				virtualisation.docker.enable = lib.mkIf isVm true;
 
-				fileSystems = {
+				fileSystems = lib.mkIf isVm ({
 					"/nix/.rw-store" = {
 						fsType = "tmpfs";
 						options = [ "size=16G" "mode=0755" ];
@@ -949,13 +1050,20 @@
 						fsType = "none";
 						options = [ "bind" ];
 					}) ephemeralPaths)
-				);
+				));
 			})
 		];
 	in {
 		packages = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
+			# Container-native agent system (see mkContainer): the SAME guest
+			# module tree with target = "container". Its toplevel/init boots
+			# systemd PID1 in the agent-image below.
+			containerSystem = mkContainer system "cogbox" {
+				extraModules = cogboxModules system { target = "container"; };
+			};
+			containerToplevel = containerSystem.config.system.build.toplevel;
 			# Space-separated enabled-harness names, baked into cogbox-launch.sh's
 			# `HARNESSES=(@harnesses@)` so the launcher's set can never drift from
 			# what the VM was built with (single source of truth: mkHarnesses +
@@ -1093,6 +1201,48 @@
 					Env = [ "PATH=/bin" "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
 				};
 			};
+
+			# Container-native agent image:
+			# the cogbox guest's NixOS userland booted as an UNPRIVILEGED
+			# container -- no QEMU, no /dev/kvm, no privileged. Reuses the
+			# streamLayeredImage builder from cogbox-pod-image, but the contents
+			# are a full NixOS toplevel: /etc, users, /etc/nix/nix.conf, and CA
+			# trust are generated by NixOS activation at boot, so -- unlike the
+			# plain-userland cogbox-pod-image -- this image needs no fakeNss /
+			# usrBinEnv / baked nix.conf / cacert layers (their equivalents are
+			# mkContainer options). Entrypoint is systemd PID1 via the toplevel's
+			# /init; it runs the reused brain/trust/l7-trust oneshots to
+			# multi-user.target. cogbox-pod-image is deliberately left untouched
+			# (the VM backend coexists).
+			agent-image = pkgs.dockerTools.streamLayeredImage {
+				name = "cogbox-agent";
+				tag = "latest";
+				# systemd PID1 + early units need a writable /tmp; streamLayeredImage
+				# seeds none (same reason as cogbox-pod-image). Also bake root's home
+				# /root: NixOS does not create it for a container, and creating a new
+				# entry directly under / can be blocked by the runtime's rootfs
+				# ownership -- so the reused brain-materialize/trust oneshots (which
+				# write ~/work + dotfiles under /root) get a real, writable home.
+				extraCommands = "mkdir -m 1777 -p tmp var/tmp && mkdir -m 0700 -p root";
+				# The store closure arrives via the toplevel (also referenced by
+				# Entrypoint); no extra userland layers are needed.
+				contents = [ containerToplevel ];
+				config = {
+					Entrypoint = [ "${containerToplevel}/init" ];
+					# Mirror the cogworx k8s pod env so a
+					# kubectl-exec'd `c`/`tmux`/`git` resolves identically whether or
+					# not the pod also sets these. /run/current-system/sw/bin is
+					# populated by NixOS activation (the harness launchers c/oc, tmux,
+					# git all live there).
+					Env = [
+						"PATH=/run/current-system/sw/bin:/usr/bin:/bin"
+						"XDG_CONFIG_HOME=/var/lib/cogbox-state/config"
+						"COGBOX_DATA=/var/lib/cogbox-state/data/cogbox"
+						"XDG_RUNTIME_DIR=/run/cogbox"
+						"SSL_CERT_FILE=/run/cogbox/ca-bundle.crt"
+					];
+				};
+			};
 		} // lib.optionalAttrs (system == "x86_64-linux") {
 			# Test fixture: a cogbox wrapper baked against the
 			# pre-built test-hello runner. Used by tests/cogbox.nix
@@ -1115,6 +1265,7 @@
 		apps = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			image = self.packages.${system}.cogbox-pod-image;
+			agentImage = self.packages.${system}.agent-image;
 		in {
 			push-pod-image = {
 				type = "app";
@@ -1129,6 +1280,24 @@
 						echo "Pushed $ref" >&2
 					'';
 				}}/bin/push-pod-image";
+			};
+			# `nix run .#push-agent-image [-- <registry-ref>]` streams the
+			# container-native agent image into the destination registry. Supply
+			# the ref as the arg or via $COGBOX_AGENT_REF (default is a
+			# placeholder); auth from $REGISTRY_AUTH_FILE, else ~/.docker/config.json.
+			push-agent-image = {
+				type = "app";
+				program = "${pkgs.writeShellApplication {
+					name = "push-agent-image";
+					runtimeInputs = [ pkgs.skopeo ];
+					text = ''
+						ref="''${1:-''${COGBOX_AGENT_REF:-registry.example.com/team/cogbox-agent:latest}}"
+						authfile="''${REGISTRY_AUTH_FILE:-$HOME/.docker/config.json}"
+						echo "Pushing cogbox-agent -> docker://$ref (auth: $authfile)" >&2
+						${agentImage} | skopeo copy --insecure-policy --authfile "$authfile" docker-archive:/dev/stdin "docker://$ref"
+						echo "Pushed $ref" >&2
+					'';
+				}}/bin/push-agent-image";
 			};
 		});
 
