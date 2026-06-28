@@ -635,9 +635,51 @@
 				# writable dirs so the harness can scaffold session state alongside).
 				# Harness-agnostic: each layout is attempted, skipped if the brain
 				# didn't build it. Offline-safe -- reads only closure-resident paths.
+				# Container backend: the baked ${cogbox-brain} is BASE-only (the agent
+				# image is built once, plugin-less). Resolve $brain by rebuilding it
+				# from THIS instance's composition flake -- the SAME
+				# `--override-input userExtensions <composition>` path the VM runner
+				# rebuild takes (cogbox-launch.sh) -- and fall back to the baked base
+				# brain when the instance has no plugins or the rebuild fails
+				# (offline / eval error), so the sandbox always boots. Best-effort
+				# throughout; nix's stderr flows to the unit journal. COGBOX_INSTANCE
+				# is forwarded into the unit (PassEnvironment); ${self}/${nixpkgs} are
+				# the image's baked flake + nixpkgs sources.
+				brainResolveContainer = ''
+					brain=${cogbox-brain}
+					inst="''${COGBOX_INSTANCE:-default}"
+					icd="''${XDG_CONFIG_HOME:-${stateRoot}/config}/cogbox/instances/$inst"
+					pcount=0
+					if [ -f "$icd/config.json" ]; then
+						pcount=$(${pkgs.jq}/bin/jq -r '(.plugins // []) | length' "$icd/config.json" 2>/dev/null || echo 0)
+					fi
+					if [ "$pcount" -gt 0 ] && [ -f "$icd/plugins-flake/flake.nix" ]; then
+						# Resolve the composition's transitive tarball/narHash inputs from
+						# the per-instance file:// cache `cogbox plugin add` populated
+						# (require-sigs false: a local content-addressed cache is unsigned).
+						subst=()
+						[ -d "$icd/plugin-cache" ] && subst=(--option extra-substituters "file://$icd/plugin-cache" --option require-sigs false)
+						echo "cogbox-brain: rebuilding per-instance brain ($pcount plugin(s)) for instance '$inst'" >&2
+						if out=$(${pkgs.nix}/bin/nix build --no-link --print-out-paths \
+								--extra-experimental-features "nix-command flakes" \
+								"''${subst[@]}" \
+								--override-input userExtensions "path:$icd/plugins-flake" \
+								--override-input userExtensions/user/nixpkgs "path:${nixpkgs}" \
+								"path:${self}#nixosConfigurations.${configName system}.config.system.build.cogboxBrain"); then
+							first=$(printf '%s\n' "$out" | grep -m1 '^/nix/store/' || true)
+							if [ -n "$first" ] && [ -e "$first" ]; then
+								brain="$first"
+								echo "cogbox-brain: using per-instance brain $brain" >&2
+							else
+								echo "cogbox-brain: rebuild produced no out-path; using baked base brain" >&2
+							fi
+						else
+							echo "cogbox-brain: rebuild failed; using baked base brain (see prior nix log)" >&2
+						fi
+					fi'';
 				brainMaterializeScript = pkgs.writeShellScript "cogbox-brain-materialize" ''
 					set -e
-					brain=${cogbox-brain}
+					${if isContainer then brainResolveContainer else "brain=${cogbox-brain}"}
 					WORK=/var/lib/cogbox/work
 					mkdir -p "$WORK/.cogbox"
 					ln -sfn "$WORK" /root/work
@@ -695,6 +737,30 @@
 						| del(.projects["/var/lib/cogbox/home"])
 					' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 					chmod 600 "$f"
+				'';
+
+				# Container backend: seed instances/<COGBOX_INSTANCE>/config.json
+				# (with the default network-rule seed) once at boot, so the
+				# kubectl-exec'd control-plane verbs (rules/l7/plugin) have a config
+				# to edit. `cogbox init`'s --init-only path is pure host-state
+				# seeding -- on a fresh instance PLUGIN_COUNT is 0, so it never
+				# rebuilds a runner or touches a VM. 'default' is reserved by
+				# `cogbox init -n`, so the default instance omits -n (which writes
+				# the same instances/default/config.json).
+				cogboxInitScript = pkgs.writeShellScript "cogbox-init" ''
+					set -eu
+					inst="''${COGBOX_INSTANCE:-default}"
+					cfg="''${XDG_CONFIG_HOME:-${stateRoot}/config}/cogbox/instances/$inst/config.json"
+					if [ -f "$cfg" ]; then
+						echo "cogbox-init: $cfg already present; skipping seed." >&2
+						exit 0
+					fi
+					echo "cogbox-init: seeding config for instance '$inst'" >&2
+					if [ "$inst" = "default" ]; then
+						exec ${self.packages.${system}.cogbox-container}/bin/cogbox init -y
+					else
+						exec ${self.packages.${system}.cogbox-container}/bin/cogbox init -y -n "$inst"
+					fi
 				'';
 			in {
 				nixpkgs.config.allowUnfree = true;
@@ -760,7 +826,27 @@
 				]
 				++ lib.optionals (system != "riscv64-linux") [
 					bpftrace
-				];
+				]
+				# Container backend: the cogbox CLI itself, so cogworx can
+				# `kubectl exec <pod> -c agent -- cogbox <verb> -n <name>` to drive
+				# the control-plane verbs (init/rules/l7/remap/plugin) on the running
+				# sandbox. Lands `cogbox`/`cbx` in /run/current-system/sw/bin (on the
+				# agent-image PATH). The VM never carries the CLI in-guest (it is the
+				# host-side launcher there), so gate it to the container.
+				++ lib.optional isContainer self.packages.${system}.cogbox-container;
+
+				# Expose the materialized plugin "brain" as a build product so the
+				# container can rebuild it per-instance at boot. config.cogbox (hence
+				# this derivation) is target-independent, so it is the SAME drv on the
+				# VM and container configs; adding it here does not touch the microvm
+				# runner closure (which references neither system.build.cogboxBrain nor
+				# the toplevel's full system.build). The container's
+				# cogbox-brain-materialize builds
+				# `nixosConfigurations.${configName}.config.system.build.cogboxBrain`
+				# with `--override-input userExtensions <instance composition>` -- the
+				# exact mechanism cogbox-launch.sh uses to fold per-instance plugins
+				# into the VM runner.
+				system.build.cogboxBrain = cogbox-brain;
 
 				microvm = lib.mkIf isVm {
 					writableStoreOverlay = "/nix/.rw-store";
@@ -827,12 +913,19 @@
 						wantedBy = [ "multi-user.target" ];
 						before = [ "multi-user.target" "sshd.service" ];
 						after = [ stateUnit ]
+							++ lib.optional isContainer "cogbox-init.service"
 							++ lib.optional (isVm && harnesses ? "codex") "${utils.escapeSystemdPath "/root/.codex"}.mount";
 						requires = [ stateUnit ];
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
 							ExecStart = brainMaterializeScript;
+						} // lib.optionalAttrs isContainer {
+							# COGBOX_INSTANCE picks which instance's composition flake the
+							# brain rebuilds from; XDG_CONFIG_HOME locates it. systemd does
+							# not forward PID1's env, so set/pass them explicitly.
+							Environment = [ "XDG_CONFIG_HOME=${stateRoot}/config" ];
+							PassEnvironment = [ "COGBOX_INSTANCE" ];
 						};
 					};
 					cogbox-brain-trust = {
@@ -1021,6 +1114,31 @@
 							'';
 						};
 					};
+
+					# Container backend: seed the per-instance config.json before the
+					# brain materializes (and before any kubectl-exec'd verb edits it).
+					# Ordered after the state symlink and before brain-materialize.
+					cogbox-init = lib.mkIf isContainer {
+						description = "Seed the per-instance cogbox config (container backend)";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "multi-user.target" "cogbox-brain-materialize.service" ];
+						after = [ "cogbox-container-state.service" ];
+						requires = [ "cogbox-container-state.service" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							# systemd does not forward PID1's env to services. XDG_CONFIG_HOME
+							# /COGBOX_DATA/HOME are baked constants; COGBOX_INSTANCE is the
+							# runtime per-sandbox name the pod sets (unset -> "default").
+							Environment = [
+								"HOME=/root"
+								"XDG_CONFIG_HOME=${stateRoot}/config"
+								"COGBOX_DATA=${cogboxData}"
+							];
+							PassEnvironment = [ "COGBOX_INSTANCE" ];
+							ExecStart = cogboxInitScript;
+						};
+					};
 				};
 
 				virtualisation.docker.enable = lib.mkIf isVm true;
@@ -1170,6 +1288,17 @@
 			});
 			cogbox = mkCogbox runner;
 			default = cogbox;
+
+			# cogbox CLI for the container-native agent image: identical Zig
+			# binary + launch script, but baked against a NON-store placeholder
+			# runner so the heavy microvm runner closure (QEMU, guest kernel) is
+			# NOT pulled into the agent image. The container IS the sandbox -- it
+			# never launches a VM, so the only `cogbox` paths it exercises are the
+			# control-plane verbs (init/rules/l7/remap/plugin) and `cogbox init`'s
+			# --init-only host-state seeding, none of which dereference @runner@.
+			# COGBOX_FLAKE_SOURCE/COGBOX_NIXPKGS_SOURCE stay baked (the in-container
+			# per-instance brain rebuild below needs them).
+			cogbox-container = mkCogbox "/var/empty/cogbox-container-has-no-vm-runner";
 
 			# Container image for a single cogbox sandbox pod: bundles the cogbox
 			# CLI so a Kubernetes control plane (e.g. cogworx) runs `cogbox start`
