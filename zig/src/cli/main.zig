@@ -119,7 +119,14 @@ pub fn main(init: std.process.Init) !void {
 			std.fmt.parseInt(u16, rest[1], 10) catch filter_mod.l7_default_base
 		else
 			filter_mod.l7_default_base;
-		return l7proxy_module.run(allocator, rest[0], base);
+		// Accept mode: COGBOX_L7_ACCEPT=redirect selects the container enforcer's
+		// nft-REDIRECT front door (orig dst via SO_ORIGINAL_DST); anything else
+		// (incl. unset / "socks5") keeps the unchanged SOCKS5 VM/launch path.
+		const accept_mode: l7proxy_module.AcceptMode = if (env.get("COGBOX_L7_ACCEPT")) |v|
+			(if (std.mem.eql(u8, v, "redirect")) .redirect else .socks5)
+		else
+			.socks5;
+		return l7proxy_module.run(allocator, rest[0], base, accept_mode);
 	}
 	if (std.mem.eql(u8, verb, "__render-rules")) {
 		if (rest.len < 2) util.die(allocator, io, null, exit_codes.usage, "__render-rules requires <config> <runtime>", .{});

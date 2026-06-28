@@ -50,6 +50,18 @@ extern "c" fn @"open"(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const c_bind = @extern(*const fn (c_int, *const c.struct_sockaddr, c.socklen_t) callconv(.c) c_int, .{ .name = "bind" });
 const c_connect = @extern(*const fn (c_int, *const c.struct_sockaddr, c.socklen_t) callconv(.c) c_int, .{ .name = "connect" });
 const c_accept = @extern(*const fn (c_int, ?*c.struct_sockaddr, ?*c.socklen_t) callconv(.c) c_int, .{ .name = "accept" });
+// getsockopt for SO_ORIGINAL_DST. Bound as a raw libc symbol with an explicit
+// signature (the @cImport variant is fine, but binding it directly keeps the
+// pointer types unambiguous). Used only by the redirect accept path.
+const c_getsockopt = @extern(*const fn (c_int, c_int, c_int, *anyopaque, *c.socklen_t) callconv(.c) c_int, .{ .name = "getsockopt" });
+
+// Linux socket constants the netinet/in.h cImport doesn't surface (they live in
+// linux/netfilter_ipv4.h). Numeric per the stable kernel ABI; SOL_IP ==
+// IPPROTO_IP == 0. SO_ORIGINAL_DST reads the conntrack ORIGINAL tuple recorded
+// by a netfilter REDIRECT (DNAT) -- i.e. the pre-redirect destination the guest
+// aimed at, supplied by the kernel and not forgeable by the guest.
+const SOL_IP: c_int = 0;
+const SO_ORIGINAL_DST: c_int = 80;
 
 const peek_cap: usize = 16 * 1024;
 const relay_buf: usize = 32 * 1024;
@@ -64,6 +76,19 @@ var runtime_dir_len: usize = 0;
 // Loopback port of this instance's mitmproxy terminate backend (base + 2),
 // set in run() from the instance's L7 port base.
 var mitm_port: u16 = filter.l7_default_base + 2;
+
+/// Front-door accept mode, selected once at startup from COGBOX_L7_ACCEPT.
+///   socks5 (DEFAULT): the unchanged VM/launch path -- the guest's 80/443
+///     egress arrives as a SOCKS5 CONNECT carrying the original ip:port.
+///   redirect: the container enforcer path -- a normal listener receives flows
+///     that an nft REDIRECT (DNAT) sent here, and the KERNEL hands us the
+///     pre-redirect original dst via getsockopt(SO_ORIGINAL_DST), which a guest
+///     cannot forge. The enforcer holds NO CAP_NET_ADMIN, so this path uses
+///     neither IP_TRANSPARENT nor fwmark policy-routing (both NET_ADMIN-gated).
+/// Anything other than "redirect" resolves to socks5, so the existing path is
+/// byte-for-byte unchanged.
+pub const AcceptMode = enum { socks5, redirect };
+var accept_mode: AcceptMode = .socks5;
 
 // Tiny test-and-set spinlock guarding the two rulesets. Critical sections are
 // microsecond-short memory scans; reloads (the only writer, in the accept
@@ -87,29 +112,52 @@ fn unlockRules() void {
 var reload_pending = std.atomic.Value(bool).init(false);
 var conn_count = std.atomic.Value(usize).init(0);
 
-pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16) !void {
+pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: AcceptMode) !void {
 	if (runtime_dir.len >= runtime_dir_buf.len) return error.PathTooLong;
 	@memcpy(runtime_dir_buf[0..runtime_dir.len], runtime_dir);
 	runtime_dir_len = runtime_dir.len;
 
+	accept_mode = mode;
 	installSignals();
 	loadRules();
 
 	// Per-instance loopback ports (base / base+1 / base+2). Binding is
 	// fail-closed: if a port is already taken (e.g. another instance picked
-	// the same base, or a stale proxy), listenLoopback returns error.Bind and
-	// the process exits non-zero -- the launcher treats that as a hard failure
-	// and aborts the start rather than leaving the funnel pointed elsewhere.
+	// the same base, or a stale proxy), the listen* helper returns error.Bind
+	// and the process exits non-zero -- the launcher treats that as a hard
+	// failure and aborts the start rather than leaving the funnel pointed
+	// elsewhere.
 	const ports = filter.l7PortsForBase(l7_base);
 	mitm_port = ports.mitm;
-	const tls_fd = try listenLoopback(ports.tls);
-	const http_fd = try listenLoopback(ports.http);
 
-	logLine("l7proxy: listening on 127.0.0.1:{d} (tls) :{d} (http); terminate backend :{d}", .{ ports.tls, ports.http, ports.mitm });
+	switch (mode) {
+		// DEFAULT path -- byte-for-byte identical to the original SOCKS5 proxy.
+		// The VM/launch path only ever reaches here.
+		.socks5 => {
+			const tls_fd = try listenLoopback(ports.tls);
+			const http_fd = try listenLoopback(ports.http);
 
-	const th = try std.Thread.spawn(.{}, acceptLoop, .{http_fd});
-	th.detach();
-	acceptLoop(tls_fd);
+			logLine("l7proxy: listening on 127.0.0.1:{d} (tls) :{d} (http); terminate backend :{d}", .{ ports.tls, ports.http, ports.mitm });
+
+			const th = try std.Thread.spawn(.{}, acceptLoop, .{http_fd});
+			th.detach();
+			acceptLoop(tls_fd);
+		},
+		// Container enforcer path: ONE normal listener on `base`. An nft REDIRECT
+		// (DNAT) funnels both :80 and :443 (and any other diverted port) here;
+		// peekClassify distinguishes TLS/HTTP/neither off the first byte, so the
+		// base+1 (http) listener is unused. The original destination is recovered
+		// from the kernel per connection (originalDst -> SO_ORIGINAL_DST), never
+		// from the guest. No IP_TRANSPARENT bind -- that needs NET_ADMIN, which
+		// the enforcer deliberately lacks.
+		.redirect => {
+			const r_fd = try listenLoopback(ports.tls);
+
+			logLine("l7proxy: REDIRECT listener on 127.0.0.1:{d}; terminate backend :{d}", .{ ports.tls, ports.mitm });
+
+			acceptLoop(r_fd);
+		},
+	}
 }
 
 // --- signals / reload ---
@@ -203,9 +251,9 @@ fn acceptLoop(listen_fd: c_int) void {
 
 // --- per-connection worker ---
 
-const Orig = struct { addr: filter.IpAddr, port: u16 };
+pub const Orig = struct { addr: filter.IpAddr, port: u16 };
 
-const Classified = union(enum) {
+pub const Classified = union(enum) {
 	tls: tls.Sni, // SNI + whether an ECH extension accompanied it
 	http: http.Parsed,
 	deny,
@@ -217,7 +265,13 @@ fn worker(client_fd: c_int) void {
 
 	setTimeouts(client_fd);
 
-	const orig = socks5Accept(client_fd) orelse return;
+	// Recover the original dst. socks5 mode reads it from the SOCKS5 CONNECT the
+	// shim sent; redirect mode recovers it from the kernel conntrack original
+	// tuple via SO_ORIGINAL_DST (never guest-forgeable).
+	const orig = switch (accept_mode) {
+		.socks5 => socks5Accept(client_fd) orelse return,
+		.redirect => originalDst(client_fd) orelse return,
+	};
 
 	var buf: [peek_cap]u8 = undefined;
 	var out_host: [256]u8 = undefined;
@@ -232,7 +286,16 @@ fn worker(client_fd: c_int) void {
 	var ech = false;
 	switch (cl) {
 		.deny => {
-			logReject(orig, "?", "unclassifiable-or-no-sni");
+			// A flow we can't classify as HTTP/TLS. In socks5 mode this is a hard
+			// drop (unchanged). In redirect mode the nft REDIRECT can hand us an
+			// arbitrary funneled port, so give the flow ordered first-match L4
+			// parity: splice it to its LITERAL kernel-provided orig dst -- but
+			// only behind the hard floor + CIDR gate (rawL4Splice).
+			if (accept_mode == .redirect) {
+				rawL4Splice(client_fd, orig, buf[0..buffered]);
+			} else {
+				logReject(orig, "?", "unclassifiable-or-no-sni");
+			}
 			return;
 		},
 		.tls => |s| {
@@ -472,13 +535,53 @@ fn socks5Accept(fd: c_int) ?Orig {
 	return orig;
 }
 
+// --- redirect original-destination recovery (kernel-provided, never forgeable) ---
+
+/// Parse a kernel-filled sockaddr into an Orig. v4/TCP-only: any non-AF_INET
+/// family returns null and the caller refuses the connection (the v6 guard).
+/// The address/port bytes come straight from the kernel's conntrack record of
+/// the connection, so a guest cannot forge them. Takes a type-erased pointer
+/// (so a test can feed a libc-laid-out sockaddr from its own cImport); the
+/// alignment bound matches struct sockaddr_in, the smallest thing read here.
+pub fn origFromStorage(ss: *align(@alignOf(c.struct_sockaddr_in)) const anyopaque) ?Orig {
+	const sa: *const c.struct_sockaddr = @ptrCast(ss);
+	if (sa.sa_family != c.AF_INET) return null;
+	const a4: *const c.struct_sockaddr_in = @ptrCast(ss);
+	return .{
+		.addr = .{ .ipv4 = @bitCast(a4.sin_addr.s_addr) },
+		.port = std.mem.bigToNative(u16, a4.sin_port),
+	};
+}
+
+/// The checked original destination from the SO_ORIGINAL_DST sockaddr. Parses
+/// it (v4-only guard) then refuses a loopback result: SO_ORIGINAL_DST returns a
+/// loopback dst only when there was no DNAT -- i.e. a direct hit on our own
+/// 127.0.0.1 listener (an accept loop) or a guest probe of loopback the REDIRECT
+/// must never have funneled here. Both are anti-loop refusals.
+pub fn origDstFromStorage(ss: *align(@alignOf(c.struct_sockaddr_in)) const anyopaque) ?Orig {
+	const o = origFromStorage(ss) orelse return null;
+	if (filter.isLoopback(o.addr)) return null;
+	return o;
+}
+
+/// Recover the connection's original destination from the kernel conntrack
+/// original tuple. redirect mode only. Returns null (refuse) on getsockopt
+/// failure, a non-IPv4 family, or a loopback/own-listener dst. The dst is
+/// authoritative kernel state -- the guest never supplies it on this path.
+fn originalDst(fd: c_int) ?Orig {
+	var od: c.struct_sockaddr_storage = std.mem.zeroes(c.struct_sockaddr_storage);
+	var od_len: c.socklen_t = @sizeOf(c.struct_sockaddr_storage);
+	if (c_getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, @ptrCast(&od), &od_len) != 0) return null;
+	return origDstFromStorage(&od);
+}
+
 // --- peek + classify ---
 
 fn isHttpStart(b: u8) bool {
 	return b >= 'A' and b <= 'Z';
 }
 
-fn peekClassify(
+pub fn peekClassify(
 	fd: c_int,
 	buf: []u8,
 	buffered: *usize,
@@ -588,6 +691,81 @@ fn connectVetted(ai: *c.struct_addrinfo, port: u16) ?c_int {
 		return null;
 	}
 	return fd;
+}
+
+// --- raw-L4 splice arm (redirect only) ---
+
+/// The gate for an unclassifiable (non-HTTP/TLS) redirect flow. It may be spliced
+/// to its LITERAL kernel-provided orig dst only when BOTH gates pass: the
+/// non-overridable SSRF hard floor admits the IP, AND the instance's ordered
+/// first-match L4 CIDR policy does not deny (tcp, IP, port). Pure + default-deny
+/// (an empty/no-match ruleset evaluates to .deny -> false). Deliberately
+/// STRICTER than the named splice path: there is no vhost name to `allow`, so
+/// the L4 CIDR policy is ALWAYS consulted -- it is never superseded here. This
+/// mirrors the in-guest LD_PRELOAD shim, which evaluates the literal connect()
+/// destination against the same rule engine.
+pub fn rawL4Allowed(rs: *const filter.RuleSet, orig: Orig) bool {
+	if (filter.isHardBlocked(orig.addr)) return false;
+	return rs.evaluate(.tcp, orig.addr, orig.port) != .deny;
+}
+
+/// Splice a non-HTTP/TLS redirect flow straight to its original destination. The
+/// dst is the kernel-recovered orig (NO name -> no re-resolve; never a
+/// guest-supplied value). Connects only after rawL4Allowed clears both gates;
+/// otherwise it logs and drops.
+fn rawL4Splice(client_fd: c_int, orig: Orig, buffered: []const u8) void {
+	lockRules();
+	const allowed = rawL4Allowed(&cidr_rs, orig);
+	unlockRules();
+	if (!allowed) {
+		logReject(orig, "?", "rawl4-deny");
+		return;
+	}
+
+	const up_fd = connectRaw(orig.addr, orig.port) orelse {
+		logReject(orig, "?", "rawl4-no-upstream");
+		return;
+	};
+	defer _ = c.close(up_fd);
+
+	if (!writeAll(up_fd, buffered)) return;
+	relay(client_fd, up_fd);
+}
+
+/// Connect to a literal IP:port (no name resolution). Used only by the raw-L4
+/// arm, on an orig dst that already cleared rawL4Allowed. originalDst only ever
+/// yields IPv4, but the v6 branch is kept for completeness.
+fn connectRaw(addr: filter.IpAddr, port: u16) ?c_int {
+	switch (addr) {
+		.ipv4 => |b| {
+			var sa: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+			sa.sin_family = c.AF_INET;
+			sa.sin_port = std.mem.nativeToBig(u16, port);
+			sa.sin_addr.s_addr = @bitCast(b);
+			const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+			if (fd < 0) return null;
+			setTimeouts(fd);
+			if (c_connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0) {
+				_ = c.close(fd);
+				return null;
+			}
+			return fd;
+		},
+		.ipv6 => |b| {
+			var sa: c.struct_sockaddr_in6 = std.mem.zeroes(c.struct_sockaddr_in6);
+			sa.sin6_family = c.AF_INET6;
+			sa.sin6_port = std.mem.nativeToBig(u16, port);
+			@memcpy(@as([*]u8, @ptrCast(&sa.sin6_addr))[0..16], &b);
+			const fd = c.socket(c.AF_INET6, c.SOCK_STREAM, 0);
+			if (fd < 0) return null;
+			setTimeouts(fd);
+			if (c_connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in6)) != 0) {
+				_ = c.close(fd);
+				return null;
+			}
+			return fd;
+		},
+	}
 }
 
 fn sockaddrToIp(sa: *c.struct_sockaddr) ?filter.IpAddr {
