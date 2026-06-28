@@ -56,8 +56,27 @@ mkdir -p "$RUNTIME" "$DIVERT_DIR" "$CAPUB_DIR" "$CA_CONF"
 # egress is not redirected back into us. The divert volume is rw here, ro in
 # nft-init, ABSENT from the agent -> the sandbox cannot forge it. Our children
 # (mitmdump, l7proxy) share this cgroup, so one write covers them.
-cat /proc/self/cgroup > "$DIVERT_DIR/enforcer.cgroup" \
+#
+# k8s gives EACH container a PRIVATE cgroup namespace, so /proc/self/cgroup here
+# is namespace-relative ("0::/") -- useless to nft-init, which lives in its OWN
+# cgroupns and cannot name our cgroup by that path. What IS globally stable is our
+# cgroup DIRECTORY's kernfs inode: under a private cgroupns /sys/fs/cgroup is the
+# cgroup-v2 mount rooted at our OWN container cgroup, so `stat /sys/fs/cgroup`
+# yields that directory's inode -- the SAME inode nft-init sees for our scope when
+# it walks the host cgroup tree (kernfs inode ids are global, not namespaced).
+# nft-init matches by inode to recover our REAL (host-global) cgroup path and keys
+# the exemption on it. We publish `inode=` (what nft-init reads) plus the
+# ns-relative path as a diagnostic.
+ECG_INODE="$(stat -c %i /sys/fs/cgroup 2>/dev/null)"
+ECG_NSREL="$(tr '\n' ',' < /proc/self/cgroup 2>/dev/null)"
+[ -n "$ECG_INODE" ] || die "could not stat /sys/fs/cgroup inode for the divert handshake"
+{
+	echo "inode=$ECG_INODE"
+	echo "nsrel=$ECG_NSREL"
+} > "$DIVERT_DIR/enforcer.cgroup.tmp" \
+	&& mv "$DIVERT_DIR/enforcer.cgroup.tmp" "$DIVERT_DIR/enforcer.cgroup" \
 	|| die "failed to write cgroup handshake to $DIVERT_DIR/enforcer.cgroup"
+log "cgroup handshake published: inode=$ECG_INODE nsrel=$ECG_NSREL"
 
 # -- (b) render the wire files -------------------------------------
 # The same renderer the hot-reload path uses (no jq/Zig drift). Writes l7-rules

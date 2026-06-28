@@ -1480,8 +1480,9 @@
 					contents = [
 						pkgs.nftables             # nft
 						pkgs.iproute2             # ip (the native-sidecar netns toolkit)
-						pkgs.gawk                 # awk (handle lookup)
-						pkgs.coreutils            # cat/sleep
+						pkgs.gawk                 # awk (handle lookup + cgroup level/depth)
+						pkgs.coreutils            # cat/sleep/stat/ls/tr/head/printf
+						pkgs.findutils            # find -inum (resolve the enforcer cgroup by inode)
 						pkgs.dockerTools.binSh    # /bin/sh for the script's #!/bin/sh
 						(pkgs.runCommand "cogbox-nft-divert" {} ''
 							mkdir -p $out/bin
