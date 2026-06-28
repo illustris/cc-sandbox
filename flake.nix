@@ -1064,6 +1064,34 @@
 				extraModules = cogboxModules system { target = "container"; };
 			};
 			containerToplevel = containerSystem.config.system.build.toplevel;
+			# Pre-systemd boot shim for the unprivileged agent pod
+			# systemd PID1 cannot bring
+			# itself up under a stock Kubernetes pod for two container-specific
+			# reasons that must be fixed BEFORE exec'ing the NixOS init:
+			#
+			#  1. cgroup-v2 delegation. The kubelet mounts the pod's delegated
+			#     /sys/fs/cgroup subtree READ-ONLY for a non-privileged container,
+			#     so systemd cannot create its cgroup hierarchy and exits. Remount
+			#     it read-write. This is namespaced to the pod's OWN delegated
+			#     subtree (private cgroup namespace, cgroup root "0::/"), NOT the
+			#     host root, and uses the single CAP_SYS_ADMIN the pod is granted
+			#     for exactly this — no privileged, no /dev/kvm, no NET_ADMIN/RAW.
+			#     systemd in container mode does NOT self-remount a ro cgroup
+			#     (verified), so this shim is required.
+			#  2. Writable /etc. dockerTools lays the NixOS toplevel's own /etc as
+			#     a symlink into the immutable Nix store, so activation's setup-etc
+			#     cannot populate it. Drop the symlink; NixOS then builds a fresh
+			#     writable /etc on the overlay rootfs.
+			#
+			# Both are no-ops/best-effort if a future runtime delegates a writable
+			# cgroup or the image stops baking /etc, so the shim degrades cleanly.
+			# NB: at boot time PATH points only at /run/current-system/sw/bin (not
+			# yet populated), so every command here MUST be an absolute store path.
+			agentInit = pkgs.writeShellScript "cogbox-agent-init" ''
+				${pkgs.util-linux}/bin/mount -o remount,rw /sys/fs/cgroup 2>/dev/null || true
+				[ -L /etc ] && ${pkgs.coreutils}/bin/rm -f /etc || true
+				exec ${containerToplevel}/init
+			'';
 			# Space-separated enabled-harness names, baked into cogbox-launch.sh's
 			# `HARNESSES=(@harnesses@)` so the launcher's set can never drift from
 			# what the VM was built with (single source of truth: mkHarnesses +
@@ -1223,12 +1251,19 @@
 				# entry directly under / can be blocked by the runtime's rootfs
 				# ownership -- so the reused brain-materialize/trust oneshots (which
 				# write ~/work + dotfiles under /root) get a real, writable home.
-				extraCommands = "mkdir -m 1777 -p tmp var/tmp && mkdir -m 0700 -p root";
+				# Also drop the NixOS toplevel's baked /etc symlink (it points into
+				# the read-only Nix store, so activation's setup-etc cannot populate
+				# it); with it gone NixOS builds a fresh writable /etc on the overlay
+				# rootfs at boot. The agent-init shim repeats this defensively at
+				# runtime in case the whiteout does not survive the layering.
+				extraCommands = "mkdir -m 1777 -p tmp var/tmp && mkdir -m 0700 -p root && rm -f etc";
 				# The store closure arrives via the toplevel (also referenced by
 				# Entrypoint); no extra userland layers are needed.
 				contents = [ containerToplevel ];
 				config = {
-					Entrypoint = [ "${containerToplevel}/init" ];
+					# Entrypoint is the pre-systemd shim (above), which fixes the
+					# cgroup/-etc container quirks then exec's the NixOS systemd PID1.
+					Entrypoint = [ "${agentInit}" ];
 					# Mirror the cogworx k8s pod env so a
 					# kubectl-exec'd `c`/`tmux`/`git` resolves identically whether or
 					# not the pod also sets these. /run/current-system/sw/bin is
@@ -1240,6 +1275,12 @@
 						"COGBOX_DATA=/var/lib/cogbox-state/data/cogbox"
 						"XDG_RUNTIME_DIR=/run/cogbox"
 						"SSL_CERT_FILE=/run/cogbox/ca-bundle.crt"
+						# NixOS stage-2 + systemd run in container mode only when the
+						# `container` env var is set (nspawn sets it; containerd/k8s do
+						# not). Without it stage-2 tries to remount / and mount host
+						# special filesystems, all of which fail unprivileged. Set it
+						# so the guest boots as a container, not a host.
+						"container=oci"
 					];
 				};
 			};
