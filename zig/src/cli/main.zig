@@ -25,6 +25,7 @@ const filter_mod = @import("filter");
 const start_verb = @import("verbs/start.zig");
 const attach_verb = @import("verbs/attach_verb.zig");
 const attach = @import("attach.zig");
+const enforce_verb = @import("verbs/enforce.zig");
 
 const KNOWN_VERBS = [_][]const u8{
 	"start", "stop",  "restart", "status",  "list",    "init",
@@ -32,8 +33,9 @@ const KNOWN_VERBS = [_][]const u8{
 	"console", "monitor", "delete", "help",
 	// Hidden re-exec / helper targets, recognized below but omitted from
 	// help: "__launch" (re-exec), "__l7proxy" (the host-side L7 proxy),
-	// "__render-rules" (boot-time runtime-file renderer).
-	"__launch", "__l7proxy", "__render-rules",
+	// "__render-rules" (boot-time runtime-file renderer), "enforce" (the
+	// container enforcer sidecar's PID1 supervisor entrypoint).
+	"__launch", "__l7proxy", "__render-rules", "enforce",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -110,7 +112,8 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "remap")) return remap_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "l7")) return l7_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "plugin")) return plugin_verb.run(allocator, io, env, &p, rest);
-	if (std.mem.eql(u8, verb, "secret")) return secret_verb.run(allocator, io, &p, rest);
+	if (std.mem.eql(u8, verb, "secret")) return secret_verb.run(allocator, io, env, &p, rest);
+	if (std.mem.eql(u8, verb, "enforce")) return enforce_verb.run(allocator, io, env, rest);
 	if (std.mem.eql(u8, verb, "__l7proxy")) {
 		if (rest.len < 1) util.die(allocator, io, null, exit_codes.usage, "__l7proxy requires a runtime dir [l7-base-port]", .{});
 		// Optional L7 port base (default canonical); the launcher passes the
@@ -130,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
 	}
 	if (std.mem.eql(u8, verb, "__render-rules")) {
 		if (rest.len < 2) util.die(allocator, io, null, exit_codes.usage, "__render-rules requires <config> <runtime>", .{});
-		return rules_module.renderFiles(allocator, io, rest[0], rest[1]);
+		return rules_module.renderFiles(allocator, io, env, rest[0], rest[1]);
 	}
 	if (std.mem.eql(u8, verb, "console")) return attach_verb.run(allocator, io, &p, rest, attach.Target.console);
 	if (std.mem.eql(u8, verb, "monitor")) return attach_verb.run(allocator, io, &p, rest, attach.Target.monitor);

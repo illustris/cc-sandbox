@@ -384,11 +384,11 @@
 				# (so ~/work resolves identically to the VM).
 				stateUnit = if isVm then "var-lib-cogbox.mount" else "cogbox-container-state.service";
 				# L7 trust CA source: fw_cfg in the VM, a mounted file in the
-				# container (absent in Phase 0 -> the unit yields the system
+				# container (the enforcer publishes it; absent -> the unit yields the system
 				# bundle, which is the no-enforcement default).
 				l7CaSource = if isVm
 					then "/sys/firmware/qemu_fw_cfg/by_name/opt/system-l7ca/raw"
-					else "/run/cogbox/ca.crt";
+					else "/var/run/cogbox-ca/ca.crt"; # enforcer publishes the CA cert here (agent ro mount)
 
 				# Flatten harnesses into a list of paths annotated with
 				# their owning harness name and path key.
@@ -954,7 +954,16 @@
 							ExecStart = pkgs.writeShellScript "cogbox-l7-trust" ''
 								set -e
 								mkdir -p /run/cogbox
-								raw=${l7CaSource}
+								raw=${l7CaSource}${lib.optionalString isContainer ''
+								  # The enforcer sidecar mints the CA then publishes the cert to the
+								  # ca-pub mount asynchronously. BLOCK (bounded, ~60s) so the bundle + NSS
+								  # import below actually include it and harness egress never opens before
+								  # the CA is trusted. The nft divert is fail-closed meanwhile, so a timeout
+								  # here degrades to the system bundle, never opens an untrusted hole.
+								  for _ in $(seq 1 300); do
+								  	[ -s "$raw" ] && break
+								  	sleep 0.2
+								  done''}
 								ca=/run/cogbox/l7-ca.crt
 								bundle=${l7CaBundle}
 								sys=/etc/ssl/certs/ca-certificates.crt
@@ -1245,9 +1254,26 @@
 					--replace-fail "@flakeSource@" "${self}" \
 					--replace-fail "@nixpkgsSource@" "${nixpkgs}"
 				chmod +x $out/libexec/cogbox-launch.sh
+				
+				# Container enforcer supervisor (sidecar PID1). Reuses the same cogbox
+				# binary + mitmdump + L7 addon as the launch script; NO VM tokens.
+				cp ${./cogbox-enforce.sh} $out/libexec/cogbox-enforce.sh
+				chmod +w $out/libexec/cogbox-enforce.sh
+				substituteInPlace $out/libexec/cogbox-enforce.sh \
+					--replace-fail "@cogbox@" "$out/bin/cogbox" \
+					--replace-fail "@mitmdump@" "${pkgs.mitmproxy}/bin/mitmdump" \
+					--replace-fail "@l7addon@" "$out/libexec/l7-mitm-addon.py"
+				chmod +x $out/libexec/cogbox-enforce.sh
+				
+				# nft REDIRECT divert init -- the nft-init sidecar's entrypoint. Standalone
+				# POSIX sh (bare nft/awk resolved from the nft-init image PATH), so it
+				# carries no @-substitutions; co-located here for provenance/debugging.
+				cp ${./cogbox-nft-divert.sh} $out/libexec/cogbox-nft-divert.sh
+				chmod +x $out/libexec/cogbox-nft-divert.sh
 
 				wrapProgram $out/bin/cogbox \
 					--set COGBOX_LAUNCH_SCRIPT $out/libexec/cogbox-launch.sh \
+					--set COGBOX_ENFORCE_SCRIPT $out/libexec/cogbox-enforce.sh \
 					--set-default COGBOX_FLAKE_SOURCE "${self}" \
 					--set-default COGBOX_NIXPKGS_SOURCE "${nixpkgs}" \
 					--prefix PATH : "${lib.makeBinPath (with pkgs; [
@@ -1413,6 +1439,62 @@
 					];
 				};
 			};
+				# Container enforcer sidecar image (the L7 proxy/mitm control plane). Uses
+				# the placeholder-runner cogbox (cogbox-container) so NO QEMU/microvm-runner
+				# closure is pulled in; mitmdump + the L7 addon + cogbox-enforce.sh arrive via
+				# that cogbox's closure (the @mitmdump@/@l7addon@ substitutions). The pod
+				# overrides Entrypoint with `cogbox enforce -n <name>`. (passt-cc/libnetfilter
+				# remain incidentally in the cogbox closure but are unused here.)
+				enforcer-image = pkgs.dockerTools.streamLayeredImage {
+					name = "cogbox-enforcer";
+					tag = "latest";
+					# mitmproxy/python + the supervisor write under /tmp; streamLayeredImage
+					# seeds none (same as cogbox-pod-image). Provide it.
+					extraCommands = "mkdir -m 1777 -p tmp var/tmp";
+					contents = [
+						cogbox-container          # cogbox CLI + cogbox-enforce.sh + mitmdump + L7 addon (closure)
+						pkgs.cacert
+						pkgs.bashInteractive
+						pkgs.coreutils
+						pkgs.gnugrep              # cogbox-enforce.sh greps the CA for a stray private key
+						# cogbox-enforce.sh is `#!/usr/bin/env bash`; without /usr/bin/env the
+						# kernel cannot find the interpreter.
+						pkgs.dockerTools.usrBinEnv
+						# mitmproxy drops privileges / calls id(); both need /etc/passwd + group.
+						pkgs.dockerTools.fakeNss
+					];
+					config = {
+					  # Pod sets command: ["cogbox","enforce","-n",<name>]; this is a sane default.
+					  Entrypoint = [ "/bin/cogbox" ];
+					  Env = [ "PATH=/bin" "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
+					};
+				};
+
+				# nft REDIRECT divert init image -- the privileged native sidecar (NET_ADMIN/
+				# NET_RAW). MINIMAL: just nftables + iproute2 + gawk + coreutils + /bin/sh +
+				# the standalone divert script (entrypoint). NO cogbox/qemu/mitmproxy. The pod
+				# sets no command, so the image Entrypoint runs the script directly.
+				nft-init-image = pkgs.dockerTools.streamLayeredImage {
+					name = "cogbox-nft-init";
+					tag = "latest";
+					contents = [
+						pkgs.nftables             # nft
+						pkgs.iproute2             # ip (the native-sidecar netns toolkit)
+						pkgs.gawk                 # awk (handle lookup)
+						pkgs.coreutils            # cat/sleep
+						pkgs.dockerTools.binSh    # /bin/sh for the script's #!/bin/sh
+						(pkgs.runCommand "cogbox-nft-divert" {} ''
+							mkdir -p $out/bin
+							cp ${./cogbox-nft-divert.sh} $out/bin/cogbox-nft-divert
+							chmod +x $out/bin/cogbox-nft-divert
+						'')
+					];
+					config = {
+					  Entrypoint = [ "/bin/cogbox-nft-divert" ];
+					  Env = [ "PATH=/bin" "COGBOX_DIVERT_PORT=18443" ];
+					};
+				};
+
 		} // lib.optionalAttrs (system == "x86_64-linux") {
 			# Test fixture: a cogbox wrapper baked against the
 			# pre-built test-hello runner. Used by tests/cogbox.nix
@@ -1436,6 +1518,8 @@
 			pkgs = nixpkgs.legacyPackages.${system};
 			image = self.packages.${system}.cogbox-pod-image;
 			agentImage = self.packages.${system}.agent-image;
+			enforcerImage = self.packages.${system}.enforcer-image;
+			nftInitImage = self.packages.${system}.nft-init-image;
 		in {
 			push-pod-image = {
 				type = "app";
@@ -1468,6 +1552,41 @@
 						echo "Pushed $ref" >&2
 					'';
 				}}/bin/push-agent-image";
+			};
+			# `nix run .#push-enforcer-image [-- <ref>]` streams the enforcer sidecar
+			# image into the destination registry. Ref via the arg or $COGBOX_ENFORCER_REF
+			# (default a placeholder on registry.example.com); auth from
+			# $REGISTRY_AUTH_FILE, else ~/.docker/config.json.
+			push-enforcer-image = {
+				type = "app";
+				program = "${pkgs.writeShellApplication {
+					name = "push-enforcer-image";
+					runtimeInputs = [ pkgs.skopeo ];
+					text = ''
+						ref="''${1:-''${COGBOX_ENFORCER_REF:-registry.example.com/team/cogbox-enforcer:latest}}"
+						authfile="''${REGISTRY_AUTH_FILE:-$HOME/.docker/config.json}"
+						echo "Pushing cogbox-enforcer -> docker://$ref (auth: $authfile)" >&2
+						${enforcerImage} | skopeo copy --insecure-policy --authfile "$authfile" docker-archive:/dev/stdin "docker://$ref"
+						echo "Pushed $ref" >&2
+					'';
+				}}/bin/push-enforcer-image";
+			};
+			# `nix run .#push-nft-init-image [-- <ref>]` streams the nft-init sidecar
+			# image. Ref via the arg or $COGBOX_NFT_INIT_REF (default a placeholder on
+			# registry.example.com); auth as above.
+			push-nft-init-image = {
+				type = "app";
+				program = "${pkgs.writeShellApplication {
+					name = "push-nft-init-image";
+					runtimeInputs = [ pkgs.skopeo ];
+					text = ''
+						ref="''${1:-''${COGBOX_NFT_INIT_REF:-registry.example.com/team/cogbox-nft-init:latest}}"
+						authfile="''${REGISTRY_AUTH_FILE:-$HOME/.docker/config.json}"
+						echo "Pushing cogbox-nft-init -> docker://$ref (auth: $authfile)" >&2
+						${nftInitImage} | skopeo copy --insecure-policy --authfile "$authfile" docker-archive:/dev/stdin "docker://$ref"
+						echo "Pushed $ref" >&2
+					'';
+				}}/bin/push-nft-init-image";
 			};
 		});
 

@@ -69,21 +69,39 @@ pub fn buildLaunchArgs(
 	return try args.toOwnedSlice(allocator);
 }
 
-/// Resolve the absolute path to libexec/cogbox-launch.sh by reading
-/// /proc/self/exe and walking up. Falls back to the COGBOX_LAUNCH_SCRIPT
-/// env var for testing.
-pub fn resolveScriptPath(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) ![]const u8 {
-	if (env.get("COGBOX_LAUNCH_SCRIPT")) |p| {
+/// Resolve the absolute path to a sibling libexec script by reading
+/// /proc/self/exe and walking up (exe = .../bin/cogbox -> .../libexec/<name>),
+/// so the binary stays relocatable. An explicit `override` env var wins (used by
+/// the wrapper's --set and by tests).
+fn resolveLibexec(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	env: *std.process.Environ.Map,
+	override: []const u8,
+	name: []const u8,
+) ![]const u8 {
+	if (env.get(override)) |p| {
 		return try allocator.dupe(u8, p);
 	}
 
 	var buf: [std.fs.max_path_bytes]u8 = undefined;
 	const n = try std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", &buf);
 	const exe = buf[0..n];
-	// exe = .../bin/cogbox  -> bin_dir = .../bin  -> prefix = ...
 	const bin_dir = std.fs.path.dirname(exe) orelse return error.NoBinDir;
 	const prefix = std.fs.path.dirname(bin_dir) orelse return error.NoPrefix;
-	return try std.fs.path.join(allocator, &.{ prefix, "libexec", "cogbox-launch.sh" });
+	return try std.fs.path.join(allocator, &.{ prefix, "libexec", name });
+}
+
+/// Resolve the absolute path to libexec/cogbox-launch.sh. Falls back to the
+/// COGBOX_LAUNCH_SCRIPT env var for testing.
+pub fn resolveScriptPath(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) ![]const u8 {
+	return resolveLibexec(allocator, io, env, "COGBOX_LAUNCH_SCRIPT", "cogbox-launch.sh");
+}
+
+/// Resolve the absolute path to libexec/cogbox-enforce.sh (the container
+/// enforcer supervisor). Falls back to the COGBOX_ENFORCE_SCRIPT env var.
+pub fn resolveEnforceScriptPath(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) ![]const u8 {
+	return resolveLibexec(allocator, io, env, "COGBOX_ENFORCE_SCRIPT", "cogbox-enforce.sh");
 }
 
 extern "c" fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;

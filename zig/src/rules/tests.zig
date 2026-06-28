@@ -11,4 +11,5 @@ test {
 	_ = @import("rule_test.zig");
 	_ = @import("config_test.zig");
 	_ = @import("reload.zig");
+	_ = @import("main.zig");
 }

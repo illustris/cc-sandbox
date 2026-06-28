@@ -26,6 +26,7 @@ const rules_module = @import("rules_module");
 pub fn run(
 	allocator: std.mem.Allocator,
 	io: std.Io,
+	env: *std.process.Environ.Map,
 	p: *const paths.Paths,
 	argv: []const []const u8,
 ) !void {
@@ -73,11 +74,19 @@ pub fn run(
 	// already-bound store + signal its proxy. No store mutation.
 	if (rest.items.len > 0 and std.mem.eql(u8, rest.items[0], "reload")) {
 		const n = name orelse util.die(allocator, io, "secret", exit_codes.usage, "secret reload requires -n NAME", .{});
-		try reRenderInstance(allocator, io, p, n, true);
+		try reRenderInstance(allocator, io, env, p, n, true);
 		return;
 	}
 
-	const secrets_dir = try paths.globalSecretsDir(allocator, p);
+	// The store the operator binds into. The container enforcer keeps it on an
+	// ENFORCER-PRIVATE volume (never the agent-readable PVC), so honor the same
+	// COGBOX_GLOBAL_SECRETS_DIR override the renderer (resolveSecretDirs) reads;
+	// otherwise the historical <config>/secrets is used. WRITE and READ must
+	// agree on one location, else a bind would render against the wrong store.
+	const secrets_dir = if (env.get("COGBOX_GLOBAL_SECRETS_DIR")) |d|
+		try allocator.dupe(u8, d)
+	else
+		try paths.globalSecretsDir(allocator, p);
 	defer allocator.free(secrets_dir);
 
 	try secret_module.dispatch(allocator, io, secrets_dir, rest.items);
@@ -88,7 +97,7 @@ pub fn run(
 	// running / not inited) must not fail the command.
 	if (name) |n| {
 		if (rest.items.len > 0 and isMutation(rest.items[0])) {
-			reRenderInstance(allocator, io, p, n, false) catch |err| {
+			reRenderInstance(allocator, io, env, p, n, false) catch |err| {
 				util.warn(allocator, io, "secret bound, but re-rendering {s}'s inject conf failed ({s}); it will apply on the instance's next start", .{ n, @errorName(err) }) catch {};
 			};
 		}
@@ -105,7 +114,7 @@ fn isMutation(sub: []const u8) bool {
 /// quietly when the instance isn't inited or isn't running (no live runtime dir)
 /// -- the boot render covers that case. `announce` adds a user-facing line (for
 /// the explicit `reload` verb).
-fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, p: *const paths.Paths, name: []const u8, announce: bool) !void {
+fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, p: *const paths.Paths, name: []const u8, announce: bool) !void {
 	const inst_cfg = try paths.instanceConfigDir(allocator, p, name);
 	defer allocator.free(inst_cfg);
 	const cfg_path = try std.fs.path.join(allocator, &.{ inst_cfg, "config.json" });
@@ -125,7 +134,7 @@ fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, p: *const paths.Pa
 		return;
 	};
 
-	try rules_module.renderFiles(allocator, io, cfg_path, inst_runtime);
+	try rules_module.renderFiles(allocator, io, env, cfg_path, inst_runtime);
 	_ = rules_module.reload.maybeSignalL7proxy(allocator, io, inst_runtime) catch {};
 	if (announce) try util.say(allocator, io, "Re-rendered inject conf for '{s}' and signalled its proxy.", .{name});
 }

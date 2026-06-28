@@ -90,25 +90,72 @@ pub fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []con
 	if (sent) try announce(allocator, io, "Rules reloaded.", .{});
 }
 
+/// Resolved secret-store directories (caller owns both slices).
+pub const SecretDirs = struct {
+	global: []const u8,
+	instance: []const u8,
+
+	pub fn deinit(self: SecretDirs, allocator: std.mem.Allocator) void {
+		allocator.free(self.global);
+		allocator.free(self.instance);
+	}
+};
+
+/// Resolve the global + per-instance secret-store directories for the instance
+/// whose config.json lives at `config_path`.
+///
+/// SECURITY (container enforcer): the store holds bound credential VALUES. In the
+/// VM/launch path it derives from config_path's fixed layout -- the per-instance
+/// store is a sibling `secrets/`, the global store is `<config>/secrets`. In the
+/// container backend that layout lands on the state PVC the AGENT also mounts, so
+/// a bound token would be readable from inside the sandbox. The
+/// COGBOX_GLOBAL_SECRETS_DIR / COGBOX_INSTANCE_SECRETS_DIR env overrides repoint
+/// the store at an ENFORCER-PRIVATE volume; both the `secret` verb (which WRITES
+/// the store) and this renderer (which READS it) honor them, so a bind and its
+/// inject-conf render always agree on one location. Each override is independent;
+/// an unset var keeps the byte-for-byte config-derived path (VM path unchanged).
+pub fn resolveSecretDirs(
+	allocator: std.mem.Allocator,
+	env: *std.process.Environ.Map,
+	config_path: []const u8,
+) !SecretDirs {
+	const global = if (env.get("COGBOX_GLOBAL_SECRETS_DIR")) |d|
+		try allocator.dupe(u8, d)
+	else blk: {
+		const instance_dir = std.fs.path.dirname(config_path) orelse ".";
+		const instances_dir = std.fs.path.dirname(instance_dir) orelse ".";
+		const config_dir = std.fs.path.dirname(instances_dir) orelse ".";
+		break :blk try std.fs.path.join(allocator, &.{ config_dir, "secrets" });
+	};
+	errdefer allocator.free(global);
+
+	const instance = if (env.get("COGBOX_INSTANCE_SECRETS_DIR")) |d|
+		try allocator.dupe(u8, d)
+	else blk: {
+		const instance_dir = std.fs.path.dirname(config_path) orelse ".";
+		break :blk try std.fs.path.join(allocator, &.{ instance_dir, "secrets" });
+	};
+
+	return .{ .global = global, .instance = instance };
+}
+
 /// Boot-time render: write BOTH runtime files (netfilter-rules + l7-rules)
 /// from config.json. Backs the hidden `cogbox __render-rules <config>
 /// <runtime>` verb that the launcher calls before passt/the proxy start, so
 /// the boot path and hot-reload path share one renderer (no jq/Zig drift).
-pub fn renderFiles(allocator: std.mem.Allocator, io: std.Io, config_path: []const u8, runtime_path: []const u8) !void {
+pub fn renderFiles(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	env: *std.process.Environ.Map,
+	config_path: []const u8,
+	runtime_path: []const u8,
+) !void {
 	var loaded = try config.load(allocator, io, config_path);
 	defer loaded.deinit();
 	const base = l7Base(&loaded);
 
-	// The secret store dirs derive from config_path's fixed layout
-	// (<config>/instances/<name>/config.json): the per-instance store is a
-	// sibling `secrets/`, the global store is <config>/secrets.
-	const instance_dir = std.fs.path.dirname(config_path) orelse ".";
-	const instance_secrets = try std.fs.path.join(allocator, &.{ instance_dir, "secrets" });
-	defer allocator.free(instance_secrets);
-	const instances_dir = std.fs.path.dirname(instance_dir) orelse ".";
-	const config_dir = std.fs.path.dirname(instances_dir) orelse ".";
-	const global_secrets = try std.fs.path.join(allocator, &.{ config_dir, "secrets" });
-	defer allocator.free(global_secrets);
+	const dirs = try resolveSecretDirs(allocator, env, config_path);
+	defer dirs.deinit(allocator);
 
 	// "full"/"none" mode carries no .network object; render against null so the
 	// runtime files (incl. an empty inject conf) are emitted defensively.
@@ -118,7 +165,7 @@ pub fn renderFiles(allocator: std.mem.Allocator, io: std.Io, config_path: []cons
 	};
 	try reload.writeRuntimeRules(allocator, io, runtime_path, net_val, base);
 	try reload.writeL7Rules(allocator, io, runtime_path, net_val);
-	try reload.writeL7Inject(allocator, io, runtime_path, net_val, global_secrets, instance_secrets);
+	try reload.writeL7Inject(allocator, io, runtime_path, net_val, dirs.global, dirs.instance);
 }
 
 fn cmdList(allocator: std.mem.Allocator, io: std.Io, rules_arr: std.json.Array) !void {
@@ -291,4 +338,43 @@ fn die(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args:
 	const msg = std.fmt.allocPrint(allocator, "cogbox rules: error: " ++ fmt ++ "\n", args) catch "cogbox rules: error: (message too long)\n";
 	writeStderr(io, msg) catch {};
 	std.process.exit(code);
+}
+
+test "resolveSecretDirs honors env overrides, else derives from config_path" {
+	const t = std.testing;
+	const cfg = "/var/lib/cogbox-state/config/cogbox/instances/web/config.json";
+
+	// No overrides -> the historical config-derived layout (VM path, unchanged).
+	{
+		var env = std.process.Environ.Map.init(t.allocator);
+		defer env.deinit();
+		const d = try resolveSecretDirs(t.allocator, &env, cfg);
+		defer d.deinit(t.allocator);
+		try t.expectEqualStrings("/var/lib/cogbox-state/config/cogbox/secrets", d.global);
+		try t.expectEqualStrings("/var/lib/cogbox-state/config/cogbox/instances/web/secrets", d.instance);
+	}
+
+	// Both overrides set -> used verbatim (the enforcer-private store, never the
+	// agent-readable PVC -- the secret-leak guard).
+	{
+		var env = std.process.Environ.Map.init(t.allocator);
+		defer env.deinit();
+		try env.put("COGBOX_GLOBAL_SECRETS_DIR", "/run/cogbox-secrets/global");
+		try env.put("COGBOX_INSTANCE_SECRETS_DIR", "/run/cogbox-secrets/instance");
+		const d = try resolveSecretDirs(t.allocator, &env, cfg);
+		defer d.deinit(t.allocator);
+		try t.expectEqualStrings("/run/cogbox-secrets/global", d.global);
+		try t.expectEqualStrings("/run/cogbox-secrets/instance", d.instance);
+	}
+
+	// Each override is independent: only the global set -> instance still derived.
+	{
+		var env = std.process.Environ.Map.init(t.allocator);
+		defer env.deinit();
+		try env.put("COGBOX_GLOBAL_SECRETS_DIR", "/run/cogbox-secrets/global");
+		const d = try resolveSecretDirs(t.allocator, &env, cfg);
+		defer d.deinit(t.allocator);
+		try t.expectEqualStrings("/run/cogbox-secrets/global", d.global);
+		try t.expectEqualStrings("/var/lib/cogbox-state/config/cogbox/instances/web/secrets", d.instance);
+	}
 }
