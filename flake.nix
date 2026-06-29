@@ -783,6 +783,18 @@
 				# ssh -- c` invocations).
 				environment.variables = l7CaEnv;
 
+				# Container target DNS: the kubelet writes /etc/resolv.conf (cluster
+				# DNS, e.g. `nameserver 10.96.0.10`) into the pod and manages it at
+				# runtime -- it is NOT an environment.etc entry. NixOS's resolvconf
+				# default-enables resolvconf.service, which runs `openresolv -u` at
+				# boot and regenerates /etc/resolv.conf from the (empty)
+				# networking.nameservers, leaving it nameserver-less -> DNS broken.
+				# Disable resolvconf for the container so the kubelet-provided file is
+				# preserved (nothing else here touches /etc/resolv.conf). mkForce
+				# guards against any other module flipping it back on; gated to the
+				# container so the VM runner is byte-identical.
+				networking.resolvconf.enable = lib.mkIf isContainer (lib.mkForce false);
+
 				services.openssh.enable = lib.mkIf isVm true;
 				# `cogbox ssh` pins to a single key with IdentitiesOnly +
 				# IdentityAgent=none (see zig/src/cli/verbs/ssh.zig), so its
@@ -1471,18 +1483,19 @@
 				};
 
 				# nft REDIRECT divert init image -- the privileged native sidecar (NET_ADMIN/
-				# NET_RAW). MINIMAL: just nftables + iproute2 + gawk + coreutils + /bin/sh +
-				# the standalone divert script (entrypoint). NO cogbox/qemu/mitmproxy. The pod
-				# sets no command, so the image Entrypoint runs the script directly.
+				# NET_RAW). MINIMAL: just nftables + iproute2 + coreutils + /bin/sh + the
+				# standalone divert script (entrypoint). NO cogbox/qemu/mitmproxy. The
+				# separate-pod divert script uses nft alone -- the old cgroup-handshake
+				# (find -inum + awk) is gone -- so gawk + findutils are dropped. The pod
+				# sets no command, so the image Entrypoint runs the script directly; the
+				# enforcer ClusterIP carve-out arrives via COGBOX_ENFORCER_IP/PORT env.
 				nft-init-image = pkgs.dockerTools.streamLayeredImage {
 					name = "cogbox-nft-init";
 					tag = "latest";
 					contents = [
-						pkgs.nftables             # nft
-						pkgs.iproute2             # ip (the native-sidecar netns toolkit)
-						pkgs.gawk                 # awk (handle lookup + cgroup level/depth)
-						pkgs.coreutils            # cat/sleep/stat/ls/tr/head/printf
-						pkgs.findutils            # find -inum (resolve the enforcer cgroup by inode)
+						pkgs.nftables             # nft (loads the divert + fail-closed floor)
+						pkgs.iproute2             # ip (the native-sidecar netns toolkit / debugging)
+						pkgs.coreutils            # sleep/cat/printf for the script + entrypoint
 						pkgs.dockerTools.binSh    # /bin/sh for the script's #!/bin/sh
 						(pkgs.runCommand "cogbox-nft-divert" {} ''
 							mkdir -p $out/bin

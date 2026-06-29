@@ -277,6 +277,67 @@ test "classify: an unclassifiable flow on :443 is .deny -> raw-L4 GATED, not aut
 	try t.expect(main.rawL4Allowed(&allow_rs, orig));
 }
 
+// --- FUNNEL_ALL (separate-pod enforcer, socks5 front door) routing ---
+//
+// The enforcer reuses the EXISTING socks5 accept path; its in-pod shim funnels
+// EVERY port over one SOCKS5 hop, so the socks5 front door now sees non-HTTP/TLS
+// flows. COGBOX_L7_FUNNEL_ALL routes those .deny flows to the SAME rawL4Splice
+// double-gate the redirect arm uses, instead of a hard drop. The decision is
+// rawL4Eligible(mode, funnel) AND rawL4Allowed(rules, orig) -- the latter is the
+// non-overridable SSRF floor + the instance's default-deny L4 CIDR policy, both
+// already proven above. These tests pin the NEW routing predicate + its
+// composition, and that plain socks5 (the VM/launch path) still hard-drops.
+
+test "funnel-all: routing predicate -- socks5 drops unless funnel-all; redirect always eligible" {
+	// Plain socks5 (VM/launch): a .deny flow is NOT eligible -> hard drop. This is
+	// the byte-identical guarantee.
+	try t.expect(!main.rawL4Eligible(.socks5, false));
+	// socks5 + FUNNEL_ALL (the enforcer): eligible -> raw-L4 gate (NOT auto-allow).
+	try t.expect(main.rawL4Eligible(.socks5, true));
+	// redirect front door is always eligible, independent of the funnel flag.
+	try t.expect(main.rawL4Eligible(.redirect, false));
+	try t.expect(main.rawL4Eligible(.redirect, true));
+}
+
+test "funnel-all: a default-deny instance drops an eligible unclassifiable flow" {
+	// Eligible under funnel-all, but the instance's empty (default-deny) L4 policy
+	// gates it -> dropped. Eligibility is necessary, never sufficient.
+	const orig = main.Orig{ .addr = .{ .ipv4 = .{ 93, 184, 216, 34 } }, .port = 443 };
+	const rs = filter.parseRules(""); // default deny
+	try t.expect(main.rawL4Eligible(.socks5, true));
+	try t.expect(!main.rawL4Allowed(&rs, orig));
+}
+
+test "funnel-all: an explicit L4 allow lets an eligible flow reach its orig dst" {
+	const orig = main.Orig{ .addr = .{ .ipv4 = .{ 93, 184, 216, 34 } }, .port = 5432 };
+	const rs = filter.parseRules("allow tcp 93.184.216.0/24:5432");
+	try t.expect(main.rawL4Eligible(.socks5, true));
+	try t.expect(main.rawL4Allowed(&rs, orig)); // both gates pass -> spliced
+	// wrong port under the same allow -> default-deny -> dropped.
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = orig.addr, .port = 22 }));
+}
+
+test "funnel-all: the SSRF hard floor still bounds an eligible flow (incl mapped metadata)" {
+	// Even `allow 0.0.0.0/0` cannot let a funnel-all flow reach the hard floor.
+	const rs = filter.parseRules("allow 0.0.0.0/0");
+	try t.expect(main.rawL4Eligible(.socks5, true));
+	// cloud metadata, both literal and IPv4-mapped IPv6 form.
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 169, 254, 169, 254 } }, .port = 80 }));
+	const mapped = filter.IpAddr{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 169, 254, 169, 254 } };
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = mapped, .port = 80 }));
+	// loopback is likewise off-limits.
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 127, 0, 0, 1 } }, .port = 443 }));
+}
+
+test "funnel-all: plain socks5 (no funnel) drops even an L4-allowed unclassifiable flow" {
+	// The routing predicate short-circuits BEFORE rawL4Allowed: a VM-socks5 .deny
+	// flow is hard-dropped regardless of how permissive the L4 rules are.
+	const orig = main.Orig{ .addr = .{ .ipv4 = .{ 8, 8, 8, 8 } }, .port = 443 };
+	const rs = filter.parseRules("allow 0.0.0.0/0");
+	try t.expect(main.rawL4Allowed(&rs, orig)); // L4 would allow it...
+	try t.expect(!main.rawL4Eligible(.socks5, false)); // ...but it's never routed there.
+}
+
 test "classify: an ECH ClientHello is still refused on the splice tier" {
 	var raw: [1200]u8 = undefined;
 	const hello = buildHello(&raw, "app.example.com", true); // GREASE/real ECH present

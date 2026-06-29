@@ -90,6 +90,21 @@ var mitm_port: u16 = filter.l7_default_base + 2;
 pub const AcceptMode = enum { socks5, redirect };
 var accept_mode: AcceptMode = .socks5;
 
+// COGBOX_L7_FUNNEL_ALL: when set, the socks5 accept path routes its
+// unclassifiable (.deny) flows to the same rawL4Splice double-gate the redirect
+// arm already uses, instead of the hard drop. Set for the separate-pod enforcer:
+// the agent pod's in-pod shim funnels EVERY diverted port over one SOCKS5 hop,
+// so the socks5 front door now sees non-HTTP/TLS flows too. Default false keeps
+// the VM/launch socks5 path byte-identical (a .deny is hard-dropped there).
+var funnel_all: bool = false;
+
+// COGBOX_L7_LISTEN_ADDR (host-order IPv4): the front-door listener bind address.
+// Default 127.0.0.1 == the unchanged VM/launch path (the guest's funnel and the
+// mitm hop are loopback-local). The enforcer pod sets 0.0.0.0 so the agent pod's
+// cross-pod shim can reach the SOCKS5 front door over the pod network. The mitm
+// terminate hop (connectLoopback) is ALWAYS 127.0.0.1, never this address.
+var listen_addr_host: u32 = 0x7f000001;
+
 // Tiny test-and-set spinlock guarding the two rulesets. Critical sections are
 // microsecond-short memory scans; reloads (the only writer, in the accept
 // thread) are rare, so spinning is cheaper than a futex.
@@ -112,12 +127,14 @@ fn unlockRules() void {
 var reload_pending = std.atomic.Value(bool).init(false);
 var conn_count = std.atomic.Value(usize).init(0);
 
-pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: AcceptMode) !void {
+pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: AcceptMode, listen_addr: u32, funnel: bool) !void {
 	if (runtime_dir.len >= runtime_dir_buf.len) return error.PathTooLong;
 	@memcpy(runtime_dir_buf[0..runtime_dir.len], runtime_dir);
 	runtime_dir_len = runtime_dir.len;
 
 	accept_mode = mode;
+	listen_addr_host = listen_addr;
+	funnel_all = funnel;
 	installSignals();
 	loadRules();
 
@@ -134,10 +151,11 @@ pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: Ac
 		// DEFAULT path -- byte-for-byte identical to the original SOCKS5 proxy.
 		// The VM/launch path only ever reaches here.
 		.socks5 => {
-			const tls_fd = try listenLoopback(ports.tls);
-			const http_fd = try listenLoopback(ports.http);
+			const tls_fd = try listenFront(ports.tls);
+			const http_fd = try listenFront(ports.http);
 
-			logLine("l7proxy: listening on 127.0.0.1:{d} (tls) :{d} (http); terminate backend :{d}", .{ ports.tls, ports.http, ports.mitm });
+			const la: [4]u8 = @bitCast(std.mem.nativeToBig(u32, listen_addr_host));
+			logLine("l7proxy: listening on {d}.{d}.{d}.{d}:{d} (tls) :{d} (http); terminate backend 127.0.0.1:{d}; funnel_all={}", .{ la[0], la[1], la[2], la[3], ports.tls, ports.http, ports.mitm, funnel_all });
 
 			const th = try std.Thread.spawn(.{}, acceptLoop, .{http_fd});
 			th.detach();
@@ -151,9 +169,10 @@ pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: Ac
 		// from the guest. No IP_TRANSPARENT bind -- that needs NET_ADMIN, which
 		// the enforcer deliberately lacks.
 		.redirect => {
-			const r_fd = try listenLoopback(ports.tls);
+			const r_fd = try listenFront(ports.tls);
 
-			logLine("l7proxy: REDIRECT listener on 127.0.0.1:{d}; terminate backend :{d}", .{ ports.tls, ports.mitm });
+			const la: [4]u8 = @bitCast(std.mem.nativeToBig(u32, listen_addr_host));
+			logLine("l7proxy: REDIRECT listener on {d}.{d}.{d}.{d}:{d}; terminate backend 127.0.0.1:{d}", .{ la[0], la[1], la[2], la[3], ports.tls, ports.mitm });
 
 			acceptLoop(r_fd);
 		},
@@ -206,7 +225,9 @@ fn readFileInto(rt: []const u8, name: []const u8, buf: []u8) []const u8 {
 
 // --- listener / accept ---
 
-fn listenLoopback(port: u16) !c_int {
+// Bind the front-door listener on listen_addr_host:port (default 127.0.0.1; the
+// enforcer pod sets 0.0.0.0 via COGBOX_L7_LISTEN_ADDR for cross-pod reach).
+fn listenFront(port: u16) !c_int {
 	const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
 	if (fd < 0) return error.Socket;
 	var one: c_int = 1;
@@ -214,7 +235,7 @@ fn listenLoopback(port: u16) !c_int {
 	var sa: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
 	sa.sin_family = c.AF_INET;
 	sa.sin_port = std.mem.nativeToBig(u16, port);
-	sa.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7f000001); // 127.0.0.1
+	sa.sin_addr.s_addr = std.mem.nativeToBig(u32, listen_addr_host);
 	if (c_bind(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0) {
 		_ = c.close(fd);
 		return error.Bind;
@@ -286,12 +307,14 @@ fn worker(client_fd: c_int) void {
 	var ech = false;
 	switch (cl) {
 		.deny => {
-			// A flow we can't classify as HTTP/TLS. In socks5 mode this is a hard
-			// drop (unchanged). In redirect mode the nft REDIRECT can hand us an
-			// arbitrary funneled port, so give the flow ordered first-match L4
-			// parity: splice it to its LITERAL kernel-provided orig dst -- but
-			// only behind the hard floor + CIDR gate (rawL4Splice).
-			if (accept_mode == .redirect) {
+			// A flow we can't classify as HTTP/TLS. Eligible for the raw-L4 splice
+			// arm when the front door funnels arbitrary ports: redirect mode (the
+			// nft REDIRECT hands us any port) OR socks5 + COGBOX_L7_FUNNEL_ALL (the
+			// separate-pod enforcer's shim funnels every port over one SOCKS5 hop).
+			// Either way the flow is spliced to its orig dst ONLY behind the hard
+			// floor + CIDR gate (rawL4Splice). Plain socks5 (VM/launch, no funnel)
+			// hard-drops here -- byte-identical to the original proxy.
+			if (rawL4Eligible(accept_mode, funnel_all)) {
 				rawL4Splice(client_fd, orig, buf[0..buffered]);
 			} else {
 				logReject(orig, "?", "unclassifiable-or-no-sni");
@@ -693,7 +716,16 @@ fn connectVetted(ai: *c.struct_addrinfo, port: u16) ?c_int {
 	return fd;
 }
 
-// --- raw-L4 splice arm (redirect only) ---
+// --- raw-L4 splice arm (redirect or socks5+funnel-all) ---
+
+/// Whether an unclassifiable (.deny) flow is eligible for the raw-L4 splice arm
+/// (still gated by rawL4Allowed's double check) instead of a hard drop. True for
+/// the redirect front door, OR for the socks5 front door when COGBOX_L7_FUNNEL_ALL
+/// is set (the separate-pod enforcer, whose shim funnels every port over socks5).
+/// FALSE for plain socks5 (the VM/launch path) -> hard drop, byte-identical.
+pub fn rawL4Eligible(mode: AcceptMode, funnel: bool) bool {
+	return mode == .redirect or funnel;
+}
 
 /// The gate for an unclassifiable (non-HTTP/TLS) redirect flow. It may be spliced
 /// to its LITERAL kernel-provided orig dst only when BOTH gates pass: the

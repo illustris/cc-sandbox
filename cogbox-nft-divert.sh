@@ -1,47 +1,66 @@
 #!/bin/sh
-# cogbox container-enforcer nft divert + fail-closed floor (nft-init sidecar PID1).
+# cogbox separate-pod enforcer nft divert + fail-closed floor (nft-init sidecar PID1).
 #
-# Uses REDIRECT (DNAT), NOT TPROXY -- so the ENFORCER needs NO CAP_NET_ADMIN
-# (IP_TRANSPARENT/fwmark would force it). nft-init (the ONLY privileged container;
-# NET_ADMIN/NET_RAW) DNATs the agent's locally-originated egress to the enforcer's
-# loopback l7proxy; the enforcer recovers the original dst via SO_ORIGINAL_DST
-# (conntrack) on a NORMAL listener.
+# Uses REDIRECT (DNAT), NOT TPROXY -- so NOTHING downstream needs CAP_NET_ADMIN
+# beyond this one sidecar (IP_TRANSPARENT/fwmark would force it). nft-init (the
+# ONLY privileged container; NET_ADMIN/NET_RAW) DNATs the agent's locally-
+# originated TCP egress to the in-pod divert shim (`cogbox __divertshim`, a
+# no-caps sidecar on the SAME pod netns). The shim recovers the original dst via
+# SO_ORIGINAL_DST (conntrack) and carries it over a SOCKS5 hop to the SEPARATE
+# enforcer pod for L7 enforcement.
 #
-# The enforcer's OWN egress must be EXEMPT (else it loops back into itself). The
-# exemption is CGROUP-keyed (forge-proof), NOT uid-keyed: the agent holds
-# CAP_SETUID and could setuid() to the enforcer's uid to forge an exempt socket,
-# but it cannot move a process into the enforcer's cgroup (that needs write on a
-# cgroup outside the agent's delegated subtree) and a nested userns changes uids
-# but not the cgroup.
+# The enforcer carve-out (validated): the shim's own SOCKS5
+# connection to the enforcer must NOT be redirected back into the shim, else it
+# loops. Exempt it by destination = the enforcer's STABLE ClusterIP:port. The CNI's
+# socket-LB does NOT rewrite the in-pod OUTPUT netfilter hook's view (the
+# ClusterIP -> backend DNAT is downstream in eBPF tc), so the in-pod nft hook sees
+# the ClusterIP and the exemption matches across enforcer-pod restarts -- no
+# pod-IP refresh. This replaces the old cgroup-keyed handshake entirely.
 #
-# The hard part: k8s gives each container a PRIVATE cgroup namespace, so the
-# enforcer's /proc/self/cgroup is "0::/" and we (a different cgroupns) can neither
-# see nor name its sibling cgroup. Bridge it by INODE: the enforcer publishes its
-# cgroup dir's kernfs inode (global id) over the rw divert volume; we walk the
-# HOST cgroup tree (bind-mounted read-only at /sys/fs/cgroup) to find the dir with
-# that inode -> the enforcer's REAL host-global path -> key the exemption on it,
-# with `level N` computed from the path depth (NOT hardcoded). nft resolves the
-# cgroupv2 match path against that same host-rooted /sys/fs/cgroup.
-
-# The fail-closed floor + default-divert load FIRST and MUST succeed (a missing
-# floor would leak egress): guard with set -e so nft-init fails loudly if nft
-# rejects the ruleset. The cgroup-exemption handshake that follows is made
-# resilient (set +e) -- a resolution hiccup leaves the pod UP and inspectable with
-# the floor still enforcing (fail-closed: the enforcer's own egress loops, so the
-# sandbox simply cannot reach the internet) rather than crashlooping nft-init out
-# of `kubectl exec` reach.
+# nft-init image PATH carries nft + ip + coreutils + /bin/sh ONLY (no grep/awk/
+# find): this script uses nft alone, with absolute paths nowhere required (PATH is
+# set by the image). The fail-closed floor + divert load ATOMICALLY (one nft -f
+# transaction, `flush ruleset`-first so it is idempotent across restarts with no
+# open window); guard with set -e so nft-init fails loudly if nft rejects them.
 set -e
-PORT=${COGBOX_DIVERT_PORT:-18443}   # == l7proxy loopback listener (base)
+PORT="${COGBOX_DIVERT_PORT:-18443}"       # == the in-pod shim's loopback listener (REDIRECT target)
+ENFORCER_IP="${COGBOX_ENFORCER_IP:-}"     # the enforcer Service ClusterIP (stable VIP)
+ENFORCER_PORT="${COGBOX_ENFORCER_PORT:-}" # the enforcer l7proxy SOCKS5 port (== its base)
+
+# Fail-closed if the enforcer carve-out coordinates are missing: without them the
+# exemption rule is malformed and the atomic load would leave the netns with NO
+# rules at all (open egress). Load a deny-all floor (TCP egress dropped; only lo +
+# DNS pass) first, then refuse to start, so a misconfig blocks egress rather than
+# leaking it.
+if [ -z "$ENFORCER_IP" ] || [ -z "$ENFORCER_PORT" ]; then
+	nft -f - <<'EOF'
+flush ruleset
+table inet cogbox_floor {
+  chain output {
+    type filter hook output priority mangle; policy drop;
+    oif "lo" accept
+    udp dport 53 accept
+  }
+  chain forward { type filter hook forward priority filter; policy drop; }
+}
+EOF
+	echo "cogbox-nft-divert: FATAL: COGBOX_ENFORCER_IP/PORT unset; loaded deny-all floor and refusing to start" >&2
+	exit 64
+fi
+
 nft -f - <<EOF
-# NAT table: DNAT the agent's LOCALLY-ORIGINATED egress to the enforcer loopback.
-# REDIRECT in OUTPUT targets 127.0.0.1, matching the l7proxy's 127.0.0.1:base
-# listener (the pod shares ONE netns across containers). The forwarded leg is NOT
-# redirected -- it is DROPPED by the FORWARD chain below. The agent can't make a
-# tap (no NET_ADMIN), so this loses nothing and is stricter.
+flush ruleset
+
+# NAT table: DNAT the agent's LOCALLY-ORIGINATED TCP egress to the in-pod shim.
+# REDIRECT in OUTPUT maps locally-originated packets to 127.0.0.1, matching the
+# shim's 127.0.0.1:$PORT listener (the pod shares ONE netns across containers).
+# The forwarded leg is NOT redirected -- it is DROPPED by the FORWARD chain below.
 table inet cogbox_divert {
   chain output {
     type nat hook output priority -100; policy accept;
-    # (the enforcer-cgroup RETURN is inserted by the handshake below, BEFORE the redirect)
+    # Enforcer carve-out FIRST: the shim's own SOCKS5 connect to the enforcer
+    # ClusterIP must pass through un-redirected (anti-loop). Stable VIP -- see header.
+    ip daddr $ENFORCER_IP tcp dport $ENFORCER_PORT counter return
     oif "lo" return
     udp dport 53 return
     meta l4proto tcp redirect to :$PORT
@@ -49,7 +68,8 @@ table inet cogbox_divert {
 }
 # FILTER table: nat chains can't drop, so the floor lives here. Local TCP egress
 # is left to the nat redirect; UDP (except DNS) + all IPv6 are dropped; ALL
-# forwarded traffic is dropped (the nested-VM tap leg -- belt-and-suspenders).
+# forwarded traffic is dropped (belt-and-suspenders -- the agent holds no NET_ADMIN
+# to make a tap, but keep the FORWARD drop regardless).
 table inet cogbox_floor {
   chain output {
     type filter hook output priority mangle; policy accept;
@@ -61,53 +81,8 @@ table inet cogbox_floor {
   chain forward { type filter hook forward priority filter; policy drop; }
 }
 EOF
-echo "cogbox-nft-divert: fail-closed floor + default REDIRECT(:$PORT) loaded" >&2
+echo "cogbox-nft-divert: fail-closed floor + REDIRECT(:$PORT) loaded; enforcer carve-out $ENFORCER_IP:$ENFORCER_PORT" >&2
 
-# ---- cgroup-keyed enforcer exemption (forge-proof, inode-bridged) -----------
-set +e
-log() { echo "cogbox-nft-divert: $*" >&2; }
-stay_up() {
-	log "ERROR: $1"
-	log "fail-closed: floor stays enforced (sandbox egress blocked); staying up for inspection"
-	log "DIAGNOSTICS:"
-	log "  handshake: $(tr '\n' ' ' < /run/cogbox-divert/enforcer.cgroup 2>&1)"
-	log "  nft-init /proc/self/cgroup: $(tr '\n' ',' < /proc/self/cgroup 2>&1)"
-	log "  /sys/fs/cgroup top: $(ls /sys/fs/cgroup 2>&1 | tr '\n' ' ')"
-	log "  POD_UID=${POD_UID:-<unset>}"
-	exec sleep infinity
-}
-
-# Wait for the enforcer to publish its cgroup inode over the rw divert volume.
-i=0
-while [ ! -s /run/cogbox-divert/enforcer.cgroup ]; do
-	i=$((i + 1)); [ "$i" -gt 600 ] && stay_up "timed out waiting for the enforcer cgroup handshake"
-	sleep 0.2
-done
-INODE=$(awk -F= '/^inode=/{print $2; exit}' /run/cogbox-divert/enforcer.cgroup)
-[ -n "$INODE" ] || stay_up "no inode= line in the cgroup handshake"
-
-# Recover the enforcer's REAL (host-global) cgroup path by inode. The host cgroup
-# tree is bind-mounted at /sys/fs/cgroup, so nft resolves the cgroupv2 match path
-# against the true cgroup root.
-CGABS=$(find /sys/fs/cgroup -xdev -type d -inum "$INODE" 2>/dev/null | head -1)
-[ -n "$CGABS" ] || stay_up "no cgroup dir with inode $INODE under /sys/fs/cgroup (host cgroup tree mounted?)"
-RELPATH=${CGABS#/sys/fs/cgroup}
-RELPATH=${RELPATH#/}
-[ -n "$RELPATH" ] || stay_up "inode $INODE resolved to the cgroup ROOT ($CGABS); refusing to exempt root"
-# level N = the cgroup's depth from the root == number of path components.
-LEVEL=$(printf '%s' "$RELPATH" | awk -F/ '{print NF}')
-log "enforcer cgroup resolved: inode=$INODE path=/$RELPATH level=$LEVEL"
-
-# Insert the RETURN exemption BEFORE the redirect so the enforcer's own egress
-# (and its mitmdump/l7proxy children -- same cgroup) is not looped back. Nested
-# agent processes sit DEEPER in the agent's own subtree, so their level-N ancestor
-# is the agent scope (not the enforcer) -> they still divert.
-H=$(nft -a list chain inet cogbox_divert output | awk '/redirect to/{print $NF; exit}')
-[ -n "$H" ] || stay_up "could not find the redirect rule handle"
-if nft insert rule inet cogbox_divert output handle "$H" socket cgroupv2 level "$LEVEL" "$RELPATH" return; then
-	log "inserted enforcer cgroup exemption (level $LEVEL \"$RELPATH\") before redirect handle $H"
-else
-	stay_up "failed to insert the cgroup exemption (level $LEVEL \"$RELPATH\")"
-fi
-
+# nft rules persist in the shared pod netns for the pod's lifetime; this sidecar
+# just needs to stay up (k8s native sidecar = a never-exiting initContainer).
 exec sleep infinity

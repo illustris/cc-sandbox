@@ -37,6 +37,18 @@ pub fn build(b: *std.Build) void {
 	});
 	l7proxy_mod.addImport("filter", filter_mod);
 
+	// Divert shim (cogbox __divertshim). The separate-pod enforcer's in-pod
+	// REDIRECT shim: recovers SO_ORIGINAL_DST, then SOCKS5-CONNECTs the dst to the
+	// enforcer. Reuses the filter types + the socks5 client; links libc.
+	const divertshim_mod = b.createModule(.{
+		.root_source_file = b.path("src/divertshim/main.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	divertshim_mod.addImport("filter", filter_mod);
+	divertshim_mod.addImport("socks5", socks5_mod);
+
 	const lib = b.addLibrary(.{
 		.name = "netfilter",
 		.linkage = .dynamic,
@@ -111,6 +123,7 @@ pub fn build(b: *std.Build) void {
 	cli_mod.addImport("plugin_module", plugin_mod);
 	cli_mod.addImport("secret_module", secret_mod);
 	cli_mod.addImport("l7proxy_module", l7proxy_mod);
+	cli_mod.addImport("divertshim_module", divertshim_mod);
 	cli_mod.addImport("filter", filter_mod);
 
 	const cogbox_exe = b.addExecutable(.{
@@ -140,6 +153,19 @@ pub fn build(b: *std.Build) void {
 		.root_module = l7proxy_test_mod,
 	});
 	const run_l7proxy_tests = b.addRunArtifact(l7proxy_tests);
+
+	const divertshim_test_mod = b.createModule(.{
+		.root_source_file = b.path("src/divertshim/tests.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	divertshim_test_mod.addImport("filter", filter_mod);
+	divertshim_test_mod.addImport("socks5", socks5_mod);
+	const divertshim_tests = b.addTest(.{
+		.root_module = divertshim_test_mod,
+	});
+	const run_divertshim_tests = b.addRunArtifact(divertshim_tests);
 
 	const rules_test_mod = b.createModule(.{
 		.root_source_file = b.path("src/rules/tests.zig"),
@@ -228,6 +254,7 @@ pub fn build(b: *std.Build) void {
 	test_step.dependOn(&run_filter_tests.step);
 	test_step.dependOn(&run_socks5_tests.step);
 	test_step.dependOn(&run_l7proxy_tests.step);
+	test_step.dependOn(&run_divertshim_tests.step);
 	test_step.dependOn(&run_rules_tests.step);
 	test_step.dependOn(&run_remap_tests.step);
 	test_step.dependOn(&run_l7_tests.step);

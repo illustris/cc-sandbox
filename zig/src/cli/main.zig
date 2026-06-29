@@ -21,6 +21,7 @@ const secret_verb = @import("verbs/secret.zig");
 const run_verb = @import("verbs/run.zig");
 const rules_module = @import("rules_module");
 const l7proxy_module = @import("l7proxy_module");
+const divertshim_module = @import("divertshim_module");
 const filter_mod = @import("filter");
 const start_verb = @import("verbs/start.zig");
 const attach_verb = @import("verbs/attach_verb.zig");
@@ -34,8 +35,9 @@ const KNOWN_VERBS = [_][]const u8{
 	// Hidden re-exec / helper targets, recognized below but omitted from
 	// help: "__launch" (re-exec), "__l7proxy" (the host-side L7 proxy),
 	// "__render-rules" (boot-time runtime-file renderer), "enforce" (the
-	// container enforcer sidecar's PID1 supervisor entrypoint).
-	"__launch", "__l7proxy", "__render-rules", "enforce",
+	// container enforcer sidecar's PID1 supervisor entrypoint),
+	// "__divertshim" (the separate-pod enforcer's in-pod nft-REDIRECT shim).
+	"__launch", "__l7proxy", "__render-rules", "enforce", "__divertshim",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -129,7 +131,33 @@ pub fn main(init: std.process.Init) !void {
 			(if (std.mem.eql(u8, v, "redirect")) .redirect else .socks5)
 		else
 			.socks5;
-		return l7proxy_module.run(allocator, rest[0], base, accept_mode);
+		// Front-door bind address (COGBOX_L7_LISTEN_ADDR, IPv4 dotted-quad). Default
+		// 127.0.0.1 keeps the VM/launch path byte-identical; the enforcer pod sets
+		// 0.0.0.0 so the agent pod's shim reaches it cross-pod. Fail-closed: an
+		// unparseable value falls back to loopback (never accidentally 0.0.0.0).
+		const listen_addr: u32 = if (env.get("COGBOX_L7_LISTEN_ADDR")) |v|
+			(if (filter_mod.parseIpv4(v)) |b| std.mem.readInt(u32, &b, .big) else 0x7f000001)
+		else
+			0x7f000001;
+		// COGBOX_L7_FUNNEL_ALL=1: route the socks5 .deny arm to the raw-L4 gate (the
+		// separate-pod enforcer funnels every port over one socks5 hop). Default off.
+		const funnel_all = if (env.get("COGBOX_L7_FUNNEL_ALL")) |v|
+			(std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
+		else
+			false;
+		return l7proxy_module.run(allocator, rest[0], base, accept_mode, listen_addr, funnel_all);
+	}
+	if (std.mem.eql(u8, verb, "__divertshim")) {
+		// The separate-pod enforcer's in-pod nft-REDIRECT shim. Listens on
+		// COGBOX_DIVERT_LISTEN, recovers SO_ORIGINAL_DST, and SOCKS5-CONNECTs the
+		// dst to COGBOX_ENFORCER_ADDR (the enforcer's stable ClusterIP:base). Both
+		// env vars are required; fail-closed (no default enforcer) on either.
+		const lp = env.get("COGBOX_DIVERT_LISTEN") orelse util.die(allocator, io, null, exit_codes.usage, "__divertshim requires COGBOX_DIVERT_LISTEN", .{});
+		const listen_port = std.fmt.parseInt(u16, lp, 10) catch util.die(allocator, io, null, exit_codes.usage, "COGBOX_DIVERT_LISTEN must be a port number", .{});
+		if (listen_port == 0) util.die(allocator, io, null, exit_codes.usage, "COGBOX_DIVERT_LISTEN must be a non-zero port", .{});
+		const ea = env.get("COGBOX_ENFORCER_ADDR") orelse util.die(allocator, io, null, exit_codes.usage, "__divertshim requires COGBOX_ENFORCER_ADDR (ip:port)", .{});
+		const enforcer = divertshim_module.parseEnforcerAddr(ea) orelse util.die(allocator, io, null, exit_codes.usage, "COGBOX_ENFORCER_ADDR must be IPv4 ip:port", .{});
+		return divertshim_module.run(listen_port, enforcer);
 	}
 	if (std.mem.eql(u8, verb, "__render-rules")) {
 		if (rest.len < 2) util.die(allocator, io, null, exit_codes.usage, "__render-rules requires <config> <runtime>", .{});

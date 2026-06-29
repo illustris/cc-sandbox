@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# cogbox enforce supervisor -- PID1 of the container enforcer sidecar.
+# cogbox enforce supervisor -- PID1 of the SEPARATE enforcer pod.
 #
 # Reached via `cogbox enforce -n <name>` (the enforce verb execs us). For ONE
 # instance, with NO VM/passt/QEMU: render the wire files, run the L7 terminate
-# backend (mitmdump) + the host-side L7 proxy in nft-REDIRECT accept mode, and
+# backend (mitmdump) + the host-side L7 proxy in SOCKS5 accept mode bound on
+# 0.0.0.0 (so the agent pod's in-pod divert shim reaches it cross-pod), and
 # publish the per-instance CA CERT (never the key) so the agent's egress trust
 # bundle and the pod readinessProbe unblock.
-# S6.1-6.5 and the enforcer blueprint.
 #
-# Cross-container contract (cogworx renders the 3-container pod to these EXACT
-# paths/env; build to them):
-#   env     COGBOX_L7_ACCEPT=redirect  COGBOX_DIVERT_PORT=<base>
+# Re-architecture note: the enforcer is now its OWN pod. The agent pod's nft-init
+# REDIRECTs egress to an in-pod shim (`cogbox __divertshim`) which recovers the
+# orig dst and SOCKS5-CONNECTs it here. So the l7proxy runs in the EXISTING socks5
+# accept mode (NOT the redirect mode of the old shared-netns design), with
+# FUNNEL_ALL=1 so its socks5 front door handles every funneled port (not just
+# HTTP/TLS). There is no in-pod cgroup handshake anymore.
+#
+# Cross-pod contract (cogworx renders the enforcer pod to these EXACT paths/env;
+# build to them):
+#   env     COGBOX_L7_ACCEPT=socks5  COGBOX_L7_LISTEN_ADDR=0.0.0.0
+#           COGBOX_L7_FUNNEL_ALL=1   COGBOX_DIVERT_PORT=<base>
 #           XDG_CONFIG_HOME=<state>/config  COGBOX_INSTANCE=<name>
-#           COGBOX_GLOBAL_SECRETS_DIR / COGBOX_INSTANCE_SECRETS_DIR (enforcer-private)
-#   mounts  state PVC, rules emptyDir=/run/cogbox-rt, ca-pub=/run/cogbox-capub,
-#           divert=/run/cogbox-divert, secrets=/run/cogbox-secrets,
-#           ca-conf (mitmproxy confdir)=/run/cogbox-ca-conf
+#           COGBOX_GLOBAL_SECRETS_DIR / COGBOX_INSTANCE_SECRETS_DIR (enforcer-private, on the enf PVC)
+#   mounts  enf PVC (secret store + the mitmproxy confdir CA), rules emptyDir=/run/cogbox-rt,
+#           ca-pub=/run/cogbox-capub, secrets=/run/cogbox-secrets, ca-conf (mitmproxy confdir)=/run/cogbox-ca-conf
 #   probe   readinessProbe = test -f /run/cogbox-capub/ca.crt
 #
 # Substituted by mkCogbox: @cogbox@ @mitmdump@ @l7addon@.
@@ -35,55 +42,44 @@ NAME="${1:-${COGBOX_INSTANCE:-default}}"
 
 : "${XDG_CONFIG_HOME:?XDG_CONFIG_HOME must be set (the state PVC config dir)}"
 CONFIG="$XDG_CONFIG_HOME/cogbox/instances/$NAME/config.json"
-[ -f "$CONFIG" ] || die "no config at $CONFIG" 66
 
 # Enforcer-local runtime (the rules emptyDir) + the contract mount points.
 RUNTIME=/run/cogbox-rt
-DIVERT_DIR=/run/cogbox-divert
 CAPUB_DIR=/run/cogbox-capub
 CA_CONF=/run/cogbox-ca-conf
 
-# Port base == the nft REDIRECT target == the l7proxy loopback listener; the
-# mitmdump terminate hop sits at base+2 (mirrors the VM's L7_MITM_PORT).
+# Port base == the l7proxy SOCKS5 listener (on 0.0.0.0); the mitmdump terminate
+# hop sits at base+2 on loopback (mirrors the VM's L7_MITM_PORT).
 BASE="${COGBOX_DIVERT_PORT:-18443}"
 MITM_PORT=$(( BASE + 2 ))
 
-mkdir -p "$RUNTIME" "$DIVERT_DIR" "$CAPUB_DIR" "$CA_CONF"
+mkdir -p "$RUNTIME" "$CAPUB_DIR" "$CA_CONF"
 
-# -- (a) nft cgroup handshake --------------------------------------
-# nft-init loads a fail-closed REDIRECT divert, then waits for THIS file to learn
-# the enforcer's cgroup and insert the (forge-proof) RETURN exemption so our own
-# egress is not redirected back into us. The divert volume is rw here, ro in
-# nft-init, ABSENT from the agent -> the sandbox cannot forge it. Our children
-# (mitmdump, l7proxy) share this cgroup, so one write covers them.
-#
-# k8s gives EACH container a PRIVATE cgroup namespace, so /proc/self/cgroup here
-# is namespace-relative ("0::/") -- useless to nft-init, which lives in its OWN
-# cgroupns and cannot name our cgroup by that path. What IS globally stable is our
-# cgroup DIRECTORY's kernfs inode: under a private cgroupns /sys/fs/cgroup is the
-# cgroup-v2 mount rooted at our OWN container cgroup, so `stat /sys/fs/cgroup`
-# yields that directory's inode -- the SAME inode nft-init sees for our scope when
-# it walks the host cgroup tree (kernfs inode ids are global, not namespaced).
-# nft-init matches by inode to recover our REAL (host-global) cgroup path and keys
-# the exemption on it. We publish `inode=` (what nft-init reads) plus the
-# ns-relative path as a diagnostic.
-ECG_INODE="$(stat -c %i /sys/fs/cgroup 2>/dev/null)"
-ECG_NSREL="$(tr '\n' ',' < /proc/self/cgroup 2>/dev/null)"
-[ -n "$ECG_INODE" ] || die "could not stat /sys/fs/cgroup inode for the divert handshake"
-{
-	echo "inode=$ECG_INODE"
-	echo "nsrel=$ECG_NSREL"
-} > "$DIVERT_DIR/enforcer.cgroup.tmp" \
-	&& mv "$DIVERT_DIR/enforcer.cgroup.tmp" "$DIVERT_DIR/enforcer.cgroup" \
-	|| die "failed to write cgroup handshake to $DIVERT_DIR/enforcer.cgroup"
-log "cgroup handshake published: inode=$ECG_INODE nsrel=$ECG_NSREL"
+# L7 proxy accept mode for the separate-pod enforcer: socks5 front door on
+# 0.0.0.0 (cross-pod reachable for the agent's shim), funnel ALL ports (the shim
+# carries every diverted port over one socks5 hop). Honor the pod env if it sets
+# these (the contract does); default to the enforcer-correct values otherwise so
+# the supervisor is right even if one is omitted.
+export COGBOX_L7_ACCEPT="${COGBOX_L7_ACCEPT:-socks5}"
+export COGBOX_L7_LISTEN_ADDR="${COGBOX_L7_LISTEN_ADDR:-0.0.0.0}"
+export COGBOX_L7_FUNNEL_ALL="${COGBOX_L7_FUNNEL_ALL:-1}"
 
-# -- (b) render the wire files -------------------------------------
+# -- Render the wire files (config OPTIONAL at start) ---------------
 # The same renderer the hot-reload path uses (no jq/Zig drift). Writes l7-rules
 # + l7-inject-conf.json + l7-inject-hosts; the secret-store reads honor the
-# COGBOX_*_SECRETS_DIR overrides (enforcer-private store). netfilter-rules is
-# emitted too but unused here (no LD_PRELOAD passt in the container).
-@cogbox@ __render-rules "$CONFIG" "$RUNTIME" || die "render of $CONFIG failed"
+# COGBOX_*_SECRETS_DIR overrides (enforcer-private store).
+#
+# The config may not exist yet: cogworx creates the enforcer pod FIRST (to read
+# the ClusterIP), so it can come up before the agent pod has couriered a config.
+# Start default-deny (the proxy reads absent wire files as an empty ruleset =
+# deny) and continue; cogworx reconciles (courier config -> __render-rules ->
+# SIGHUP) right after the enforcer is Ready. A present config is rendered now so a
+# restart re-enforces immediately without waiting on cogworx.
+if [ -f "$CONFIG" ]; then
+	@cogbox@ __render-rules "$CONFIG" "$RUNTIME" || die "render of $CONFIG failed"
+else
+	log "no config at $CONFIG yet -> starting default-deny (empty wire files); the control plane will deliver config + SIGHUP"
+fi
 
 # -- Child management ----------------------------------------------
 MITM_PID=""
@@ -108,10 +104,11 @@ start_l7mitm() {
 	echo "$MITM_PID" > "$RUNTIME/l7mitm.pid"
 }
 
-# The host-side L7 proxy. It reads COGBOX_L7_ACCEPT=redirect from the pod env ->
-# nft-REDIRECT front door: a normal loopback listener on $BASE, original dst
-# recovered via SO_ORIGINAL_DST. Writes l7proxy.pid so the hot-reload verbs
-# (rule/secret edits kubectl-exec'd into this container) can SIGHUP it.
+# The host-side L7 proxy. It reads COGBOX_L7_ACCEPT=socks5 + COGBOX_L7_LISTEN_ADDR
+# + COGBOX_L7_FUNNEL_ALL from the env we exported above: a SOCKS5 front door on
+# 0.0.0.0:$BASE (the agent pod's shim CONNECTs here carrying the orig dst), with
+# the funnel-all gate for non-HTTP/TLS flows. Writes l7proxy.pid so the hot-reload
+# verbs (rule/secret edits kubectl-exec'd into this pod) can SIGHUP it.
 start_l7proxy() {
 	@cogbox@ __l7proxy "$RUNTIME" "$BASE" &
 	L7PROXY_PID=$!
@@ -143,7 +140,7 @@ publish_ca() {
 	fi
 }
 
-# -- (f) signal handling: forward SIGTERM, tear down ----------------
+# -- signal handling: forward SIGTERM, tear down -------------------
 terminate() {
 	log "received termination signal; stopping children"
 	[ -n "$L7PROXY_PID" ] && kill "$L7PROXY_PID" 2>/dev/null
