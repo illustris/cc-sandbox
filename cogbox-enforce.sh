@@ -90,11 +90,18 @@ L7PROXY_PID=""
 # per-instance CA there (cert + key); we publish only the cert below.
 # connection_strategy=lazy defers the upstream connect until the addon decides,
 # so a denied request never opens an upstream socket. An explicit
-# COGBOX_L7_INJECT_CONF wins; else the addon reads the rendered conf (blank when
-# absent -> the addon falls back to "guest carries its own token").
+# COGBOX_L7_INJECT_CONF wins; else the addon reads the rendered conf. Pass the
+# PATH UNCONDITIONALLY, even when the file does not exist yet: in the separate-pod
+# topology the enforcer boots BEFORE the control plane delivers a config, so
+# l7-inject-conf.json is created only later (by the reconcile render). The addon's
+# CredStore tolerates a missing file (os.stat -> empty specs, keeps the path) and
+# hot-reloads on mtime once it appears, picking up injects with NO restart -- and
+# an absent file still means "guest carries its own token", the same fallback as
+# before. Blanking the path here (the old `[ -f ] || inject_conf=""`) wedged the
+# addon with CredStore("") which never reloads, so host-side injection NEVER took
+# effect on a freshly-booted enforcer (the file is always created after launch).
 start_l7mitm() {
 	local inject_conf="${COGBOX_L7_INJECT_CONF:-$RUNTIME/l7-inject-conf.json}"
-	[ -f "$inject_conf" ] || inject_conf=""
 	COGBOX_L7_RULES="$RUNTIME/l7-rules" \
 	COGBOX_L7_INJECT_CONF="$inject_conf" \
 	@mitmdump@ --mode "socks5@${MITM_PORT}" --listen-host 127.0.0.1 \
