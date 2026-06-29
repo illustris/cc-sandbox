@@ -1211,12 +1211,15 @@
 			#  1. cgroup-v2 delegation. The kubelet mounts the pod's delegated
 			#     /sys/fs/cgroup subtree READ-ONLY for a non-privileged container,
 			#     so systemd cannot create its cgroup hierarchy and exits. Remount
-			#     it read-write. This is namespaced to the pod's OWN delegated
-			#     subtree (private cgroup namespace, cgroup root "0::/"), NOT the
-			#     host root, and uses the single CAP_SYS_ADMIN the pod is granted
-			#     for exactly this — no privileged, no /dev/kvm, no NET_ADMIN/RAW.
-			#     systemd in container mode does NOT self-remount a ro cgroup
-			#     (verified), so this shim is required.
+			#     it read-write -- or, under a userns (hostUsers:false) where that
+			#     remount EPERMs because the superblock is owned by the INIT userns,
+			#     mount a FRESH pod-owned cgroup2 instead (a confined SYS_ADMIN may
+			#     mount cgroup2 but may not change the init-userns mount's flags).
+			#     This is namespaced to the pod's OWN delegated subtree (private
+			#     cgroup namespace, cgroup root "0::/"), NOT the host root, and uses
+			#     the single CAP_SYS_ADMIN the pod is granted for exactly this — no
+			#     privileged, no /dev/kvm, no NET_ADMIN/RAW. systemd in container
+			#     mode does NOT self-remount a ro cgroup (verified), so this is required.
 			#  2. Writable /etc. dockerTools lays the NixOS toplevel's own /etc as
 			#     a symlink into the immutable Nix store, so activation's setup-etc
 			#     cannot populate it. Drop the symlink; NixOS then builds a fresh
@@ -1227,7 +1230,21 @@
 			# NB: at boot time PATH points only at /run/current-system/sw/bin (not
 			# yet populated), so every command here MUST be an absolute store path.
 			agentInit = pkgs.writeShellScript "cogbox-agent-init" ''
-				${pkgs.util-linux}/bin/mount -o remount,rw /sys/fs/cgroup 2>/dev/null || true
+				# cgroup-v2: make the kubelet's read-only delegated /sys/fs/cgroup
+				# writable so systemd PID1 can build its hierarchy. NON-userns: a
+				# remount,rw works (the pod's host-level CAP_SYS_ADMIN owns the
+				# superblock). Under a USERNS (hostUsers:false) that remount EPERMs --
+				# a SYS_ADMIN confined to a non-initial userns cannot change mount
+				# flags on the cgroup2 superblock, which is owned by the INIT userns --
+				# so fall back to mounting a FRESH pod-owned cgroup2 over it: cgroup2
+				# is userns-mountable, the new superblock is owned by THIS userns
+				# (hence writable), and the pod's private cgroup namespace scopes it to
+				# the pod's own subtree. No silent "|| true": if neither works the boot
+				# log says so loudly instead of dying as an opaque systemd exit 255.
+				if ! ${pkgs.util-linux}/bin/mount -o remount,rw /sys/fs/cgroup 2>/dev/null; then
+					${pkgs.util-linux}/bin/mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null \
+						|| echo "cogbox-agent-init: WARNING: /sys/fs/cgroup stayed read-only (remount,rw and a fresh cgroup2 mount both failed); systemd will likely fail to boot" >&2
+				fi
 				[ -L /etc ] && ${pkgs.coreutils}/bin/rm -f /etc || true
 				exec ${containerToplevel}/init
 			'';
