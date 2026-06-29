@@ -929,6 +929,18 @@
 						"name=opt/system-l7ca,file=${runtimeDir}/system-l7ca"
 					];
 				};
+				# re-run the L7 trust assembly whenever the enforcer (re)publishes
+				# its CA, so a CA that arrives after cogbox-l7-trust's boot window still
+				# gets trusted (else allowed HTTPS silently fails until the next reboot).
+				systemd.paths.cogbox-l7-trust = lib.mkIf isContainer {
+					description = "Watch the enforcer-published L7 CA and rebuild the trust bundle";
+					wantedBy = [ "multi-user.target" ];
+					pathConfig = {
+						PathChanged = l7CaSource;
+						Unit = "cogbox-l7-trust-refresh.service";
+					};
+				};
+
 
 				# Per-fw_cfg copy services. Each one materializes a single
 				# host file (auth token, etc.) into its guest path at boot.
@@ -1044,6 +1056,21 @@
 								fi
 								set -e
 							'';
+						};
+					};
+					# self-heal: the enforcer publishes its CA to l7CaSource
+					# asynchronously; a slow (cold image pull) enforcer pod can land it
+					# AFTER cogbox-l7-trust's ~60s boot window, leaving the agent on the
+					# bare system bundle so every allowed HTTPS fails until reboot
+					# (fail-closed, no leak). The .path above runs this on the CA's
+					# (re)appearance; restarting the trust unit re-runs its idempotent
+					# bundle+NSS assembly, now with the CA present. Container-only
+					# (the VM delivers the CA via fw_cfg before boot).
+					cogbox-l7-trust-refresh = lib.mkIf isContainer {
+						description = "Rebuild the L7 CA trust bundle when the enforcer CA (re)appears";
+						serviceConfig = {
+							Type = "oneshot";
+							ExecStart = "${pkgs.systemd}/bin/systemctl restart cogbox-l7-trust.service";
 						};
 					};
 					load-ssh-keys = lib.mkIf isVm {
