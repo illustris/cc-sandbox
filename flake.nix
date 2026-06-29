@@ -795,6 +795,41 @@
 				# container so the VM runner is byte-identical.
 				networking.resolvconf.enable = lib.mkIf isContainer (lib.mkForce false);
 
+				# Container under a userns (hostUsers:false): NixOS stage-2 activation
+				# re-applies its hardened mount options to the special filesystems the
+				# OCI runtime/kubelet already mounted (/proc, /dev, /dev/pts, /dev/shm)
+				# with `mount -o remount`. A SYS_ADMIN confined to a non-initial userns
+				# cannot change flags on a superblock owned by the init userns, so the
+				# remount EPERMs; the specialfs snippet has no `|| true`, so its ERR
+				# trap makes `activate` exit non-zero and wedges the boot
+				# (CrashLoopBackOff). Override specialfs to make ONLY the already-mounted
+				# (remount) branch non-fatal: in a NON-userns container (today's live
+				# deploy) the remount still SUCCEEDS and applies nosuid/noexec/nodev
+				# exactly as upstream -- zero behavior change; only under a userns does
+				# it fall through to "keep the runtime's mount as-is". The fresh-mount
+				# branch (/run tmpfs, /run/keys ramfs -- userns-mountable and NOT
+				# runtime-provided) stays FATAL so a genuinely missing mount errors
+				# loudly (same "no silent || true" stance as the cgroup fix in a87dc47).
+				# Sources the upstream earlyMountScript so the special-fs set can never
+				# drift. Gated to the container; the VM/microvm path is byte-identical.
+				system.activationScripts.specialfs = lib.mkIf isContainer (lib.mkForce ''
+					specialMount() {
+						local device="$1"
+						local mountPoint="$2"
+						local options="$3"
+						local fsType="$4"
+
+						if mountpoint -q "$mountPoint"; then
+							mount -t "$fsType" -o "remount,$options" "$device" "$mountPoint" || true
+						else
+							mkdir -p "$mountPoint"
+							chmod 0755 "$mountPoint"
+							mount -t "$fsType" -o "$options" "$device" "$mountPoint"
+						fi
+					}
+					source ${config.system.build.earlyMountScript}
+				'');
+
 				services.openssh.enable = lib.mkIf isVm true;
 				# `cogbox ssh` pins to a single key with IdentitiesOnly +
 				# IdentityAgent=none (see zig/src/cli/verbs/ssh.zig), so its
