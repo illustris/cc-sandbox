@@ -368,6 +368,28 @@ pub fn seedClaudeInject(global_override: ?[]const u8, instance_override: ?[]cons
 	return global_override != null and instance_override != null;
 }
 
+/// Whether the reserved per-user `claude-oauth` secret is actually BOUND in this
+/// instance's store (instance store shadowing global -- the same precedence
+/// renderL7Inject uses). The container seed (seedClaudeInjectSpec) is additionally
+/// gated on this so renderL7 / renderRules terminate-allow + funnel
+/// api.anthropic.com ONLY for a connected owner's sandbox.
+///
+/// 5a review gap #1: seeding on every enforce-ON container render made renderL7
+/// terminate-allow api.anthropic.com on EVERY container sandbox (superseding the L4
+/// deny-list) even for never-connected / non-claude owners. Binding claude-oauth
+/// already triggers a re-render (secret-add hot-reload + the enforcer reconcile), so
+/// gating the seed on `bound` has no race -- a connect re-renders with the secret
+/// present, a disconnect re-renders with it gone. Reads the store, so NOT pure.
+pub fn claudeOAuthBound(
+	arena: std.mem.Allocator,
+	io: std.Io,
+	instance_secrets_dir: []const u8,
+	global_secrets_dir: []const u8,
+) !bool {
+	const resolved = (try resolveSecret(arena, io, instance_secrets_dir, global_secrets_dir, secret_mod.claude_oauth_secret)) orelse return false;
+	return resolved.bound;
+}
+
 /// Seed the harness-owned Claude inject spec into `network.l7.inject.specs[]` so a
 /// bound per-user `claude-oauth` setup-token actually renders. The step-3 reconcile BINDS the `claude-oauth` secret (kind=anthropic-oauth,
 /// audience=api.anthropic.com), but renderL7Inject only iterates specs the config
@@ -415,12 +437,18 @@ pub fn seedClaudeInjectSpec(arena: std.mem.Allocator, network: *std.json.Value) 
 		break :blk &inj.object.getPtr("specs").?.array;
 	};
 
-	// Idempotent: a spec (plugin- or seed-contributed) already targeting the host
-	// covers it -- never add a duplicate.
+	// Idempotent BUT shadow-safe (5a review gap #2): skip ONLY when a spec already
+	// names OUR reserved claude-oauth secret for this host (a prior seed / re-render
+	// -- never add a duplicate). A pre-existing spec that targets api.anthropic.com
+	// under a DIFFERENT secret name (e.g. a plugin's) must NOT suppress the per-user
+	// bind: appending ours anyway guarantees the connected owner's claude-oauth still
+	// renders, instead of being silently shadowed by the plugin spec.
 	for (specs.items) |s| {
 		if (s != .object) continue;
 		const h = strField(s.object, "host") orelse continue;
-		if (std.ascii.eqlIgnoreCase(h, secret_mod.anthropic_api_host)) return;
+		if (!std.ascii.eqlIgnoreCase(h, secret_mod.anthropic_api_host)) continue;
+		const sn = strField(s.object, "secret") orelse continue;
+		if (std.mem.eql(u8, sn, secret_mod.claude_oauth_secret)) return; // our seed already present
 	}
 
 	// {host, style, secret}: the secret's kind=anthropic-oauth drives the actual
@@ -883,4 +911,98 @@ test "seeded claude-oauth spec: renderL7Inject silent when unbound, emits when b
 		try std.testing.expect(std.mem.indexOf(u8, out.items, "refresh") == null);
 		try std.testing.expect(std.mem.indexOf(u8, hosts.items, secret_mod.anthropic_api_host) != null);
 	}
+}
+
+test "claudeOAuthBound: false when unbound, true once the claude-oauth secret is bound" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const inst_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(inst_dir);
+	defer cwd.deleteTree(io, inst_dir) catch {};
+
+	var arena = std.heap.ArenaAllocator.init(gpa);
+	defer arena.deinit();
+
+	// Never connected: nothing in the store -> not bound.
+	try std.testing.expect(!(try claudeOAuthBound(arena.allocator(), io, inst_dir, "zig-inject-test-no-global")));
+
+	// Connect (the reconcile's bind). Now bound.
+	try secret_store.add(gpa, io, inst_dir, secret_mod.claude_oauth_secret, "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKE", .{
+		.audience = secret_mod.anthropic_api_host,
+		.kind = secret_mod.anthropic_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+	try std.testing.expect(try claudeOAuthBound(arena.allocator(), io, inst_dir, "zig-inject-test-no-global"));
+}
+
+test "gap #1: renderL7 terminate-allows api.anthropic.com ONLY when the seed is applied (bound)" {
+	const gpa = std.testing.allocator;
+
+	// UNBOUND -> the seed is NOT applied (main.zig gates seedClaudeInjectSpec on
+	// claudeOAuthBound), so the container default network carries no claude spec and
+	// renderL7 must NOT terminate-allow api.anthropic.com (the L4 deny-list governs).
+	{
+		const src =
+			\\{"rules":[{"allow":"0.0.0.0/0","comment":"public"}]}
+		;
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+		defer parsed.deinit();
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		try renderL7(gpa, parsed.value, &out);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, secret_mod.anthropic_api_host) == null);
+	}
+
+	// BOUND -> the seed IS applied; renderL7 then terminate-allows the host so the
+	// injected Bearer can be stamped on a MITM-terminated flow.
+	{
+		const src =
+			\\{"rules":[{"allow":"0.0.0.0/0","comment":"public"}]}
+		;
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+		defer parsed.deinit();
+		var net = parsed.value;
+		try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		try renderL7(gpa, net, &out);
+		var allow_buf: [64]u8 = undefined;
+		const allow_line = std.fmt.bufPrint(&allow_buf, "allow {s} terminate", .{secret_mod.anthropic_api_host}) catch unreachable;
+		try std.testing.expect(std.mem.indexOf(u8, out.items, allow_line) != null);
+	}
+}
+
+test "gap #2: seed is shadow-safe -- appends when a DIFFERENT secret already claims the host" {
+	const gpa = std.testing.allocator;
+	// A plugin spec already targets api.anthropic.com under a DIFFERENT secret name.
+	// The old idempotency check (host-only) would have skipped, silently shadowing
+	// the per-user bind. The guard must append the claude-oauth spec anyway.
+	const src =
+		\\{"l7":{"inject":{"specs":[
+		\\  {"host":"api.anthropic.com","style":"bearer","secret":"plugin-anthropic","plugin":"obs-plugin"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+
+	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+
+	const specs = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
+	try std.testing.expectEqual(@as(usize, 2), specs.items.len);
+	// the plugin spec is untouched (still first, still its own secret)
+	try std.testing.expectEqualStrings("plugin-anthropic", specs.items[0].object.get("secret").?.string);
+	// the per-user bind STILL renders: our claude-oauth spec was appended
+	try std.testing.expectEqualStrings(secret_mod.claude_oauth_secret, specs.items[1].object.get("secret").?.string);
+	try std.testing.expectEqualStrings(secret_mod.anthropic_api_host, specs.items[1].object.get("host").?.string);
+
+	// True idempotency is preserved: re-seeding now that OUR secret names the host
+	// adds nothing (only our own seed -- not a foreign spec -- suppresses a re-add).
+	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+	const specs2 = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
+	try std.testing.expectEqual(@as(usize, 2), specs2.items.len);
 }

@@ -27,6 +27,7 @@ const start_verb = @import("verbs/start.zig");
 const attach_verb = @import("verbs/attach_verb.zig");
 const attach = @import("attach.zig");
 const enforce_verb = @import("verbs/enforce.zig");
+const claude_stub_verb = @import("verbs/claude_stub.zig");
 
 const KNOWN_VERBS = [_][]const u8{
 	"start", "stop",  "restart", "status",  "list",    "init",
@@ -36,8 +37,10 @@ const KNOWN_VERBS = [_][]const u8{
 	// help: "__launch" (re-exec), "__l7proxy" (the host-side L7 proxy),
 	// "__render-rules" (boot-time runtime-file renderer), "enforce" (the
 	// container enforcer sidecar's PID1 supervisor entrypoint),
-	// "__divertshim" (the separate-pod enforcer's in-pod nft-REDIRECT shim).
+	// "__divertshim" (the separate-pod enforcer's in-pod nft-REDIRECT shim),
+	// "__claude-stub" (the container agent's marker-gated Claude stub-staging).
 	"__launch", "__l7proxy", "__render-rules", "enforce", "__divertshim",
+	"__claude-stub",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -163,6 +166,7 @@ pub fn main(init: std.process.Init) !void {
 		if (rest.len < 2) util.die(allocator, io, null, exit_codes.usage, "__render-rules requires <config> <runtime>", .{});
 		return rules_module.renderFiles(allocator, io, env, rest[0], rest[1]);
 	}
+	if (std.mem.eql(u8, verb, "__claude-stub")) return claude_stub_verb.run(allocator, io, rest);
 	if (std.mem.eql(u8, verb, "console")) return attach_verb.run(allocator, io, &p, rest, attach.Target.console);
 	if (std.mem.eql(u8, verb, "monitor")) return attach_verb.run(allocator, io, &p, rest, attach.Target.monitor);
 	if (std.mem.eql(u8, verb, "init")) return run_verb.run(allocator, io, env, rest);

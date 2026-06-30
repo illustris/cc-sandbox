@@ -47,6 +47,24 @@ pub const anthropic_api_host = "api.anthropic.com";
 /// typo would silently break injection (fail-closed, but invisibly).
 pub const claude_oauth_secret = "claude-oauth";
 
+/// The redacted in-guest Claude credential the CONTAINER agent stages so
+/// claude-code boots "logged-in but tokenless" (the step-5b container stub-staging). It mirrors the VM launcher's
+/// write_stub_cred (cogbox-launch.sh): accessToken = the shared stub sentinel
+/// (claude_stub_token -- the enforcer's mitm addon stamps the real Bearer ONLY
+/// over THIS placeholder, never a real token, which lives only in the enforcer
+/// secret store), a sentinel refreshToken that can never refresh in-guest, a
+/// far-future expiry so the guest never tries (and fails) to refresh the
+/// placeholder locally, and the read-only OAuth scopes that keep a logged-in
+/// identity. Single-sourced off claude_stub_token so the staged stub, the VM
+/// redactor, and the addon's should_inject can never name different sentinels.
+/// Caller owns the returned bytes.
+pub fn stubCredentialJson(allocator: std.mem.Allocator) ![]u8 {
+	return std.fmt.allocPrint(allocator,
+		"{{\"claudeAiOauth\":{{\"accessToken\":\"{s}\",\"refreshToken\":\"cogbox-evicted-no-refresh-token-in-guest\",\"expiresAt\":9999999999000,\"scopes\":[\"user:inference\",\"user:profile\"]}}}}\n",
+		.{claude_stub_token},
+	);
+}
+
 /// The injection styles a `cogbox secret add --kind` may carry. `bearer`,
 /// `cookie` and `basic` are the operator/plugin credential primitives; the
 /// per-user Claude bind adds `anthropic-oauth` (a long-lived setup-token the

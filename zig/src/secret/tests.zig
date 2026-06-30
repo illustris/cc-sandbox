@@ -42,6 +42,27 @@ test "validKind allowlist accepts the injection styles incl. anthropic-oauth" {
 	try t.expect(!main.validKind(""));
 }
 
+test "stubCredentialJson stages ONLY the shared sentinel, never a real token" {
+	const a = t.allocator;
+	const json = try main.stubCredentialJson(a);
+	defer a.free(json);
+	// The accessToken is the single shared stub sentinel (the addon stamps the real
+	// Bearer over exactly this -- the real token never enters the agent).
+	try t.expect(std.mem.indexOf(u8, json, main.claude_stub_token) != null);
+	try t.expect(std.mem.indexOf(u8, json, "\"accessToken\":\"" ++ main.claude_stub_token ++ "\"") != null);
+	// The refresh token is the in-guest eviction sentinel, never a usable one, and a
+	// far-future expiry stops the guest from refreshing the placeholder locally.
+	try t.expect(std.mem.indexOf(u8, json, "cogbox-evicted-no-refresh-token-in-guest") != null);
+	try t.expect(std.mem.indexOf(u8, json, "9999999999000") != null);
+	// Read-only scopes keep a logged-in identity without inference-write power.
+	try t.expect(std.mem.indexOf(u8, json, "user:inference") != null);
+	// It parses as the credential shape claude-code reads.
+	var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+	defer parsed.deinit();
+	const at = parsed.value.object.get("claudeAiOauth").?.object.get("accessToken").?.string;
+	try t.expectEqualStrings(main.claude_stub_token, at);
+}
+
 test "buildMeta/parseMeta round-trip" {
 	const a = t.allocator;
 	const m: store.Meta = .{ .audience = "api.example.com", .kind = "bearer", .tier = "durable", .bound_at = 1234 };

@@ -733,9 +733,14 @@
 						.projects["/var/lib/cogbox/work"].hasTrustDialogAccepted = true
 						| .projects["/root/work"].hasTrustDialogAccepted = true
 						| del(.projects["/var/lib/cogbox"])
-						| del(.projects["/var/lib/cogbox/analytics"])
 						| del(.projects["/var/lib/cogbox/home"])
-					' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+					' "$f" > "$f.tmp"
+					# Write THROUGH $f rather than `mv` onto it: on the container backend
+					# the claude-stub oneshot symlinks /root/.claude.json at the state PVC
+					# (so config survives a restart), and a rename would replace that
+					# symlink with an ephemeral regular file. `cat >` follows the symlink
+					# to the PVC target; for the VM (a regular file) it is equivalent.
+					cat "$f.tmp" > "$f" && rm -f "$f.tmp"
 					chmod 600 "$f"
 				'';
 
@@ -761,6 +766,44 @@
 					else
 						exec ${self.packages.${system}.cogbox-container}/bin/cogbox init -y -n "$inst"
 					fi
+				'';
+
+				# Container backend: per-user Claude auth stub-staging
+				# cogworx's reconcile sets the
+				# marker file on the state PVC when it binds the owner's `claude-oauth`
+				# setup-token into the enforcer (and clears it on disconnect); this
+				# oneshot makes the guest's ~/.claude/.credentials.json match, so
+				# claude-code boots "logged-in but tokenless" exactly when -- and only
+				# when -- the owner has connected Claude. The enforcer stamps the real
+				# Bearer over the inert stub; the real token never reaches the agent.
+				#
+				# ~/.claude{,.json} are backed by the state PVC (symlinks below) so both
+				# the staged stub AND the harness's own config/history survive a
+				# container restart (closes Phase 0). The marker + the stub also live
+				# on the PVC, so a restart re-stages from the persisted marker. The
+				# marker path + unit name are matched by convention with cogworx
+				# (control-plane convention).
+				claudeStubScript = pkgs.writeShellScript "cogbox-claude-stub" ''
+					set -eu
+					persist=${stateRoot}/claude-home
+					cdir="$persist/.claude"
+					cjson="$persist/.claude.json"
+					marker=${stateRoot}/claude-oauth.bound
+
+					mkdir -p "$cdir"
+					chmod 700 "$persist" "$cdir"
+					# A minimal, non-secret ~/.claude.json must exist for claude-code to
+					# skip /login (the credential file alone is not enough). brain-trust
+					# enriches it (workspace trust); seed an empty object if absent.
+					[ -e "$cjson" ] || printf '{}\n' > "$cjson"
+					chmod 600 "$cjson"
+					ln -sfn "$cdir" /root/.claude
+					ln -sfn "$cjson" /root/.claude.json
+
+					# Stage (marker present) or remove (absent) the redacted stub. The
+					# verb single-sources the stub sentinel from the secret module and
+					# never writes a real token.
+					${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub "$cdir" "$marker"
 				'';
 			in {
 				nixpkgs.config.allowUnfree = true;
@@ -992,6 +1035,7 @@
 						wantedBy = [ "multi-user.target" ];
 						before = [ "multi-user.target" "sshd.service" ];
 						after = [ stateUnit "cogbox-brain-materialize.service" ]
+							++ lib.optional isContainer "cogbox-claude-stub.service"
 							++ lib.optional (isVm && harnesses ? "claude-code") "claude-code-auth.service";
 						serviceConfig = {
 							Type = "oneshot";
@@ -1226,6 +1270,34 @@
 							];
 							PassEnvironment = [ "COGBOX_INSTANCE" ];
 							ExecStart = cogboxInitScript;
+						};
+					};
+
+					# Container backend: reconcile the redacted Claude stub credential
+					# from the per-instance marker cogworx sets/clears (step 5b). Ordered
+					# after the state symlink and BEFORE brain-materialize/brain-trust/login
+					# so the ~/.claude{,.json} PVC symlinks + the stub are in place before
+					# brain-trust writes ~/.claude.json and before a terminal opens.
+					# Re-run on connect/disconnect by cogworx (systemctl restart) and at
+					# every boot (restart persistence from the PVC marker).
+					cogbox-claude-stub = lib.mkIf isContainer {
+						description = "Stage/remove the redacted Claude stub credential (container backend)";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "multi-user.target" "sshd.service" "cogbox-brain-materialize.service" "cogbox-brain-trust.service" ];
+						after = [ "cogbox-container-state.service" ];
+						requires = [ "cogbox-container-state.service" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							# cogbox resolves XDG/HOME before any verb dispatch; mirror
+							# cogbox-init so the boot run has them (the verb itself takes
+							# explicit path args and holds no secret).
+							Environment = [
+								"HOME=/root"
+								"XDG_CONFIG_HOME=${stateRoot}/config"
+								"COGBOX_DATA=${cogboxData}"
+							];
+							ExecStart = claudeStubScript;
 						};
 					};
 				};

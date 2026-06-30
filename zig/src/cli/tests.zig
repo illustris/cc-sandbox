@@ -7,4 +7,5 @@
 test {
 	_ = @import("verbs/ssh.zig");
 	_ = @import("verbs/status.zig");
+	_ = @import("verbs/claude_stub.zig");
 }

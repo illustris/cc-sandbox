@@ -166,14 +166,24 @@ pub fn renderFiles(
 
 	// CONTAINER ENFORCER render only: seed the harness Claude inject spec so a
 	// bound per-user `claude-oauth` setup-token actually renders (the bind is inert
-	// without a spec naming it). Gated on the
-	// enforcer-private secret-store overrides, which cogworx sets ONLY on the
-	// enforcer/worker pods, so the VM boot render and the non-enforcing agent are
-	// untouched. Seed BEFORE the rule/L7 renders below so renderL7/renderRules also
-	// derive the terminate-allow + funnel for api.anthropic.com from it. Harmless
-	// when unbound (renderL7Inject emits only for a bound, audience-matched secret).
+	// without a spec naming it). Two gates, BOTH
+	// required:
+	//   (1) the enforcer-private secret-store overrides are set -- cogworx sets them
+	//       ONLY on the enforcer/worker pods, so the VM boot render and the
+	//       non-enforcing agent never seed.
+	//   (2) the claude-oauth secret is actually BOUND in the store (the owner has
+	//       connected Claude). 5a review gap #1: seeding unconditionally made
+	//       renderL7 terminate-allow api.anthropic.com on EVERY container sandbox
+	//       (superseding the L4 deny-list) even for never-connected / non-claude
+	//       owners. Binding already re-renders, so gating on bound has no race.
+	// Seed BEFORE the rule/L7 renders below so renderL7/renderRules also derive the
+	// terminate-allow + funnel for api.anthropic.com from it.
 	if (reload.seedClaudeInject(env.get("COGBOX_GLOBAL_SECRETS_DIR"), env.get("COGBOX_INSTANCE_SECRETS_DIR"))) {
-		try reload.seedClaudeInjectSpec(loaded.treeAllocator(), &net_val);
+		var bound_arena = std.heap.ArenaAllocator.init(allocator);
+		defer bound_arena.deinit();
+		if (try reload.claudeOAuthBound(bound_arena.allocator(), io, dirs.instance, dirs.global)) {
+			try reload.seedClaudeInjectSpec(loaded.treeAllocator(), &net_val);
+		}
 	}
 
 	try reload.writeRuntimeRules(allocator, io, runtime_path, net_val, base);
