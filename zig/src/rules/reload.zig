@@ -357,6 +357,83 @@ pub fn renderL7Inject(
 	try config.writeJqTab(allocator, out, .{ .array = arr });
 }
 
+/// Whether THIS render should seed the harness Claude inject spec: true ONLY in
+/// the container-enforcer context. cogworx sets BOTH enforcer-private secret-store
+/// overrides (COGBOX_GLOBAL_SECRETS_DIR / COGBOX_INSTANCE_SECRETS_DIR) exclusively
+/// on the enforcer (and the stopped-instance worker) pods -- never on the VM boot
+/// render or the non-enforcing single-pod agent -- so their presence is the
+/// "enforcement on + container target" signal with no extra wiring. Pure, so the
+/// gate is unit-testable. (Both must be set: an enforcer always sets both together.)
+pub fn seedClaudeInject(global_override: ?[]const u8, instance_override: ?[]const u8) bool {
+	return global_override != null and instance_override != null;
+}
+
+/// Seed the harness-owned Claude inject spec into `network.l7.inject.specs[]` so a
+/// bound per-user `claude-oauth` setup-token actually renders. The step-3 reconcile BINDS the `claude-oauth` secret (kind=anthropic-oauth,
+/// audience=api.anthropic.com), but renderL7Inject only iterates specs the config
+/// declares -- with nothing naming that secret the bind is INERT. This is the
+/// load-bearing link the step-4 review flagged.
+///
+/// Called only in the container-enforcer render (see seedClaudeInject). The spec is
+/// HARMLESS when the secret is unbound: renderL7Inject emits an element ONLY when the
+/// named secret is bound AND its audience == host, so a sandbox whose owner never
+/// connected Claude (or a non-claude harness) renders nothing for it. It is also
+/// additive -- a plugin/seed spec already targeting the host is left untouched
+/// (idempotent), so re-renders and plugin-contributed specs are undisturbed.
+///
+/// Creates `.l7` / `.l7.inject` / `.l7.inject.specs` on demand and folds a legacy
+/// bool `inject` (which carries no specs) into the object form. Mutates `network`
+/// in place; new values are allocated in `arena` (the config tree's arena).
+pub fn seedClaudeInjectSpec(arena: std.mem.Allocator, network: *std.json.Value) !void {
+	if (network.* != .object) return; // "full"/"none" mode carries no L7 object
+
+	// .network.l7 (object), created on demand.
+	const l7 = blk: {
+		if (network.object.getPtr("l7")) |v| {
+			if (v.* == .object) break :blk v;
+		}
+		try network.object.put(arena, "l7", .{ .object = .empty });
+		break :blk network.object.getPtr("l7").?;
+	};
+
+	// .network.l7.inject (object). A legacy bool `inject: true`/`false` carries no
+	// specs, so replace it with the object form the seed can land in.
+	const inj = blk: {
+		if (l7.object.getPtr("inject")) |v| {
+			if (v.* == .object) break :blk v;
+		}
+		try l7.object.put(arena, "inject", .{ .object = .empty });
+		break :blk l7.object.getPtr("inject").?;
+	};
+
+	// .network.l7.inject.specs (array), created on demand.
+	const specs = blk: {
+		if (inj.object.getPtr("specs")) |v| {
+			if (v.* == .array) break :blk &v.array;
+		}
+		try inj.object.put(arena, "specs", .{ .array = std.json.Array.init(arena) });
+		break :blk &inj.object.getPtr("specs").?.array;
+	};
+
+	// Idempotent: a spec (plugin- or seed-contributed) already targeting the host
+	// covers it -- never add a duplicate.
+	for (specs.items) |s| {
+		if (s != .object) continue;
+		const h = strField(s.object, "host") orelse continue;
+		if (std.ascii.eqlIgnoreCase(h, secret_mod.anthropic_api_host)) return;
+	}
+
+	// {host, style, secret}: the secret's kind=anthropic-oauth drives the actual
+	// style/stub override in renderL7Inject, but declare style explicitly so the
+	// config reads truthfully. No value/path/stub here -- a spec only NAMES a
+	// credential (the same constraint plugin inject specs carry).
+	var spec: std.json.ObjectMap = .empty;
+	try spec.put(arena, "host", .{ .string = secret_mod.anthropic_api_host });
+	try spec.put(arena, "style", .{ .string = secret_mod.anthropic_oauth_kind });
+	try spec.put(arena, "secret", .{ .string = secret_mod.claude_oauth_secret });
+	try specs.append(.{ .object = spec });
+}
+
 /// Resolve a named secret: an instance-produced secret (e.g. a sidecar-minted
 /// session) shadows a global operator-bound one of the same name.
 fn resolveSecret(
@@ -686,4 +763,124 @@ test "renderL7Inject: a bearer-kind secret keeps the spec's style + spec stub (o
 	try std.testing.expect(std.mem.indexOf(u8, s, "spec-stub-keeps") != null);
 	try std.testing.expect(std.mem.indexOf(u8, s, secret_mod.claude_stub_token) == null);
 	try std.testing.expect(std.mem.indexOf(u8, s, "anthropic-oauth") == null);
+}
+
+test "seedClaudeInject gates strictly on BOTH enforcer-private secret-dir overrides" {
+	// Container enforcer/worker: both set -> seed. VM boot render / non-enforcing
+	// agent: neither (or only one, which never happens) set -> no seed.
+	try std.testing.expect(seedClaudeInject("/run/cogbox-secrets/global", "/run/cogbox-secrets/instance"));
+	try std.testing.expect(!seedClaudeInject(null, "/run/cogbox-secrets/instance"));
+	try std.testing.expect(!seedClaudeInject("/run/cogbox-secrets/global", null));
+	try std.testing.expect(!seedClaudeInject(null, null));
+}
+
+test "seedClaudeInjectSpec seeds the claude-oauth spec into l7.inject.specs (idempotent)" {
+	const gpa = std.testing.allocator;
+	// A rules-mode network with NO l7 yet (the container default before the seed).
+	const src =
+		\\{"rules":[{"allow":"0.0.0.0/0","comment":"public"}]}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+
+	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+
+	const specs = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
+	try std.testing.expectEqual(@as(usize, 1), specs.items.len);
+	const s0 = specs.items[0].object;
+	try std.testing.expectEqualStrings(secret_mod.anthropic_api_host, s0.get("host").?.string);
+	try std.testing.expectEqualStrings(secret_mod.anthropic_oauth_kind, s0.get("style").?.string);
+	try std.testing.expectEqualStrings(secret_mod.claude_oauth_secret, s0.get("secret").?.string);
+	// A spec only NAMES a credential: no value/path/stub leaks into config.
+	try std.testing.expect(s0.get("stub") == null);
+	try std.testing.expect(s0.get("cred_file") == null);
+
+	// Idempotent: re-seeding the same network adds nothing.
+	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+	const specs2 = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
+	try std.testing.expectEqual(@as(usize, 1), specs2.items.len);
+}
+
+test "seedClaudeInjectSpec is additive: keeps an existing plugin inject spec" {
+	const gpa = std.testing.allocator;
+	// A plugin already contributed a spec for a different host (OSS-clean fictionals).
+	const src =
+		\\{"l7":{"inject":{"specs":[
+		\\  {"host":"api.example.com","style":"bearer","secret":"api-token","plugin":"obs-plugin"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+
+	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+
+	const specs = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
+	try std.testing.expectEqual(@as(usize, 2), specs.items.len);
+	// the plugin spec is untouched (still first)
+	try std.testing.expectEqualStrings("api.example.com", specs.items[0].object.get("host").?.string);
+	try std.testing.expectEqualStrings("obs-plugin", specs.items[0].object.get("plugin").?.string);
+	// the harness claude spec was appended
+	try std.testing.expectEqualStrings(secret_mod.anthropic_api_host, specs.items[1].object.get("host").?.string);
+	try std.testing.expectEqualStrings(secret_mod.claude_oauth_secret, specs.items[1].object.get("secret").?.string);
+}
+
+test "seeded claude-oauth spec: renderL7Inject silent when unbound, emits when bound" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const inst_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(inst_dir);
+	defer cwd.deleteTree(io, inst_dir) catch {};
+
+	// The container default: a rules-mode network with no l7 -> seed it, exactly as
+	// the enforcer render does before writing the inject conf.
+	const src =
+		\\{"rules":[{"allow":"0.0.0.0/0","comment":"public"}]}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+
+	// Unbound: claude-oauth isn't in the store -> renderL7Inject emits NO element
+	// and routes NO host, the fail-closed "guest carries its own token" fallback.
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		var hosts: std.ArrayList(u8) = .empty;
+		defer hosts.deinit(gpa);
+		try renderL7Inject(gpa, io, net, "zig-inject-test-no-global", inst_dir, &out, &hosts);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "anthropic-oauth") == null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, secret_mod.anthropic_api_host) == null);
+		try std.testing.expect(std.mem.indexOf(u8, hosts.items, secret_mod.anthropic_api_host) == null);
+	}
+
+	// Bind the reserved secret the way cogworx's reconcile does: kind=anthropic-oauth,
+	// audience pinned to the host. The VALUE is a fictional (OSS-clean) setup-token.
+	try secret_store.add(gpa, io, inst_dir, secret_mod.claude_oauth_secret, "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKE", .{
+		.audience = secret_mod.anthropic_api_host,
+		.kind = secret_mod.anthropic_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	// Bound: the seeded spec now resolves -> an anthropic-oauth element carrying the
+	// shared stub sentinel, NO refresh block, and the host mirrored into the
+	// plain-HTTP inject-routing list.
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		var hosts: std.ArrayList(u8) = .empty;
+		defer hosts.deinit(gpa);
+		try renderL7Inject(gpa, io, net, "zig-inject-test-no-global", inst_dir, &out, &hosts);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "\"style\": \"anthropic-oauth\"") != null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "\"cred_format\": \"raw\"") != null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, secret_mod.claude_stub_token) != null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "refresh") == null);
+		try std.testing.expect(std.mem.indexOf(u8, hosts.items, secret_mod.anthropic_api_host) != null);
+	}
 }

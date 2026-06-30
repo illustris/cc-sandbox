@@ -32,6 +32,21 @@ pub const anthropic_oauth_kind = "anthropic-oauth";
 /// untouched. MUST equal harness_stub_token "claude-code" in cogbox-launch.sh.
 pub const claude_stub_token = "sk-ant-oat01-cogbox-host-injected-placeholder";
 
+/// The single host the per-user Claude credential may be stamped at: the
+/// audience the `claude-oauth` secret is pinned to (renderL7Inject's exfiltration
+/// gate) AND the host the container harness inject-spec seed targets
+/// (rules/reload.zig seedClaudeInjectSpec). Single-sourced so the seed and the
+/// bind can never name different hosts.
+pub const anthropic_api_host = "api.anthropic.com";
+
+/// The reserved secret NAME cogworx binds the per-user Claude setup-token into
+/// kind=anthropic-oauth, audience=api.anthropic.com.
+/// The container enforcer seeds an inject spec referencing THIS name so a bound
+/// token actually renders; the bind alone is inert without the spec. Single-sourced
+/// here so the seed, the renderer, and the cogworx bind all name one secret -- a
+/// typo would silently break injection (fail-closed, but invisibly).
+pub const claude_oauth_secret = "claude-oauth";
+
 /// The injection styles a `cogbox secret add --kind` may carry. `bearer`,
 /// `cookie` and `basic` are the operator/plugin credential primitives; the
 /// per-user Claude bind adds `anthropic-oauth` (a long-lived setup-token the

@@ -159,10 +159,23 @@ pub fn renderFiles(
 
 	// "full"/"none" mode carries no .network object; render against null so the
 	// runtime files (incl. an empty inject conf) are emitted defensively.
-	const net_val: std.json.Value = blk: {
+	var net_val: std.json.Value = blk: {
 		const net = loaded.network() catch break :blk .null;
 		break :blk net.*;
 	};
+
+	// CONTAINER ENFORCER render only: seed the harness Claude inject spec so a
+	// bound per-user `claude-oauth` setup-token actually renders (the bind is inert
+	// without a spec naming it). Gated on the
+	// enforcer-private secret-store overrides, which cogworx sets ONLY on the
+	// enforcer/worker pods, so the VM boot render and the non-enforcing agent are
+	// untouched. Seed BEFORE the rule/L7 renders below so renderL7/renderRules also
+	// derive the terminate-allow + funnel for api.anthropic.com from it. Harmless
+	// when unbound (renderL7Inject emits only for a bound, audience-matched secret).
+	if (reload.seedClaudeInject(env.get("COGBOX_GLOBAL_SECRETS_DIR"), env.get("COGBOX_INSTANCE_SECRETS_DIR"))) {
+		try reload.seedClaudeInjectSpec(loaded.treeAllocator(), &net_val);
+	}
+
 	try reload.writeRuntimeRules(allocator, io, runtime_path, net_val, base);
 	try reload.writeL7Rules(allocator, io, runtime_path, net_val);
 	try reload.writeL7Inject(allocator, io, runtime_path, net_val, dirs.global, dirs.instance);
