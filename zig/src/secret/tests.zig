@@ -28,6 +28,20 @@ test "validName accepts valid names, rejects traversal/charset/length" {
 	try t.expect(!store.validName("x" ** 65)); // > 64 chars
 }
 
+test "validKind allowlist accepts the injection styles incl. anthropic-oauth" {
+	try t.expect(main.validKind("bearer"));
+	try t.expect(main.validKind("cookie"));
+	try t.expect(main.validKind("basic"));
+	// The per-user Claude setup-token bind without
+	// this the `claude-oauth` bind FAILS CLOSED at `secret add`.
+	try t.expect(main.validKind("anthropic-oauth"));
+	try t.expectEqualStrings("anthropic-oauth", main.anthropic_oauth_kind);
+	// unknown styles are still rejected (fail closed)
+	try t.expect(!main.validKind("oauth"));
+	try t.expect(!main.validKind("anthropic"));
+	try t.expect(!main.validKind(""));
+}
+
 test "buildMeta/parseMeta round-trip" {
 	const a = t.allocator;
 	const m: store.Meta = .{ .audience = "api.example.com", .kind = "bearer", .tier = "durable", .bound_at = 1234 };

@@ -8,7 +8,8 @@ const std = @import("std");
 const rule = @import("rule.zig");
 const config = @import("config.zig");
 const filter = @import("filter");
-const secret_store = @import("secret_module").store;
+const secret_mod = @import("secret_module");
+const secret_store = secret_mod.store;
 
 /// True when L7 vhost filtering is active for this instance: `.network.l7` is
 /// an object with a non-empty `rules` array OR a non-empty
@@ -286,6 +287,14 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 /// no spec for that host and never stamps a stale/foreign credential. The
 /// cred_file is the store's value path; cred_format "raw" (the addon's
 /// token_for reads its first non-empty line). NOT pure -- reads the store.
+///
+/// A bound secret whose meta.kind == anthropic-oauth (the per-user Claude
+/// `setup-token` bind) FORCES style
+/// "anthropic-oauth" + the shared host stub_token sentinel, overriding whatever
+/// the spec declared: the addon's anthropic-oauth branch then stamps the real
+/// Bearer ONLY over that placeholder. No `refresh` block is ever emitted here --
+/// a setup-token is long-lived and bound once (S4.4). Every other kind keeps its
+/// existing spec-driven style + optional spec `stub` rendering unchanged.
 pub fn renderL7Inject(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -305,12 +314,19 @@ pub fn renderL7Inject(
 			if (spec != .object) continue;
 			const host = strField(spec.object, "host") orelse continue;
 			const secret_name = strField(spec.object, "secret") orelse continue;
-			const style = strField(spec.object, "style") orelse "bearer";
+			var style = strField(spec.object, "style") orelse "bearer";
 
 			const resolved = (try resolveSecret(arena, io, instance_secrets_dir, global_secrets_dir, secret_name)) orelse continue;
 			if (!resolved.bound) continue;
 			const audience = resolved.meta.audience orelse continue; // unset -> not injectable
 			if (!std.mem.eql(u8, audience, host)) continue; // exfiltration gate
+
+			// A kind=anthropic-oauth secret (the per-user Claude setup-token bind)
+			// forces the anthropic-oauth inject style + the shared host stub
+			// sentinel, overriding the spec's style/stub. The audience pin above
+			// already proved this secret is bound for THIS host.
+			const oauth_kind = std.mem.eql(u8, resolved.meta.kind, secret_mod.anthropic_oauth_kind);
+			if (oauth_kind) style = secret_mod.anthropic_oauth_kind;
 
 			var el: std.json.ObjectMap = .empty;
 			try el.put(arena, "host", .{ .string = host });
@@ -320,7 +336,11 @@ pub fn renderL7Inject(
 			if (strField(spec.object, "cookieName")) |cn| {
 				try el.put(arena, "cookie_name", .{ .string = cn });
 			}
-			if (strField(spec.object, "stub")) |st| {
+			if (oauth_kind) {
+				// A setup-token is long-lived/static -> NO refresh block, just the
+				// stub the host redacted into the guest's cred file.
+				try el.put(arena, "stub_token", .{ .string = secret_mod.claude_stub_token });
+			} else if (strField(spec.object, "stub")) |st| {
 				try el.put(arena, "stub_token", .{ .string = st });
 			}
 			try arr.append(.{ .object = el });
@@ -565,4 +585,105 @@ test "renderRules funnels non-standard inject-host ports (deduped, 80/443 exclud
 	// 80/443 are already the standard funnel -- no duplicate custom remap for them.
 	try std.testing.expect(std.mem.count(u8, s, "0.0.0.0/0:443 ->") == 1);
 	try std.testing.expect(std.mem.count(u8, s, "0.0.0.0/0:80 ->") == 1);
+}
+
+// A self-made instance store dir (relative to cwd) for the renderL7Inject IO
+// tests; the caller owns teardown. Returns the dir name allocated in `gpa`.
+fn tmpStoreDir(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+	var rnd: [8]u8 = undefined;
+	io.random(&rnd);
+	var hexb: [16]u8 = undefined;
+	_ = std.fmt.bufPrint(&hexb, "{x}", .{&rnd}) catch unreachable;
+	const dir = try std.fmt.allocPrint(gpa, "zig-inject-test-{s}", .{hexb});
+	try std.Io.Dir.cwd().createDirPath(io, dir);
+	return dir;
+}
+
+test "renderL7Inject: kind=anthropic-oauth forces style + the shared stub sentinel, no refresh" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const inst_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(inst_dir);
+	defer cwd.deleteTree(io, inst_dir) catch {};
+
+	// Bind the reserved claude-oauth secret: kind=anthropic-oauth, audience pinned
+	// to the spec host. The VALUE is a fictional (OSS-clean) setup-token.
+	try secret_store.add(gpa, io, inst_dir, "claude-oauth", "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKE", .{
+		.audience = "api.anthropic.com",
+		.kind = secret_mod.anthropic_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	// The spec deliberately declares a DIFFERENT style + stub: the secret's kind
+	// must override both.
+	const src =
+		\\{"l7":{"mode":"terminate","inject":{"enabled":true,"specs":[
+		\\  {"host":"api.anthropic.com","style":"bearer","secret":"claude-oauth","stub":"ignored-spec-stub"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	var hosts: std.ArrayList(u8) = .empty;
+	defer hosts.deinit(gpa);
+	// No global store needed (the instance store binds the secret).
+	try renderL7Inject(gpa, io, parsed.value, "zig-inject-test-no-global", inst_dir, &out, &hosts);
+	const s = out.items;
+
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"style\": \"anthropic-oauth\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"cred_format\": \"raw\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, secret_mod.claude_stub_token) != null);
+	// the spec's declared bearer style + stub did NOT win
+	try std.testing.expect(std.mem.indexOf(u8, s, "ignored-spec-stub") == null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"style\": \"bearer\"") == null);
+	// a setup-token is static -> no refresh block is ever emitted here
+	try std.testing.expect(std.mem.indexOf(u8, s, "refresh") == null);
+	// the host is mirrored into the plain-HTTP inject-routing list
+	try std.testing.expect(std.mem.indexOf(u8, hosts.items, "api.anthropic.com") != null);
+}
+
+test "renderL7Inject: a bearer-kind secret keeps the spec's style + spec stub (other kinds unchanged)" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const inst_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(inst_dir);
+	defer cwd.deleteTree(io, inst_dir) catch {};
+
+	try secret_store.add(gpa, io, inst_dir, "api-token", "tok-abc123", .{
+		.audience = "api.example.com",
+		.kind = "bearer",
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	const src =
+		\\{"l7":{"mode":"terminate","inject":{"enabled":true,"specs":[
+		\\  {"host":"api.example.com","style":"bearer","secret":"api-token","stub":"spec-stub-keeps"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	var hosts: std.ArrayList(u8) = .empty;
+	defer hosts.deinit(gpa);
+	try renderL7Inject(gpa, io, parsed.value, "zig-inject-test-no-global", inst_dir, &out, &hosts);
+	const s = out.items;
+
+	// Unchanged from before this feature: the spec's style + its own stub are used,
+	// and the claude sentinel is NOT stamped onto a non-claude kind.
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"style\": \"bearer\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "spec-stub-keeps") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, secret_mod.claude_stub_token) == null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "anthropic-oauth") == null);
 }

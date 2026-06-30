@@ -5,7 +5,7 @@
 // process table / shell history.
 //
 //   cogbox secret add <name> --from-file F | --from-stdin
-//                            [--audience HOST] [--kind bearer|cookie] [-n INST]
+//        [--audience HOST] [--kind bearer|cookie|basic|anthropic-oauth] [-n INST]
 //   cogbox secret ls [--json]
 //   cogbox secret rm <name> [-n INST]
 //   cogbox secret reload -n INST   (-n + reload handled by the cli verb layer:
@@ -14,6 +14,32 @@
 
 const std = @import("std");
 pub const store = @import("store.zig");
+
+/// The secret `kind` that selects HOST-SIDE Bearer injection for a Claude
+/// `setup-token` (the per-user "Connect Claude" bind). It is admitted by the `--kind` allowlist below, and renderL7Inject
+/// keys the `anthropic-oauth` inject style + the stub_token off a resolved
+/// secret carrying this kind. Single-sourced here so the verb (which writes the
+/// meta) and the renderer (which reads it) can never drift.
+pub const anthropic_oauth_kind = "anthropic-oauth";
+
+/// The redacted setup-token sentinel the host stamps into a Claude harness's
+/// in-guest credential so it boots "logged-in but tokenless": the VM launcher's
+/// write_stub_cred (cogbox-launch.sh harness_stub_token "claude-code") and the
+/// container-backend stub-staging both write THIS exact string, and
+/// renderL7Inject emits it as a kind=anthropic-oauth spec's `stub_token`. The
+/// addon then REWRITES the real Bearer ONLY over this placeholder (should_inject)
+/// and forwards any secondary credential the guest legitimately obtained
+/// untouched. MUST equal harness_stub_token "claude-code" in cogbox-launch.sh.
+pub const claude_stub_token = "sk-ant-oat01-cogbox-host-injected-placeholder";
+
+/// The injection styles a `cogbox secret add --kind` may carry. `bearer`,
+/// `cookie` and `basic` are the operator/plugin credential primitives; the
+/// per-user Claude bind adds `anthropic-oauth` (a long-lived setup-token the
+/// enforcer stamps as a Bearer, gated by the redacted in-guest stub). Pure, so
+/// the allowlist is unit-testable without IO.
+pub fn validKind(kind: []const u8) bool {
+	return eql(kind, "bearer") or eql(kind, "cookie") or eql(kind, "basic") or eql(kind, anthropic_oauth_kind);
+}
 
 pub fn dispatch(
 	allocator: std.mem.Allocator,
@@ -63,8 +89,8 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 	if (!store.validName(nm)) {
 		return die(allocator, io, "invalid secret name '{s}' (use [A-Za-z0-9_-], max 64)", .{nm}, 65);
 	}
-	if (!eql(kind, "bearer") and !eql(kind, "cookie") and !eql(kind, "basic")) {
-		return die(allocator, io, "invalid --kind '{s}' (expected bearer|cookie|basic)", .{kind}, 65);
+	if (!validKind(kind)) {
+		return die(allocator, io, "invalid --kind '{s}' (expected bearer|cookie|basic|anthropic-oauth)", .{kind}, 65);
 	}
 	if (from_file != null and from_stdin) {
 		return die(allocator, io, "--from-file and --from-stdin are mutually exclusive", .{}, 64);

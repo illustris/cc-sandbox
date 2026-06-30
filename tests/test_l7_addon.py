@@ -317,6 +317,35 @@ check(csr.token_for(spr) == "SID-RAW-2", "credstore raw read hot-reloads on mtim
 os.remove(_raw)
 check(csr.token_for(spr) is None, "credstore raw read fail-closed on missing file")
 
+# A raw anthropic-oauth secret (the per-user Claude setup-token bind) is the exact
+# shape renderL7Inject emits for a kind=anthropic-oauth secret: style
+# anthropic-oauth, cred_format raw (the token is the whole value, NOT a jq path),
+# the shared stub sentinel, and NO refresh block. The addon must admit it, raw-read
+# the token, stub-gate against the sentinel, and stamp the Bearer. This is the
+# end-to-end path.
+_oauthraw = os.path.join(_d, "claude-oauth")
+_write_raw(_oauthraw, "sk-ant-oat01-REAL-SETUP-TOKEN\n", 1000)
+_write(_conf, [{"host": "api.anthropic.com", "style": "anthropic-oauth",
+                "cred_file": _oauthraw, "cred_format": "raw", "stub_token": STUB}], 8000)
+cso = m.CredStore(_conf)
+spo = cso.spec_for("api.anthropic.com")
+check(spo is not None, "credstore admits a raw anthropic-oauth spec (no token_path)")
+check(cso.token_for(spo) == "sk-ant-oat01-REAL-SETUP-TOKEN",
+      "credstore raw-reads the anthropic-oauth setup-token value directly")
+check("refresh" not in spo, "raw anthropic-oauth spec carries no refresh block (long-lived token)")
+# stub-gating: inject over the redacted in-guest stub (or no auth), pass a secondary through
+check(m.should_inject(CIDict({"Authorization": "Bearer " + STUB}), "anthropic-oauth", spo.get("stub_token")),
+      "raw anthropic-oauth: inject over the host stub sentinel")
+check(not m.should_inject(CIDict({"Authorization": "Bearer eyJ.secondary.jwt"}), "anthropic-oauth", spo.get("stub_token")),
+      "raw anthropic-oauth: pass a non-stub secondary credential through untouched")
+# apply: SET the real Bearer from the raw value, drop x-api-key, merge the oauth beta
+_ho = CIDict({"Authorization": "Bearer " + STUB, "x-api-key": "guest-key"})
+m.apply_injection(_ho, "anthropic-oauth", cso.token_for(spo))
+check(_ho["authorization"] == "Bearer sk-ant-oat01-REAL-SETUP-TOKEN",
+      "raw anthropic-oauth: real setup-token stamped as Bearer over the stub")
+check("x-api-key" not in _ho, "raw anthropic-oauth: x-api-key dropped")
+check(m.ANTHROPIC_OAUTH_BETA in _ho["anthropic-beta"], "raw anthropic-oauth: oauth beta merged")
+
 # A raw bearer (cred_format=="raw") is admitted + read the same way (no token_path)
 _rawb = os.path.join(_d, "bearer.txt")
 _write_raw(_rawb, "tok-abc123\n", 1000)
