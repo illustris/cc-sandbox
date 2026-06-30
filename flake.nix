@@ -216,9 +216,10 @@
 					# ~/work (= /root/work, a base-created symlink into the persisted
 					# share). mkForce so no plugin can append a competing `cd` -- the
 					# cogbox.* contract has no loginShellInit surface. Falls back to
-					# the share root if the brain oneshot has not run yet.
+					# /root (NOT the data dir, which holds cogbox_ed25519 + instances/)
+					# if the brain oneshot has not run yet.
 					programs.bash.loginShellInit = lib.mkForce ''
-						cd /root/work 2>/dev/null || cd /var/lib/${name}
+						cd /root/work 2>/dev/null || cd /root
 					'';
 					microvm = {
 						hypervisor = "qemu";
@@ -281,9 +282,10 @@
 						users.users.root.password = "";
 						# Land login + non-login shells in ~/work, same as the VM
 						# (mkForce: no plugin appends a competing cd). Falls back to
-						# the mounted state root before the brain oneshot has run.
+						# /root (NOT COGBOX_DATA, which holds cogbox_ed25519 +
+						# instances/) before the brain oneshot has run.
 						programs.bash.loginShellInit = lib.mkForce ''
-							cd /root/work 2>/dev/null || cd /var/lib/cogbox-state/data/cogbox
+							cd /root/work 2>/dev/null || cd /root
 						'';
 						nix = {
 							nixPath = [ "nixpkgs=${pkgs.path}" ];
@@ -846,6 +848,53 @@
 				# guards against any other module flipping it back on; gated to the
 				# container so the VM runner is byte-identical.
 				networking.resolvconf.enable = lib.mkIf isContainer (lib.mkForce false);
+
+				# Container web-terminal locale. The web terminal attaches via
+				# `kubectl exec -- env ... tmux ...` (cogworx's terminal attach),
+				# which sources NO login shell and inherits NO /etc/locale.conf, so
+				# without a UTF-8 LANG in the container env LC_CTYPE stays C (ASCII)
+				# and tmux/claude-code render as degraded boxes. The cogworx pod env +
+				# baked OCI Env set LANG=C.UTF-8; this makes that locale resolvable.
+				# C.UTF-8 is a glibc builtin, so restricting supportedLocales to it
+				# keeps the multi-hundred-MB glibcLocales archive out of the closure
+				# instead of building "all". Gated to the container; the VM is untouched.
+				i18n.defaultLocale = lib.mkIf isContainer "C.UTF-8";
+				i18n.supportedLocales = lib.mkIf isContainer [ "C.UTF-8/UTF-8" ];
+
+				# Container web-terminal TUI colors. The outer `kubectl exec` forces
+				# TERM=xterm-256color, but tmux's default default-terminal is the
+				# 8-color "screen", so a TUI INSIDE a pane (claude-code) would still
+				# see TERM=screen and render in 8 colors. Advertise a 256-color,
+				# truecolor-capable terminal to pane processes. The tmux-256color
+				# terminfo entry ships with ncurses (a tmux dependency, already in the
+				# image closure). cogworx launches tmux with `-f /etc/tmux.conf` so
+				# this is loaded regardless of tmux's compiled sysconfdir. Gated to the
+				# container; the VM's host-side tmux is unaffected.
+				environment.etc."tmux.conf" = lib.mkIf isContainer {
+					text = ''
+						set -g default-terminal "tmux-256color"
+						set -ga terminal-overrides ",*256col*:Tc"
+					'';
+				};
+
+				# nscd is the lone unit that goes "degraded" in the unprivileged
+				# container: NixOS default-enables it, but it cannot write its cache
+				# (EROFS) here, so `systemctl is-system-running` reports degraded on an
+				# otherwise healthy boot. The sandbox resolves users from a static
+				# passwd/group (glibc builtin `files` NSS) and DNS via the
+				# kubelet-managed /etc/resolv.conf (glibc builtin `dns` NSS), so the
+				# NSS cache buys nothing. mkForce overrides the NixOS default-on; gated
+				# to the container so the VM keeps its default nscd.
+				services.nscd.enable = lib.mkIf isContainer (lib.mkForce false);
+				# NixOS routes EXTERNAL NSS modules (here only nss-systemd, for the
+				# `systemd` userdb / DynamicUser) through nscd, so it asserts nscd-on
+				# whenever system.nssModules is non-empty. The sandbox needs neither
+				# DynamicUser nor the systemd userdb -- root and DNS resolve via the
+				# glibc builtin `files`/`dns` sources, which need no module -- so drop
+				# the external modules in lockstep with disabling nscd. mkForce []
+				# clears the systemd contribution; gated to the container (the VM keeps
+				# nss-systemd + nscd untouched).
+				system.nssModules = lib.mkIf isContainer (lib.mkForce []);
 
 				# Container under a userns (hostUsers:false): NixOS stage-2 activation
 				# re-applies its hardened mount options to the special filesystems the
@@ -1608,6 +1657,14 @@
 						"COGBOX_DATA=/var/lib/cogbox-state/data/cogbox"
 						"XDG_RUNTIME_DIR=/run/cogbox"
 						"SSL_CERT_FILE=/run/cogbox/ca-bundle.crt"
+						# UTF-8 locale for a `kubectl exec` (which sources no login
+						# shell, so it does not pick up /etc/locale.conf): without this
+						# LC_CTYPE stays C (ASCII) and tmux/claude-code render in
+						# degraded boxes. C.UTF-8 is the glibc builtin the container
+						# system sets as i18n.defaultLocale. Mirrors the cogworx pod env
+						# so a direct/worker-pod exec inherits it even without the pod.
+						"LANG=C.UTF-8"
+						"LC_CTYPE=C.UTF-8"
 						# NixOS stage-2 + systemd run in container mode only when the
 						# `container` env var is set (nspawn sets it; containerd/k8s do
 						# not). Without it stage-2 tries to remount / and mount host
