@@ -797,7 +797,16 @@
 					# enriches it (workspace trust); seed an empty object if absent.
 					[ -e "$cjson" ] || printf '{}\n' > "$cjson"
 					chmod 600 "$cjson"
+					# /root/.claude{,.json} may pre-exist as REAL files/dirs (the image
+					# home skel / claude-code's own init runs before this oneshot). `ln
+					# -sfn` against an existing DIR NESTS the link inside it
+					# (/root/.claude/.claude -> ...) instead of replacing it, so the staged
+					# stub lands at the wrong path and claude-code reports "Not logged in".
+					# Drop any non-symlink first; on later boots the link already exists
+					# (-L true) so ln -f just refreshes it.
+					[ -L /root/.claude ] || rm -rf /root/.claude
 					ln -sfn "$cdir" /root/.claude
+					[ -L /root/.claude.json ] || rm -rf /root/.claude.json
 					ln -sfn "$cjson" /root/.claude.json
 
 					# Stage (marker present) or remove (absent) the redacted stub. The
