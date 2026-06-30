@@ -1,24 +1,43 @@
 #!/usr/bin/env python3
 """Standing egress-floor bypass probes for cogbox container mode (TODO).
 
-Run INSIDE the test guest AFTER cogbox-nft-divert.sh has loaded its ruleset and
-the dummy test IPs are assigned. This harness stands up the divert-shim, enforcer
-and echo/raw listeners IN-PROCESS, fires exactly one probe per egress path, and
-asserts each outcome. It is written to PROVE the leaks are CLOSED: the DROPPED
-probes must now fail to be delivered, and each one has a bound listener so that --
-absent the floor -- the packet WOULD be delivered (otherwise "not delivered" would
-be a meaningless false pass).
+Run INSIDE the test guest AFTER cogbox-nft-divert.sh has loaded its ruleset in the
+MAIN netns. The probe destinations are deliberately OFF-box: the driver puts them in
+a SEPARATE peer netns reached over a veth pair and routes them via the veth next-hop,
+so every probe packet leaves the main netns with oif=veth0 (NOT oif=lo). That is what
+makes the test exercise the real rules -- an earlier revision pinned the dsts as local
+/32s, which route via `lo`, and BOTH the nat divert (`oif "lo" return`) and the filter
+floor (`oif "lo" accept`) special-case lo, so the redirect and the policy-drop never
+fired and the suite codified the loopback bypass instead of the floor.
 
-Exits 0 iff every assertion holds, non-zero (with a per-line PASS/FAIL report) on
-any leak. No internal identifiers: every address is from a documentation/test
-range (RFC 5737 TEST-NET, RFC 4193 ULA, the conventional k8s 10.96/12 ClusterIP
-block) and the only hostname is under the reserved .test TLD.
+Topology (built by the driver):
+  main netns: this CLIENT process + the in-pod divert-shim (127.0.0.1:18443, the local
+              REDIRECT target) + a loopback raw listener (the raw positive control).
+  peer netns: a SERVER instance of this script (`--serve`) that binds the enforcer,
+              resolver, and per-drop-target listeners on the off-box dst addresses and
+              records each delivery as a marker file under COGBOX_PROBE_HITDIR (a shared
+              dir; the server is entered with `nsenter --net=...` so the filesystem -- and
+              thus the marker dir -- stays common to both netns).
+
+The client fires exactly one probe per egress path. REDIRECTED probes terminate at the
+in-process shim (verified via SO_ORIGINAL_DST). DELIVERED-OFF-BOX probes (the enforcer
+carve-out, the resolver-only DNS allow, and every drop case's positive control) are
+observed through the shared marker dir the peer server writes. It is written to PROVE
+the leaks are CLOSED: each DROPPED probe has a bound off-box listener so that -- absent
+the floor -- its packet WOULD be delivered, making "no marker" a real drop signal rather
+than a meaningless false pass.
+
+Exits 0 iff every assertion holds, non-zero (with a per-line PASS/FAIL report) on any
+leak. No internal identifiers: every address is from a documentation/test range (RFC 5737
+TEST-NET, RFC 4193 ULA, the conventional k8s 10.96/12 ClusterIP block) and the only
+hostname is under the reserved .test TLD.
 """
 
+import os
 import socket
 import struct
-import subprocess
 import sys
+import subprocess
 import threading
 import time
 
@@ -26,7 +45,7 @@ import time
 RESOLVER = "10.96.0.10"  # stub kube-dns ClusterIP -- the ONLY udp/53 dst allowed
 ENFORCER = "10.96.12.34"  # enforcer Service ClusterIP (the nat carve-out dst)
 ENF_PORT = 18443
-SHIM = "127.0.0.1"  # the in-pod divert-shim REDIRECT target
+SHIM = "127.0.0.1"  # the in-pod divert-shim REDIRECT target (LOCAL to the main netns)
 SHIM_PORT = 18443
 WEB = "192.0.2.10"  # raw-IP-literal TCP target (must be redirected)
 NAMED_IP = "192.0.2.20"  # origin.test (in /etc/hosts) resolves here
@@ -41,13 +60,46 @@ V6_DST = "fd00:dead:beef::10"  # any IPv6 dst (must drop)
 SCTP_PROTO = 132  # IPPROTO_SCTP -- a representative non-tcp/udp IPv4 L4
 SO_ORIGINAL_DST = 80  # getsockopt(SOL_IP, ...) -> the pre-REDIRECT tuple
 MARK_CTL = b"COGBOX-RAW-CTL"  # loopback positive control for the raw path
-MARK_DROP = b"COGBOX-RAW-DROP"  # the proto-132-to-non-loopback drop probe
+MARK_DROP = b"COGBOX-RAW-DROP"  # the proto-132-to-off-box drop probe
+
+# Shared marker dir: the peer SERVER touches a file here per delivery; the main-netns
+# CLIENT polls it. The server is entered with `nsenter --net=` (NET ns only, no mount
+# ns), so this path resolves to the same inode on both sides.
+HITDIR = os.environ.get("COGBOX_PROBE_HITDIR", "/run/cbxprobe")
+READY = "ready"  # marker the server touches once every listener is bound
+
+# Off-box delivery markers (server side). The drop markers MUST stay absent.
+M_ENF = "enf"  # tcp reached the enforcer carve-out
+M_DNS = "dns_resolver"  # udp/53 reached the resolver (the one allowed datagram)
+M_UDP_OTHER = "udp_other"  # udp/9999 leaked off-box
+M_UDP53_BAD = "udp53_bad"  # udp/53-to-non-resolver leaked off-box
+M_RAW_DROP = "raw_drop"  # proto-132 leaked off-box
+M_V6_UDP = "v6_udp"  # ipv6 udp leaked off-box
 
 _lock = threading.Lock()
 shim_hits = []  # (ip, port) recovered from SO_ORIGINAL_DST per redirected conn
-enf_hits = []  # peer addrs that reached the enforcer (carve-out, not redirected)
-udp_seen = set()  # (ip, port) datagrams actually delivered to a UDP listener
-raw_seen = []  # raw proto-132 packets (full bytes) delivered to the raw listener
+raw_ctl_seen = []  # loopback proto-132 control packets (main-netns raw listener)
+
+
+# --- marker helpers ----------------------------------------------------------
+def _touch(name):
+	try:
+		open(os.path.join(HITDIR, name), "w").close()
+	except OSError:
+		pass
+
+
+def _marker(name):
+	return os.path.exists(os.path.join(HITDIR, name))
+
+
+def _wait_marker(name, timeout=2.0, interval=0.05):
+	end = time.time() + timeout
+	while time.time() < end:
+		if _marker(name):
+			return True
+		time.sleep(interval)
+	return _marker(name)
 
 
 # --- listeners: bind synchronously (so setup errors surface), serve in threads -
@@ -77,6 +129,7 @@ def _serve_tcp(family, ip, port, sink):
 
 
 def _shim_sink(conn, peer):
+	# In-process (main netns): recover the pre-REDIRECT dst from conntrack.
 	raw = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
 	port = struct.unpack("!H", raw[2:4])[0]
 	ip = socket.inet_ntoa(raw[4:8])
@@ -84,12 +137,7 @@ def _shim_sink(conn, peer):
 		shim_hits.append((ip, port))
 
 
-def _enf_sink(conn, peer):
-	with _lock:
-		enf_hits.append(peer)
-
-
-def _serve_udp(family, ip, port):
+def _serve_udp(family, ip, port, marker):
 	s = socket.socket(family, socket.SOCK_DGRAM)
 	s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 	s.bind((ip, port))
@@ -100,13 +148,12 @@ def _serve_udp(family, ip, port):
 				s.recvfrom(2048)
 			except OSError:
 				return
-			with _lock:
-				udp_seen.add((ip, port))
+			_touch(marker)
 
 	threading.Thread(target=loop, daemon=True).start()
 
 
-def _serve_raw():
+def _serve_raw(sink):
 	s = socket.socket(socket.AF_INET, socket.SOCK_RAW, SCTP_PROTO)
 
 	def loop():
@@ -115,24 +162,12 @@ def _serve_raw():
 				data, _ = s.recvfrom(65535)
 			except OSError:
 				return
-			with _lock:
-				raw_seen.append(bytes(data))
+			sink(bytes(data))
 
 	threading.Thread(target=loop, daemon=True).start()
 
 
 # --- helpers -----------------------------------------------------------------
-def _wait_until(pred, timeout=2.0, interval=0.05):
-	end = time.time() + timeout
-	while time.time() < end:
-		with _lock:
-			if pred():
-				return True
-		time.sleep(interval)
-	with _lock:
-		return pred()
-
-
 def _tcp_connect(host, port, timeout=2.0):
 	conn = socket.create_connection((host, port), timeout=timeout)
 	conn.close()
@@ -161,59 +196,70 @@ def _raw_send(ip, payload):
 # --- probes: FORCED-THROUGH (redirected to the shim w/ correct orig dst) ------
 def probe_forced_tcp_literal():
 	_tcp_connect(WEB, 443)
-	return _wait_until(lambda: (WEB, 443) in shim_hits)
+	return _wait_until_shim(WEB, 443)
 
 
 def probe_forced_tcp_name():
 	_tcp_connect(NAMED, 80)  # resolves via /etc/hosts -> NAMED_IP
-	return _wait_until(lambda: (NAMED_IP, 80) in shim_hits)
+	return _wait_until_shim(NAMED_IP, 80)
 
 
 def probe_forced_tcp_port53():
 	# tcp/53 must be REDIRECTED (enforced), never confused with the udp/53 DNS
 	# carve-out and sent direct.
 	_tcp_connect(TCP53, 53)
-	return _wait_until(lambda: (TCP53, 53) in shim_hits)
+	return _wait_until_shim(TCP53, 53)
+
+
+def _wait_until_shim(ip, port, timeout=2.0, interval=0.05):
+	end = time.time() + timeout
+	while time.time() < end:
+		with _lock:
+			if (ip, port) in shim_hits:
+				return True
+		time.sleep(interval)
+	with _lock:
+		return (ip, port) in shim_hits
 
 
 # --- probes: ENFORCER CARVE-OUT ----------------------------------------------
 def probe_enforcer_carveout():
-	# TCP to the enforcer ClusterIP:base RETURNs (anti-loop) and reaches the
-	# enforcer directly -- it must NOT be redirected back onto the shim.
-	before = len(enf_hits)
+	# TCP to the enforcer ClusterIP:base RETURNs (anti-loop), is NOT redirected,
+	# and reaches the off-box enforcer listener directly.
 	_tcp_connect(ENFORCER, ENF_PORT)
-	reached = _wait_until(lambda: len(enf_hits) > before)
-	not_redirected = (ENFORCER, ENF_PORT) not in shim_hits
+	reached = _wait_marker(M_ENF)
+	with _lock:
+		not_redirected = (ENFORCER, ENF_PORT) not in shim_hits
 	return reached and not_redirected
 
 
 def probe_enforcer_other_port_redirected():
 	# Same ClusterIP, a DIFFERENT port: not the carve-out, so it IS redirected.
 	_tcp_connect(ENFORCER, 9999)
-	return _wait_until(lambda: (ENFORCER, 9999) in shim_hits)
+	return _wait_until_shim(ENFORCER, 9999)
 
 
 # --- probes: ALLOWED ---------------------------------------------------------
 def probe_udp_resolver_allowed():
 	_udp_send(socket.AF_INET, RESOLVER, 53)
-	return _wait_until(lambda: (RESOLVER, 53) in udp_seen)
+	return _wait_marker(M_DNS)
 
 
-# --- probes: DROPPED / now CLOSED (must fail to be delivered) -----------------
+# --- probes: DROPPED / now CLOSED (must fail to be delivered off-box) ---------
 def probe_udp_other_dropped():
 	_udp_send(socket.AF_INET, UDP_OTHER, 9999)
-	return not _wait_until(lambda: (UDP_OTHER, 9999) in udp_seen, timeout=1.0)
+	return not _wait_marker(M_UDP_OTHER, timeout=1.0)
 
 
 def probe_udp53_nonresolver_dropped():
 	# The DNS-tunnel/exfil leak: udp/53 to ANY non-resolver IP must now drop.
 	_udp_send(socket.AF_INET, UDP53_BAD, 53)
-	return not _wait_until(lambda: (UDP53_BAD, 53) in udp_seen, timeout=1.0)
+	return not _wait_marker(M_UDP53_BAD, timeout=1.0)
 
 
 def probe_icmp_dropped():
-	# ICMP echo to a locally-assigned IP would normally get a kernel reply; the
-	# floor drops it at OUTPUT, so ping fails (no unprivileged-ping egress).
+	# ICMP echo to an off-box IP would normally get a reply from the peer netns;
+	# the floor drops it at OUTPUT (oif=veth0, l4proto != tcp), so ping fails.
 	r = subprocess.run(
 		["ping", "-c", "1", "-W", "1", ICMP_DST],
 		stdout=subprocess.DEVNULL,
@@ -224,18 +270,30 @@ def probe_icmp_dropped():
 
 def probe_raw_l4_dropped():
 	# Positive control: proto-132 to loopback (oif lo -> floor accept) MUST be
-	# delivered, proving the raw send/recv path works in this env. The real probe:
-	# proto-132 to a non-loopback dst MUST be dropped (no SCTP/DCCP/GRE egress).
+	# delivered to the main-netns raw listener, proving the raw send/recv path works
+	# in this env. The real probe: proto-132 to an OFF-box dst MUST be dropped at
+	# OUTPUT, so the peer's raw listener never marks it (no SCTP/DCCP/GRE egress).
 	_raw_send("127.0.0.1", MARK_CTL + b"\x00" * 8)
-	ctl_ok = _wait_until(lambda: any(MARK_CTL in d for d in raw_seen), timeout=2.0)
+	ctl_ok = _wait_until_ctl(timeout=2.0)
 	_raw_send(RAW_DST, MARK_DROP + b"\x00" * 8)
-	dropped = not _wait_until(lambda: any(MARK_DROP in d for d in raw_seen), timeout=1.5)
+	dropped = not _wait_marker(M_RAW_DROP, timeout=1.5)
 	return ctl_ok and dropped
 
 
+def _wait_until_ctl(timeout=2.0, interval=0.05):
+	end = time.time() + timeout
+	while time.time() < end:
+		with _lock:
+			if any(MARK_CTL in d for d in raw_ctl_seen):
+				return True
+		time.sleep(interval)
+	with _lock:
+		return any(MARK_CTL in d for d in raw_ctl_seen)
+
+
 def probe_ipv6_tcp_dropped():
-	# A bound v6 listener means an unfloored connect WOULD succeed; with the floor
-	# the v6 OUTPUT is rejected, so connect raises.
+	# A bound off-box v6 listener means an unfloored connect WOULD succeed; with the
+	# floor the v6 OUTPUT is rejected, so connect raises.
 	try:
 		s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
 		s.settimeout(2.0)
@@ -248,7 +306,7 @@ def probe_ipv6_tcp_dropped():
 
 def probe_ipv6_udp_dropped():
 	_udp_send(socket.AF_INET6, V6_DST, 53)
-	return not _wait_until(lambda: (V6_DST, 53) in udp_seen, timeout=1.0)
+	return not _wait_marker(M_V6_UDP, timeout=1.0)
 
 
 CHECKS = [
@@ -267,17 +325,49 @@ CHECKS = [
 ]
 
 
-def main():
-	# Bind every listener first so a leak's packet would have somewhere to land.
-	_serve_tcp(socket.AF_INET, SHIM, SHIM_PORT, _shim_sink)
-	_serve_tcp(socket.AF_INET, ENFORCER, ENF_PORT, _enf_sink)
-	_serve_tcp(socket.AF_INET6, V6_DST, 80, _enf_sink)
-	_serve_udp(socket.AF_INET, RESOLVER, 53)
-	_serve_udp(socket.AF_INET, UDP_OTHER, 9999)
-	_serve_udp(socket.AF_INET, UDP53_BAD, 53)
-	_serve_udp(socket.AF_INET6, V6_DST, 53)
-	_serve_raw()
+def serve():
+	"""Peer-netns listener server: bind the off-box dst listeners, mark deliveries.
+
+	Runs under `nsenter --net=<peer>` so its sockets land in the peer netns while the
+	marker dir stays shared with the client. Binds and then touches READY; the client
+	waits for that before probing. Never exits on its own (the driver kills it)."""
+	os.makedirs(HITDIR, exist_ok=True)
+
+	def _raw_sink(data):
+		if MARK_DROP in data:
+			_touch(M_RAW_DROP)
+
+	# TCP: enforcer carve-out target + a v6 target (so an unfloored v6 connect lands).
+	_serve_tcp(socket.AF_INET, ENFORCER, ENF_PORT, lambda c, p: _touch(M_ENF))
+	_serve_tcp(socket.AF_INET6, V6_DST, 80, lambda c, p: None)
+	# UDP: the resolver (allowed) + every udp drop target (positive controls).
+	_serve_udp(socket.AF_INET, RESOLVER, 53, M_DNS)
+	_serve_udp(socket.AF_INET, UDP_OTHER, 9999, M_UDP_OTHER)
+	_serve_udp(socket.AF_INET, UDP53_BAD, 53, M_UDP53_BAD)
+	_serve_udp(socket.AF_INET6, V6_DST, 53, M_V6_UDP)
+	# Raw proto-132 drop target.
+	_serve_raw(_raw_sink)
 	time.sleep(0.3)
+	_touch(READY)
+	while True:
+		time.sleep(3600)
+
+
+def main():
+	# CLIENT (main netns). Bind the local REDIRECT target (shim) + the loopback raw
+	# control listener, then wait for the peer server's listeners to come up.
+	os.makedirs(HITDIR, exist_ok=True)
+	_serve_tcp(socket.AF_INET, SHIM, SHIM_PORT, _shim_sink)
+
+	def _ctl_sink(data):
+		with _lock:
+			raw_ctl_seen.append(data)
+
+	_serve_raw(_ctl_sink)
+	if not _wait_marker(READY, timeout=15.0):
+		print("FAIL  peer listener server never signalled READY")
+		print("LEAK-DETECTED")
+		sys.exit(1)
 
 	ok = True
 	for name, fn in CHECKS:
@@ -294,4 +384,7 @@ def main():
 
 
 if __name__ == "__main__":
-	main()
+	if len(sys.argv) > 1 and sys.argv[1] == "--serve":
+		serve()
+	else:
+		main()

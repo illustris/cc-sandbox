@@ -17,16 +17,20 @@
 			memorySize = 2048;
 		};
 
-		# `dummy` lets us pin every probe destination IP locally so the test is
-		# fully hermetic (no real egress); the divert/floor OUTPUT hooks still
-		# apply to locally-destined packets, which is exactly what we exercise.
-		boot.kernelModules = [ "dummy" ];
+		# `veth` connects the main netns to a peer netns holding every probe
+		# destination OFF-box, so each probe leaves with oif=veth0 (not lo) and the
+		# divert REDIRECT / floor policy-drop actually fire -- on-box (lo) dsts are
+		# special-cased by both and would bypass the rules under test. Still fully
+		# hermetic: no traffic leaves the guest.
+		boot.kernelModules = [ "veth" ];
 
 		# Keep nothing else on udp/53 so the probe's stub-resolver listeners bind
 		# the test ClusterIPs cleanly.
 		services.resolved.enable = false;
 
-		environment.systemPackages = with pkgs; [ nftables iproute2 iputils python3 ];
+		# iproute2 = veth/netns/routes; util-linux = `nsenter --net=` (enter the
+		# peer netns WITHOUT a mount ns, so the marker dir stays shared).
+		environment.systemPackages = with pkgs; [ nftables iproute2 util-linux iputils python3 ];
 
 		# The probe connects to a NAME to prove name-based TCP is redirected too;
 		# resolve it locally so the test needs no real DNS.
