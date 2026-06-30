@@ -1809,6 +1809,13 @@
 			cogbox-vm = pkgs.testers.runNixOSTest (import ./tests/cogbox.nix {
 				inherit self pkgs system;
 			});
+			# Standing bypass-test suite for the container-mode nft egress floor
+			# (TODO): loads the real cogbox-nft-divert.sh and probes every
+			# egress path to PROVE the DNS-tunnel / ICMP / non-tcp-udp-L4 leaks are
+			# closed. Needs nested KVM -- runs in CI / on a KVM host, not the dev box.
+			nft-floor-bypass = pkgs.testers.runNixOSTest (import ./tests/nft-floor-bypass.nix {
+				inherit self pkgs;
+			});
 		});
 
 		nixosConfigurations = lib.listToAttrs (map (system: {
