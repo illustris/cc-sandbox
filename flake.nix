@@ -1010,6 +1010,12 @@
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
+							# cogbox-l7-trust.path/refresh restarts this unit when the enforcer
+							# CA lands; if that happens while the boot run is still in its bounded
+							# CA wait, the restart SIGTERMs it. For Type=oneshot systemd does NOT
+							# treat SIGTERM as success, so the superseded (idempotent) initial run
+							# would otherwise surface as a failed unit -- mark SIGTERM successful.
+							SuccessExitStatus = "SIGTERM";
 							ExecStart = pkgs.writeShellScript "cogbox-l7-trust" ''
 								set -e
 								mkdir -p /run/cogbox
