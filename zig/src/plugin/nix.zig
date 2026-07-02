@@ -96,7 +96,25 @@ pub const RunnerBuild = struct {
 /// are freed by argvDeinit. Optional substituter/key/netrc knobs are appended
 /// only when non-empty (so an unconfigured worker emits no extra options).
 fn runnerBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
-	const installable = try std.fmt.allocPrint(allocator, "path:{s}#nixosConfigurations.cogbox-{s}.config.microvm.declaredRunner", .{ b.flake_source, b.arch });
+	return buildArgvFor(allocator, b, "config.microvm.declaredRunner");
+}
+
+/// The container backend's counterpart: build `config.system.build.cogboxBrain`
+/// with the SAME --override-input set the container boot uses (flake.nix
+/// brainResolveContainer), so the pre-built out-path is byte-identical to the one
+/// boot evaluates. Pre-copying that closure into the per-instance file:// cache
+/// (copyClosureTo) turns the container's egress-less boot rebuild into a local
+/// substitution. Same RunnerBuild fields; only the installable leaf differs.
+fn brainBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
+	return buildArgvFor(allocator, b, "config.system.build.cogboxBrain");
+}
+
+/// Shared `nix build` argv builder. `installable_attr` is the leaf attribute
+/// under `nixosConfigurations.cogbox-<arch>` (the VM runner vs the container
+/// brain). The interpolated installable/inputs land at argv indices 1/4/7, which
+/// argvDeinit frees; the literal flags are static.
+fn buildArgvFor(allocator: std.mem.Allocator, b: RunnerBuild, installable_attr: []const u8) !std.ArrayList([]const u8) {
+	const installable = try std.fmt.allocPrint(allocator, "path:{s}#nixosConfigurations.cogbox-{s}.{s}", .{ b.flake_source, b.arch, installable_attr });
 	errdefer allocator.free(installable);
 	const plugins_input = try std.fmt.allocPrint(allocator, "path:{s}", .{b.plugins_flake_dir});
 	errdefer allocator.free(plugins_input);
@@ -151,6 +169,26 @@ pub fn buildRunner(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.pr
 	var argv = try runnerBuildArgv(allocator, b);
 	defer argvDeinit(allocator, &argv);
 	return runNix(allocator, io, env, argv.items);
+}
+
+/// Build the container's per-instance cogbox-brain (the same out-path boot
+/// evaluates). Realizes cfg.packages' closure via the passed substituters so a
+/// later copyClosureTo can seed the offline plugin-cache. Container backend only.
+pub fn buildBrain(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, b: RunnerBuild) !RunOut {
+	var argv = try brainBuildArgv(allocator, b);
+	defer argvDeinit(allocator, &argv);
+	return runNix(allocator, io, env, argv.items);
+}
+
+/// `nix copy --to <dest> <store_path>`: copy a realized store path AND its
+/// runtime closure into the `dest` binary cache (a `file://<dir>` URI). Used to
+/// seed the per-instance plugin-cache with the pre-built cogbox-brain closure so
+/// the container's egress-less boot substitutes it (require-sigs false on the
+/// read side) instead of rebuilding. Unlike flakeArchiveTo (which archives a
+/// flake + its source inputs), this copies a BUILT output, unreachable from the
+/// composition flake.
+pub fn copyClosureTo(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, dest: []const u8, store_path: []const u8) !RunOut {
+	return runNix(allocator, io, env, &.{ "copy", "--to", dest, store_path });
 }
 
 /// Outcome of the cogboxPlugins.<attr> contract check. `missing` is the
@@ -474,5 +512,56 @@ test "runnerBuildArgv: substituters only, no keys/netrc" {
 
 	try expectArgv(&.{
 		"--option", "extra-substituters", "file:///cache", "--option", "require-sigs", "false",
+	}, argv.items[10..]);
+}
+
+// The container brain build must be byte-identical to the runner build EXCEPT
+// the installable leaf (config.system.build.cogboxBrain vs the microvm runner):
+// the pre-built out-path only substitutes at boot if the installable +
+// --override-input set exactly match flake.nix's brainResolveContainer. Lock both.
+test "brainBuildArgv: cogboxBrain installable + boot-path override-inputs" {
+	var argv = try brainBuildArgv(t.allocator, .{
+		.flake_source = "/nix/store/abc-cogbox-source",
+		.nixpkgs_source = "/nix/store/def-nixpkgs",
+		.plugins_flake_dir = "/var/lib/cogbox/inst/plugins-flake",
+		.arch = "x86_64",
+		.substituters = "",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try expectArgv(&.{
+		"build",
+		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64.config.system.build.cogboxBrain",
+		"--override-input",
+		"userExtensions",
+		"path:/var/lib/cogbox/inst/plugins-flake",
+		"--override-input",
+		"userExtensions/user/nixpkgs",
+		"path:/nix/store/def-nixpkgs",
+		"--no-link",
+		"--print-out-paths",
+	}, argv.items);
+}
+
+// The brain build takes the same substituter/key/netrc knobs as the runner (the
+// container seeds file://<cache> so the plugin-tool closure substitutes rather
+// than builds from source at add time).
+test "brainBuildArgv: aarch64 config name + substituter knobs appended" {
+	var argv = try brainBuildArgv(t.allocator, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.plugins_flake_dir = "/pf",
+		.arch = "aarch64",
+		.substituters = "file:///cache https://cache.example.com",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try t.expectEqualStrings("path:/src#nixosConfigurations.cogbox-aarch64.config.system.build.cogboxBrain", argv.items[1]);
+	try expectArgv(&.{
+		"--option", "extra-substituters", "file:///cache https://cache.example.com", "--option", "require-sigs", "false",
 	}, argv.items[10..]);
 }

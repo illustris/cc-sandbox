@@ -997,6 +997,13 @@ fn finalizeComposition(ctx: *const Ctx) void {
 	// best-effort throughout -- a failure here only means boot rebuilds, never a
 	// failed plugin verb.
 	prebuildAndPushRunner(ctx);
+
+	// Container backend counterpart: pre-build cogbox-brain (which now carries the
+	// plugins' cogbox.packages as $out/bin) and copy its closure into the LOCAL
+	// per-instance plugin-cache, so the agent's egress-less boot substitutes it
+	// offline instead of failing to build the plugin tools. Gated on
+	// COGBOX_BRAIN_PUSH_LOCAL (the container backend); a no-op on the VM.
+	prebuildBrainLocal(ctx);
 }
 
 /// The env-driven runner pre-build + push (Stage 1 of the offline-launch
@@ -1086,6 +1093,93 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 	// matches and the record self-heals across image bumps (a stale rev simply
 	// fails the launcher's `[ "$FP_REV" = "@flakeSource@" ]` guard and re-evals).
 	if (pushed) writeRunnerRecord(ctx, flake_source, first);
+}
+
+/// The container backend's local brain pre-build (the offline-boot counterpart
+/// of prebuildAndPushRunner). Runs only when cogworx's container backend requests
+/// it: COGBOX_BRAIN_PUSH_LOCAL == "1". Unlike the VM path there is NO remote push
+/// and NO runner.path record -- the container's cogbox-brain-materialize always
+/// evaluates then substitutes. It builds the SAME cogbox-brain out-path the
+/// container boot evaluates (identical flake ref + --override-input set; the brain
+/// now carries the plugins' cogbox.packages as $out/bin), then `nix copy`s that
+/// out-path's closure into the LOCAL per-instance plugin-cache (file://cache_dir,
+/// on the state PVC). The agent's boot has no egress, so without this seed the
+/// brain rebuild cannot realise the plugin tools; with it, boot substitutes the
+/// whole closure offline. Every failure is logged and swallowed (boot then falls
+/// back to the baked base brain -- skills survive, tools are simply absent, i.e.
+/// no worse than before this fix). Determinism mirrors the runner path: nothing
+/// instance-specific is in the brain closure, so the pre-built out-path is
+/// byte-identical to the one boot's brainResolveContainer evaluates.
+fn prebuildBrainLocal(ctx: *const Ctx) void {
+	const allocator = ctx.allocator;
+	const env = ctx.parent_env;
+
+	const local = env.get("COGBOX_BRAIN_PUSH_LOCAL") orelse return;
+	if (!std.mem.eql(u8, local, "1")) return;
+
+	// The cogbox flake + nixpkgs store paths, baked by mkCogbox (--set-default)
+	// into the same cogbox image the container boot evaluates against.
+	const flake_source = env.get("COGBOX_FLAKE_SOURCE") orelse {
+		warn(ctx, "brain prebuild: COGBOX_FLAKE_SOURCE unset; skipping (boot rebuilds)", .{}) catch {};
+		return;
+	};
+	const nixpkgs_source = env.get("COGBOX_NIXPKGS_SOURCE") orelse {
+		warn(ctx, "brain prebuild: COGBOX_NIXPKGS_SOURCE unset; skipping (boot rebuilds)", .{}) catch {};
+		return;
+	};
+
+	// cogbox-x86_64 / cogbox-aarch64: the config-name suffix (compile-time arch,
+	// matching flake.nix's archSuffix), same derivation as the runner path.
+	const arch = @tagName(builtin_mod.cpu.arch);
+
+	// Combine the per-instance file:// cache with any remote substituters so the
+	// brain's transitive nixpkgs deps (e.g. the plugin tools' closure) substitute
+	// rather than build from source at add-time.
+	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
+	const substituters = blk: {
+		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
+		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return;
+	};
+	defer allocator.free(substituters);
+
+	const out = nix.buildBrain(allocator, ctx.io, env, .{
+		.flake_source = flake_source,
+		.nixpkgs_source = nixpkgs_source,
+		.plugins_flake_dir = ctx.plugins_flake_dir,
+		.arch = arch,
+		.substituters = substituters,
+		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
+		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
+	}) catch {
+		warn(ctx, "brain prebuild: build failed to launch (boot rebuilds)", .{}) catch {};
+		return;
+	};
+	var o = out;
+	defer o.deinit(allocator);
+	if (!o.ok) {
+		warn(ctx, "brain prebuild: build failed (boot rebuilds): {s}", .{nix.stderrTail(o.stderr)}) catch {};
+		return;
+	}
+	// --print-out-paths emits the store path(s), one per line; take the first.
+	const out_path = std.mem.trim(u8, o.stdout, " \t\r\n");
+	const first = if (std.mem.indexOfScalar(u8, out_path, '\n')) |i| out_path[0..i] else out_path;
+	if (first.len == 0) {
+		warn(ctx, "brain prebuild: build produced no out-path (boot rebuilds)", .{}) catch {};
+		return;
+	}
+
+	// Seed the per-instance plugin-cache with the realized closure so boot
+	// substitutes it (require-sigs false on the read side -- flake.nix
+	// brainResolveContainer). Local file:// dest, no signing/push config needed.
+	const cache_url = std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
+	defer allocator.free(cache_url);
+	if (nix.copyClosureTo(allocator, ctx.io, env, cache_url, first)) |cp| {
+		var c = cp;
+		defer c.deinit(allocator);
+		if (!c.ok) warn(ctx, "brain prebuild: copy to plugin-cache failed (boot rebuilds): {s}", .{nix.stderrTail(c.stderr)}) catch {};
+	} else |_| {
+		warn(ctx, "brain prebuild: copy to plugin-cache failed to launch (boot rebuilds)", .{}) catch {};
+	}
 }
 
 /// Best-effort pre-write of cogbox-launch.sh's runner.path fast-path record.

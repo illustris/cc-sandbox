@@ -22,7 +22,7 @@ A plugin is a flake that exposes two outputs:
 ### The organizing principle — hot-reload decides where a thing lives
 
 - **Host-side, hot-reloadable policy** (`networkRules`/`l7Rules`/`inject`) lives in the `cogboxPlugins.<attr>` flake output. It is read at `add` by a cheap `nix eval`, stored in `config.json`, and applied to the running firewall/proxy **without a rebuild**. It is never rendered inside the guest.
-- **Build-time guest content** (the kit, and any packages/services) lives in the **NixOS module** as `cogbox.*`. A change there already requires a rebuild/restart, so it belongs in the build, where it is evaluated with cogbox's `pkgs` and folded into the guest by the base.
+- **Build-time guest content** (the kit, and any packages/services) lives in the **NixOS module** as `cogbox.*`. A change there already requires a rebuild/restart, so it belongs in the build, where it is evaluated with cogbox's `pkgs` and folded into the guest by the base. Ship a plugin's CLI tools via **`cogbox.packages`** (not raw `environment.systemPackages`) so they land on PATH on *both* the VM and the container backends — see [The kit](#the-kit-cogbox).
 
 A complete mid-complexity plugin:
 
@@ -38,8 +38,8 @@ A complete mid-complexity plugin:
         contents = ./contents;                  # scan contents/{skills,agents,commands,rules}
         env.ES_URL = "http://es-1.example.internal:9200";
         settings.claude-code.model = "claude-opus-4-8";
+        packages = [ /* es-*, druid-* helper bins */ ];   # tools on the sandbox PATH (both backends)
       };
-      environment.systemPackages = [ /* es-*, druid-* helper bins */ ];
     };
 
     # Thin registration: which module is the plugin, plus host-side policy.
@@ -78,6 +78,7 @@ The base declares one option tree; each plugin module fills in its slice, and th
 | `cogbox.mcp` | attrset name→`{command/args/env}` \| `{url/headers}` | Neutral MCP servers, materialized per harness. |
 | `cogbox.hooks` | attrset event→command | Lifecycle hooks. |
 | `cogbox.env` | attrset string→string | Plugin endpoints, merged into the harness launcher env (never a hard global `environment.variables`). |
+| `cogbox.packages` | list of packages | Tools placed on the sandbox PATH. **Use this, not `environment.systemPackages`, for a plugin's CLIs.** The base folds them into `environment.systemPackages` on the VM (baked into the runner) **and** into the brain's `$out/bin` prepended to PATH on the container — so tools reach *both* backends. `environment.systemPackages` alone reaches only the VM (the container image is built plugin-less), so a plugin that ships tools that way has them silently missing on the container even though its skills materialize. |
 | `cogbox.settings.<harness>` | `{ model; reasoningEffort }` | Per-harness settings. **Allowlist: `model`, `reasoningEffort` only** (enforced by the option type) — never permissions/auth/providers. Keyed `claude-code` / `opencode` / `codex`. |
 
 **Discovery.** A skill is a directory containing `SKILL.md`; an agent/command/rule is a `<name>.md` file. The skill's `name:` frontmatter must equal its directory name (opencode requirement). Non-conforming entries (`README.md`, a dir without `SKILL.md`) are skipped.

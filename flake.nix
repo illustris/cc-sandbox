@@ -220,6 +220,10 @@
 					# if the brain oneshot has not run yet.
 					programs.bash.loginShellInit = lib.mkForce ''
 						cd /root/work 2>/dev/null || cd /root
+						# Prepend the plugin tools (cogbox.packages) the brain materialized.
+						# Redundant on the VM (they are in systemPackages already) but keeps
+						# parity with the container, where this is the only PATH surface.
+						[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"
 					'';
 					microvm = {
 						hypervisor = "qemu";
@@ -286,6 +290,12 @@
 						# instances/) before the brain oneshot has run.
 						programs.bash.loginShellInit = lib.mkForce ''
 							cd /root/work 2>/dev/null || cd /root
+							# Prepend the plugin tools (cogbox.packages) the brain
+							# materialized into $out/bin. This is the container's ONLY PATH
+							# surface for plugin tools (the base image is plugin-less), so it
+							# is what makes `example-plugin-cli` et al. resolve in the
+							# interactive terminal (tmux spawns a login shell).
+							[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"
 						'';
 						nix = {
 							nixPath = [ "nixpkgs=${pkgs.path}" ];
@@ -348,6 +358,15 @@
 					# Plugin-scoped env, re-emitted into the harness launchers only
 					# (never a hard global environment.variables set).
 					env      = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = {}; description = "Plugin-scoped env, merged into the harness launcher env."; };
+					# Plugin-contributed CLI tools that must be on the sandbox PATH.
+					# The base folds these into BOTH environment.systemPackages (so the
+					# VM bakes them into /run/current-system/sw/bin via the per-instance
+					# runner rebuild) AND a $out/bin buildEnv inside cogbox-brain, which
+					# the container backend prepends to the guest PATH -- its base image
+					# is plugin-less, so systemPackages there never carry a plugin's
+					# tools. Use this instead of environment.systemPackages so a plugin's
+					# tools reach BOTH backends. (listOf package: plugins concatenate.)
+					packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = []; description = "Plugin-contributed packages placed on the sandbox PATH (systemPackages on the VM; brain/bin on the container)."; };
 					# Per-harness settings -- NOT harness-agnostic (model strings
 					# differ). ALLOWLIST per harness: model, reasoningEffort. Never
 					# permissions/auth/providers. Keyed by harness name.
@@ -445,9 +464,15 @@
 						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
 					# Land non-login `cogbox ssh -- c/oc/cx` in the standardized
 					# workdir too (loginShellInit covers the interactive login path).
+					# Prepend the brain's plugin-tool bin to PATH so the harness AND its
+					# tool subprocesses (e.g. claude-code's Bash) resolve cogbox.packages
+					# tools -- this is what lets the AGENT invoke them, not just a human at
+					# the terminal. Harness itself is found via the absolute getExe, so
+					# PATH order never affects launching it. Bash expands $PATH at runtime
+					# (literal in the '' string); redundant-but-harmless on the VM.
 					in "#!${pkgs.runtimeShell}\n"
 						+ "cd /root/work 2>/dev/null || true\n"
-						+ ''exec env ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
+						+ ''exec env PATH="/root/work/.cogbox/brain/bin:$PATH" ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
 						+ "\n"
 				);
 
@@ -605,6 +630,15 @@
 				# --- the materialized brain derivation (RO store leaves) ---
 				linkInto = dir: ext: attrs: lib.concatStringsSep "\n"
 					(lib.mapAttrsToList (n: p: ''ln -s ${p} "${dir}/${n}${ext}"'') attrs);
+				# Plugin-contributed tools, merged into one bin/ tree. Fixed name so the
+				# out-path is a pure function of cfg.packages -- the container prebuild
+				# and boot rebuild must produce a byte-identical cogbox-brain out-path
+				# (the boot substitutes it offline from the per-instance plugin-cache).
+				# ignoreCollisions: a plugin listing tools whose closures share a bin
+				# name must not FAIL the brain build (which would drop ALL its tools);
+				# first-wins matches how environment.systemPackages already tolerates the
+				# same set on the VM. Only /bin is linked (tools, not docs/man/lib).
+				pluginBin = pkgs.buildEnv { name = "cogbox-plugin-bin"; paths = cfg.packages; pathsToLink = [ "/bin" ]; ignoreCollisions = true; };
 				cogbox-brain = pkgs.runCommandLocal "cogbox-brain" {} (''
 					set -e
 					mkdir -p $out/rules
@@ -629,6 +663,13 @@
 					${linkInto "$out/agents/skills" "" skills}
 					ln -s ${indexSkill} $out/agents/skills/cogbox-plugins
 					${lib.optionalString (codexConfigAttrs != {}) "mkdir -p $out/codex && cp ${codexConfig} $out/codex/config.toml"}
+				'' + lib.optionalString (cfg.packages != []) ''
+					# Plugin tools on PATH: the container's brain-materialize prepends
+					# $out/bin (via /root/work/.cogbox/brain/bin) to the guest PATH. On
+					# the VM these are already baked into systemPackages, so this bin/ is
+					# harmless-redundant there. Guarded so a plugin-less brain (the baked
+					# base image's) keeps an out-path with no bin dir.
+					ln -s ${pluginBin}/bin $out/bin
 				'');
 
 				# Materialize the brain into ~/work: create the ~/work symlink into
@@ -981,7 +1022,12 @@
 				# sandbox. Lands `cogbox`/`cbx` in /run/current-system/sw/bin (on the
 				# agent-image PATH). The VM never carries the CLI in-guest (it is the
 				# host-side launcher there), so gate it to the container.
-				++ lib.optional isContainer self.packages.${system}.cogbox-container;
+				++ lib.optional isContainer self.packages.${system}.cogbox-container
+				# Plugin-contributed tools (cogbox.packages). On the VM the runner
+				# rebuild bakes these into the guest closure here; on the container
+				# they reach PATH via cogbox-brain's $out/bin instead (the baked base
+				# image is plugin-less), so this line is an inert no-op there.
+				++ cfg.packages;
 
 				# Expose the materialized plugin "brain" as a build product so the
 				# container can rebuild it per-instance at boot. config.cogbox (hence
@@ -1940,6 +1986,10 @@
 							contents = ./tests/fixtures/brain-plugin/contents;
 							mcp.demo-mcp = { command = "demo-mcp-server"; args = [ "--stdio" ]; env = { DEMO_MODE = "ro"; }; };
 							env = { DEMO_URL = "http://demo.example.com"; };
+							# Plugin tools -> cogbox-brain's $out/bin (prepended to the
+							# container PATH). hello is the smallest real package; the brain
+							# build below asserts $out/bin/hello resolves.
+							packages = [ pkgs.hello ];
 							settings.claude-code = { model = "claude-opus-4-8"; };
 							settings.opencode = { model = "anthropic/claude-opus-4-8"; };
 							hooks.SessionStart = "true";
