@@ -1490,7 +1490,37 @@
 						|| echo "cogbox-agent-init: WARNING: /sys/fs/cgroup stayed read-only (remount,rw and a fresh cgroup2 mount both failed); systemd will likely fail to boot" >&2
 				fi
 				[ -L /etc ] && ${pkgs.coreutils}/bin/rm -f /etc || true
-				exec ${containerToplevel}/init
+
+				# Boot the per-instance toplevel (the plugin's FULL NixOS module folded in)
+				# when a valid record exists, else the baked plugin-less base. The record +
+				# closure are seeded WITH egress at plugin-add (prebuildToplevelLocal); boot
+				# has none, so realise the recorded out-path OFFLINE from the per-instance
+				# file:// plugin-cache on the state PVC (the base is already in the image
+				# store, so only the plugin's delta is fetched). Any miss -- no record, rev
+				# mismatch (image bump), or an unrealisable path -- falls back to the baked
+				# base, so the sandbox always boots. Pre-systemd: /etc/nix/nix.conf does not
+				# exist yet, so pass nix options explicitly and RESTRICT substituters to the
+				# local cache (no network attempt on the egress-less boot); read the RAW PVC
+				# path (the /var/lib/cogbox symlink oneshot has not run yet).
+				top=${containerToplevel}
+				inst="''${COGBOX_INSTANCE:-default}"
+				icd="/var/lib/cogbox-state/config/cogbox/instances/$inst"
+				rec="$icd/toplevel.path"
+				if [ -f "$rec" ]; then
+					rev="$(${pkgs.coreutils}/bin/head -n1 "$rec")"
+					out="$(${pkgs.coreutils}/bin/head -n2 "$rec" | ${pkgs.coreutils}/bin/tail -n1)"
+					if [ "$rev" = "${self}" ] && [ -n "$out" ]; then
+						if ${pkgs.nix}/bin/nix-store --realise "$out" --option substituters "file://$icd/plugin-cache" --option require-sigs false --option build-users-group "" >/dev/null 2>&1 && [ -x "$out/init" ]; then
+							top="$out"
+							echo "cogbox-agent-init: booting per-instance toplevel $out" >&2
+						else
+							echo "cogbox-agent-init: per-instance toplevel not realisable offline; booting baked base" >&2
+						fi
+					else
+						echo "cogbox-agent-init: toplevel record stale/invalid (image bump?); booting baked base" >&2
+					fi
+				fi
+				exec "$top/init"
 			'';
 			# Space-separated enabled-harness names, baked into cogbox-launch.sh's
 			# `HARNESSES=(@harnesses@)` so the launcher's set can never drift from

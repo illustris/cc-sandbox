@@ -1004,6 +1004,12 @@ fn finalizeComposition(ctx: *const Ctx) void {
 	// offline instead of failing to build the plugin tools. Gated on
 	// COGBOX_BRAIN_PUSH_LOCAL (the container backend); a no-op on the VM.
 	prebuildBrainLocal(ctx);
+
+	// Container full-module: pre-build the per-instance toplevel (the plugin's WHOLE
+	// NixOS module folded in), seed its closure into the plugin-cache, and record the
+	// out-path so agentInit boots it directly instead of the baked plugin-less base.
+	// Gated on COGBOX_TOPLEVEL_PUSH_LOCAL; a no-op on the VM and when disabled.
+	prebuildToplevelLocal(ctx);
 }
 
 /// The env-driven runner pre-build + push (Stage 1 of the offline-launch
@@ -1189,6 +1195,98 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 	}
 }
 
+/// The container backend's per-instance FULL-TOPLEVEL pre-build. Runs when the container
+/// backend requests it: COGBOX_TOPLEVEL_PUSH_LOCAL == "1". It builds the SAME
+/// config.system.build.toplevel out-path agentInit realises and boots as PID1 -- the base
+/// container system with the plugin's WHOLE NixOS module folded in (environment.systemPackages,
+/// services, environment.etc, ...) -- copies its closure into the LOCAL per-instance
+/// plugin-cache (so the egress-less boot substitutes it offline), and records the out-path
+/// in `toplevel.path` (image-rev marker + out-path) so agentInit boots it instead of the
+/// baked plugin-less base. Unlike the brain (which the boot always re-evaluates), the
+/// toplevel MUST be recorded: agentInit reads the record before systemd to decide which
+/// toplevel's /init to exec. Best-effort throughout: any failure leaves no/stale record, so
+/// agentInit falls back to the baked base toplevel and the sandbox always boots (the plugin's
+/// tools still reach PATH via the cogbox.packages brain path; only the non-package module
+/// surface waits for a successful toplevel prebuild). Determinism mirrors the brain/runner:
+/// nothing instance-specific is in the toplevel closure, so the pre-built out-path is
+/// byte-identical to the one agentInit would derive. v1 copies the WHOLE closure (base
+/// included); a delta-vs-baked-base copy is a follow-up space/latency optimization.
+fn prebuildToplevelLocal(ctx: *const Ctx) void {
+	const allocator = ctx.allocator;
+	const env = ctx.parent_env;
+
+	const local = env.get("COGBOX_TOPLEVEL_PUSH_LOCAL") orelse return;
+	if (!std.mem.eql(u8, local, "1")) return;
+
+	const flake_source = env.get("COGBOX_FLAKE_SOURCE") orelse {
+		warn(ctx, "toplevel prebuild: COGBOX_FLAKE_SOURCE unset; skipping (boot uses baked base)", .{}) catch {};
+		return;
+	};
+	const nixpkgs_source = env.get("COGBOX_NIXPKGS_SOURCE") orelse {
+		warn(ctx, "toplevel prebuild: COGBOX_NIXPKGS_SOURCE unset; skipping (boot uses baked base)", .{}) catch {};
+		return;
+	};
+	const arch = @tagName(builtin_mod.cpu.arch);
+
+	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
+	const substituters = blk: {
+		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
+		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return;
+	};
+	defer allocator.free(substituters);
+
+	const out = nix.buildToplevel(allocator, ctx.io, env, .{
+		.flake_source = flake_source,
+		.nixpkgs_source = nixpkgs_source,
+		.plugins_flake_dir = ctx.plugins_flake_dir,
+		.arch = arch,
+		.substituters = substituters,
+		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
+		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
+	}) catch {
+		warn(ctx, "toplevel prebuild: build failed to launch (boot uses baked base)", .{}) catch {};
+		return;
+	};
+	var o = out;
+	defer o.deinit(allocator);
+	if (!o.ok) {
+		warn(ctx, "toplevel prebuild: build failed (boot uses baked base): {s}", .{nix.stderrTail(o.stderr)}) catch {};
+		return;
+	}
+	const out_path = std.mem.trim(u8, o.stdout, " \t\r\n");
+	const first = if (std.mem.indexOfScalar(u8, out_path, '\n')) |i| out_path[0..i] else out_path;
+	if (first.len == 0) {
+		warn(ctx, "toplevel prebuild: build produced no out-path (boot uses baked base)", .{}) catch {};
+		return;
+	}
+
+	// Seed the per-instance plugin-cache with the toplevel closure so the egress-less boot
+	// substitutes it (zstd; require-sigs false on the read side -- agentInit).
+	const cache_url = std.fmt.allocPrint(allocator, "file://{s}?compression=zstd", .{ctx.cache_dir}) catch return;
+	defer allocator.free(cache_url);
+	const copied = blk: {
+		if (nix.copyClosureTo(allocator, ctx.io, env, cache_url, first)) |cp| {
+			var c = cp;
+			defer c.deinit(allocator);
+			if (!c.ok) {
+				warn(ctx, "toplevel prebuild: copy to plugin-cache failed (boot uses baked base): {s}", .{nix.stderrTail(c.stderr)}) catch {};
+				break :blk false;
+			}
+			break :blk true;
+		} else |_| {
+			warn(ctx, "toplevel prebuild: copy to plugin-cache failed to launch (boot uses baked base)", .{}) catch {};
+			break :blk false;
+		}
+	};
+
+	// Record ONLY after a successful copy: agentInit realises the recorded out-path from
+	// the file:// cache offline, so a record pointing at an un-cached path would make it
+	// fall back to the baked base anyway -- recording it would be pointless. The rev marker
+	// (flake_source == the baked ${self} agentInit compares against) self-heals across image
+	// bumps: a stale rev fails agentInit's guard and boots the baked base until the next add.
+	if (copied) writeToplevelRecord(ctx, flake_source, first);
+}
+
 /// Best-effort pre-write of cogbox-launch.sh's runner.path fast-path record.
 /// The file lives at <instance_config_dir>/runner.path on the shared state PVC
 /// (the worker pod mounts it at the SAME XDG_CONFIG_HOME the sandbox launcher
@@ -1236,6 +1334,54 @@ fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const 
 	cwd.rename(tmp_path, cwd, path, ctx.io) catch {
 		cwd.deleteFile(ctx.io, tmp_path) catch {};
 		warn(ctx, "runner push: could not finalize runner record (boot will eval)", .{}) catch {};
+		return;
+	};
+}
+
+/// Best-effort atomic write of agentInit's `toplevel.path` fast-path record: two
+/// newline-terminated lines, line1 = the image-rev marker (flake_source == the baked
+/// ${self} agentInit compares against), line2 = the per-instance toplevel out-path. Lives at
+/// <instance_config_dir>/toplevel.path on the state PVC (the SAME dir the launcher/boot read,
+/// dirname of plugins_flake_dir), byte-for-byte the shape agentInit parses (head/tail). Any
+/// failure is warned and swallowed -- a missing/partial record just makes agentInit boot the
+/// baked base toplevel, never a failed verb. Mirrors writeRunnerRecord.
+fn writeToplevelRecord(ctx: *const Ctx, flake_source: []const u8, toplevel: []const u8) void {
+	const allocator = ctx.allocator;
+	const cwd = std.Io.Dir.cwd();
+
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse {
+		warn(ctx, "toplevel prebuild: plugins-flake dir has no parent; skipping record (boot uses baked base)", .{}) catch {};
+		return;
+	};
+	const path = std.fs.path.join(allocator, &.{ instance_config_dir, "toplevel.path" }) catch return;
+	defer allocator.free(path);
+	const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
+	defer allocator.free(tmp_path);
+
+	const contents = std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ flake_source, toplevel }) catch return;
+	defer allocator.free(contents);
+
+	{
+		const f = cwd.createFile(ctx.io, tmp_path, .{ .truncate = true }) catch {
+			warn(ctx, "toplevel prebuild: could not write toplevel record (boot uses baked base)", .{}) catch {};
+			return;
+		};
+		defer f.close(ctx.io);
+		var write_buf: [512]u8 = undefined;
+		var writer = f.writer(ctx.io, &write_buf);
+		writer.interface.writeAll(contents) catch {
+			warn(ctx, "toplevel prebuild: could not write toplevel record (boot uses baked base)", .{}) catch {};
+			return;
+		};
+		writer.flush() catch {
+			warn(ctx, "toplevel prebuild: could not write toplevel record (boot uses baked base)", .{}) catch {};
+			return;
+		};
+		f.sync(ctx.io) catch {};
+	}
+	cwd.rename(tmp_path, cwd, path, ctx.io) catch {
+		cwd.deleteFile(ctx.io, tmp_path) catch {};
+		warn(ctx, "toplevel prebuild: could not finalize toplevel record (boot uses baked base)", .{}) catch {};
 		return;
 	};
 }

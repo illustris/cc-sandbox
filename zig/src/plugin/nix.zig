@@ -109,6 +109,15 @@ fn brainBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([
 	return buildArgvFor(allocator, b, "config.system.build.cogboxBrain");
 }
 
+/// Full-NixOS-module counterpart: build the per-instance `config.system.build.toplevel`
+/// (base container system + the plugin's WHOLE module: environment.systemPackages,
+/// services, environment.etc, ...) with the SAME --override-input set the boot uses, so
+/// the pre-built out-path is byte-identical to the one agentInit realises + boots directly.
+/// Same RunnerBuild fields; only the installable leaf differs.
+fn toplevelBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
+	return buildArgvFor(allocator, b, "config.system.build.toplevel");
+}
+
 /// Shared `nix build` argv builder. `installable_attr` is the leaf attribute
 /// under `nixosConfigurations.cogbox-<arch>` (the VM runner vs the container
 /// brain). The interpolated installable/inputs land at argv indices 1/4/7, which
@@ -176,6 +185,15 @@ pub fn buildRunner(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.pr
 /// later copyClosureTo can seed the offline plugin-cache. Container backend only.
 pub fn buildBrain(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, b: RunnerBuild) !RunOut {
 	var argv = try brainBuildArgv(allocator, b);
+	defer argvDeinit(allocator, &argv);
+	return runNix(allocator, io, env, argv.items);
+}
+
+/// Build the container's per-instance FULL toplevel (the same out-path agentInit realises
+/// and boots as PID1). Realizes the plugin's whole-module closure via the passed
+/// substituters so a later copyClosureTo can seed the offline plugin-cache. Container only.
+pub fn buildToplevel(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, b: RunnerBuild) !RunOut {
+	var argv = try toplevelBuildArgv(allocator, b);
 	defer argvDeinit(allocator, &argv);
 	return runNix(allocator, io, env, argv.items);
 }
@@ -564,4 +582,34 @@ test "brainBuildArgv: aarch64 config name + substituter knobs appended" {
 	try expectArgv(&.{
 		"--option", "extra-substituters", "file:///cache https://cache.example.com", "--option", "require-sigs", "false",
 	}, argv.items[10..]);
+}
+
+// The full-toplevel build must be byte-identical to the brain/runner builds EXCEPT the
+// installable leaf (config.system.build.toplevel): the pre-built out-path only realises +
+// boots (agentInit) if the installable + --override-input set exactly match what boot would
+// derive. Lock both.
+test "toplevelBuildArgv: toplevel installable + boot-path override-inputs" {
+	var argv = try toplevelBuildArgv(t.allocator, .{
+		.flake_source = "/nix/store/abc-cogbox-source",
+		.nixpkgs_source = "/nix/store/def-nixpkgs",
+		.plugins_flake_dir = "/var/lib/cogbox/inst/plugins-flake",
+		.arch = "x86_64",
+		.substituters = "",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try expectArgv(&.{
+		"build",
+		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64.config.system.build.toplevel",
+		"--override-input",
+		"userExtensions",
+		"path:/var/lib/cogbox/inst/plugins-flake",
+		"--override-input",
+		"userExtensions/user/nixpkgs",
+		"path:/nix/store/def-nixpkgs",
+		"--no-link",
+		"--print-out-paths",
+	}, argv.items);
 }
