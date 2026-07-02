@@ -1171,7 +1171,14 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 	// Seed the per-instance plugin-cache with the realized closure so boot
 	// substitutes it (require-sigs false on the read side -- flake.nix
 	// brainResolveContainer). Local file:// dest, no signing/push config needed.
-	const cache_url = std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
+	// compression=zstd: nix's file:// default is xz, which is pathologically slow
+	// single-threaded -- on a 1-vCPU sandbox it compresses a multi-GB tool closure
+	// (e.g. a headless-browser bundle) at well under 1 MB/s and blows the plugin
+	// install deadline, failing the add. zstd is ~20-50x faster for a small ratio
+	// cost, and the boot reads the compression from each narinfo, so the read side
+	// needs no change. (A local single-node cache read once at boot; none/zstd both
+	// fine -- zstd keeps the PVC footprint down.)
+	const cache_url = std.fmt.allocPrint(allocator, "file://{s}?compression=zstd", .{ctx.cache_dir}) catch return;
 	defer allocator.free(cache_url);
 	if (nix.copyClosureTo(allocator, ctx.io, env, cache_url, first)) |cp| {
 		var c = cp;
