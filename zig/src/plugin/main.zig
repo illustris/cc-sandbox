@@ -861,9 +861,14 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 
 // --- shared helpers ------------------------------------------------------
 
-/// nix flake metadata + parse, with fatal errors on failure.
+/// nix flake metadata + parse, with fatal errors on failure. Backs cmdAdd + cmdResolve.
+/// `--refresh` (true) so an install/preview of a MUTABLE ref (e.g. a catalog plugin's
+/// `?ref=master`) ALWAYS re-resolves to the current tip: nix's tarball-ttl cache is
+/// shared across instances/ops, so a prior resolve elsewhere could otherwise pin a
+/// stale rev (and an install would silently ship an old plugin). The extra re-resolve
+/// is one ls-remote-class round-trip; correctness beats the cache here.
 fn resolveFlake(ctx: *const Ctx, url: []const u8) nix.Meta {
-	var out = nix.flakeMetadata(ctx.allocator, ctx.io, ctx.fetch_env, url, false) catch {
+	var out = nix.flakeMetadata(ctx.allocator, ctx.io, ctx.fetch_env, url, true) catch {
 		die(ctx.allocator, ctx.io, "failed to run nix (is it on PATH?)", .{}, 70);
 	};
 	defer out.deinit(ctx.allocator);

@@ -39,8 +39,10 @@ pub fn runNix(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process
 
 /// `refresh` adds `--refresh`, which bypasses nix's flake/tarball eval cache so
 /// a mutable ref (e.g. `github:owner/repo` with no rev) re-resolves to the
-/// current tip instead of a stale cached rev. `update` sets it; `add`/`resolve`
-/// don't (a first resolve has nothing cached to go stale).
+/// current tip instead of a stale cached rev. add/update/resolve ALL set it
+/// (resolveFlake / cmdUpdate) so an install always pins the latest rev -- the
+/// tarball-ttl cache is shared across instances, so even a first resolve on THIS
+/// instance can hit a rev another op cached and gone stale.
 pub fn flakeMetadata(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8, refresh: bool) !RunOut {
 	if (refresh) return runNix(allocator, io, env, &.{ "flake", "metadata", "--refresh", "--json", url });
 	return runNix(allocator, io, env, &.{ "flake", "metadata", "--json", url });
