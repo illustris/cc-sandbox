@@ -117,7 +117,16 @@ fn brainBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([
 /// target the `-container` config (boot.isContainer, the agentInit shim) -- the plain
 /// `cogbox-<arch>` config is a QEMU-guest toplevel that cannot boot as an unprivileged container.
 fn toplevelBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
-	return buildArgvFor(allocator, b, "-container", "config.system.build.toplevel");
+	var argv = try buildArgvFor(allocator, b, "-container", "config.system.build.toplevel");
+	errdefer argvDeinit(allocator, &argv);
+	// Serialize LOCAL builds. The container toplevel has many novel (per-plugin-set,
+	// not cache-hittable) NixOS derivations -- unit-*.service generators, system-path,
+	// /etc, perl envs -- and `max-jobs=auto` builds them in parallel, OOM-killing the
+	// ~4GB sandbox (E2E: -j1 progresses; parallel dies "unexpected EOF reading a line",
+	// a different drv each run). Substitutions of the base packages still run in
+	// parallel (max-jobs bounds local builds only), so this stays reasonably fast.
+	try argv.appendSlice(allocator, &.{ "--max-jobs", "1" });
+	return argv;
 }
 
 /// Shared `nix build` argv builder. `config_suffix` is appended after `cogbox-<arch>` to
@@ -614,5 +623,7 @@ test "toplevelBuildArgv: toplevel installable + boot-path override-inputs" {
 		"path:/nix/store/def-nixpkgs",
 		"--no-link",
 		"--print-out-paths",
+		"--max-jobs",
+		"1",
 	}, argv.items);
 }
