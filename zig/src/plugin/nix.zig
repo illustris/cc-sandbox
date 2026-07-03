@@ -123,9 +123,12 @@ fn toplevelBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayLis
 	// not cache-hittable) NixOS derivations -- unit-*.service generators, system-path,
 	// /etc, perl envs -- and `max-jobs=auto` builds them in parallel, OOM-killing the
 	// ~4GB sandbox (E2E: -j1 progresses; parallel dies "unexpected EOF reading a line",
-	// a different drv each run). Substitutions of the base packages still run in
-	// parallel (max-jobs bounds local builds only), so this stays reasonably fast.
-	try argv.appendSlice(allocator, &.{ "--max-jobs", "1" });
+	// a different drv each run). Also bound substitution concurrency: base-package NAR
+	// downloads/decompression run in parallel regardless of --max-jobs, and on the boot
+	// RECONCILE (which runs on the LIVE agent, competing with the running harness for the
+	// 4GB) that spike OOM-killed a concurrent local build once. 4 keeps downloads
+	// reasonably parallel without the memory blow-up.
+	try argv.appendSlice(allocator, &.{ "--max-jobs", "1", "--max-substitution-jobs", "4" });
 	return argv;
 }
 
@@ -625,5 +628,7 @@ test "toplevelBuildArgv: toplevel installable + boot-path override-inputs" {
 		"--print-out-paths",
 		"--max-jobs",
 		"1",
+		"--max-substitution-jobs",
+		"4",
 	}, argv.items);
 }

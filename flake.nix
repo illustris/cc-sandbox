@@ -1195,6 +1195,11 @@
 						after = [ "multi-user.target" ];
 						serviceConfig = {
 							Type = "oneshot";
+							# cogbox resolves the instance config from $XDG_CONFIG_HOME/cogbox/...
+							# (else $HOME/.config, which is /.config with HOME unset -> "no config
+							# found" -> the || true swallows it -> silent no-op). systemd does not
+							# forward PID1's env, so set it explicitly (same as brain-materialize).
+							Environment = [ "XDG_CONFIG_HOME=${stateRoot}/config" ];
 							PassEnvironment = [ "COGBOX_INSTANCE" ];
 						};
 						script = ''
