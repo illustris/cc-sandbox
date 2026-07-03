@@ -96,7 +96,7 @@ pub const RunnerBuild = struct {
 /// are freed by argvDeinit. Optional substituter/key/netrc knobs are appended
 /// only when non-empty (so an unconfigured worker emits no extra options).
 fn runnerBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
-	return buildArgvFor(allocator, b, "config.microvm.declaredRunner");
+	return buildArgvFor(allocator, b, "", "config.microvm.declaredRunner");
 }
 
 /// The container backend's counterpart: build `config.system.build.cogboxBrain`
@@ -106,24 +106,27 @@ fn runnerBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList(
 /// (copyClosureTo) turns the container's egress-less boot rebuild into a local
 /// substitution. Same RunnerBuild fields; only the installable leaf differs.
 fn brainBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
-	return buildArgvFor(allocator, b, "config.system.build.cogboxBrain");
+	return buildArgvFor(allocator, b, "", "config.system.build.cogboxBrain");
 }
 
-/// Full-NixOS-module counterpart: build the per-instance `config.system.build.toplevel`
-/// (base container system + the plugin's WHOLE module: environment.systemPackages,
-/// services, environment.etc, ...) with the SAME --override-input set the boot uses, so
-/// the pre-built out-path is byte-identical to the one agentInit realises + boots directly.
-/// Same RunnerBuild fields; only the installable leaf differs.
+/// Full-NixOS-module counterpart: build the per-instance CONTAINER `config.system.build.toplevel`
+/// (base container system + the plugin's WHOLE module: environment.systemPackages, services,
+/// environment.etc, ...) with the SAME --override-input set the boot uses, so the pre-built
+/// out-path is byte-identical to the one agentInit realises + boots directly. Unlike the runner
+/// (VM) and the target-INDEPENDENT brain, `system.build.toplevel` is target-DEPENDENT: it MUST
+/// target the `-container` config (boot.isContainer, the agentInit shim) -- the plain
+/// `cogbox-<arch>` config is a QEMU-guest toplevel that cannot boot as an unprivileged container.
 fn toplevelBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
-	return buildArgvFor(allocator, b, "config.system.build.toplevel");
+	return buildArgvFor(allocator, b, "-container", "config.system.build.toplevel");
 }
 
-/// Shared `nix build` argv builder. `installable_attr` is the leaf attribute
-/// under `nixosConfigurations.cogbox-<arch>` (the VM runner vs the container
-/// brain). The interpolated installable/inputs land at argv indices 1/4/7, which
-/// argvDeinit frees; the literal flags are static.
-fn buildArgvFor(allocator: std.mem.Allocator, b: RunnerBuild, installable_attr: []const u8) !std.ArrayList([]const u8) {
-	const installable = try std.fmt.allocPrint(allocator, "path:{s}#nixosConfigurations.cogbox-{s}.{s}", .{ b.flake_source, b.arch, installable_attr });
+/// Shared `nix build` argv builder. `config_suffix` is appended after `cogbox-<arch>` to
+/// select the nixosConfiguration (`""` = the VM config for the runner/brain; `"-container"`
+/// = the container config for the toplevel). `installable_attr` is the leaf attribute. The
+/// interpolated installable/inputs land at argv indices 1/4/7, which argvDeinit frees; the
+/// literal flags are static.
+fn buildArgvFor(allocator: std.mem.Allocator, b: RunnerBuild, config_suffix: []const u8, installable_attr: []const u8) !std.ArrayList([]const u8) {
+	const installable = try std.fmt.allocPrint(allocator, "path:{s}#nixosConfigurations.cogbox-{s}{s}.{s}", .{ b.flake_source, b.arch, config_suffix, installable_attr });
 	errdefer allocator.free(installable);
 	const plugins_input = try std.fmt.allocPrint(allocator, "path:{s}", .{b.plugins_flake_dir});
 	errdefer allocator.free(plugins_input);
@@ -602,7 +605,7 @@ test "toplevelBuildArgv: toplevel installable + boot-path override-inputs" {
 
 	try expectArgv(&.{
 		"build",
-		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64.config.system.build.toplevel",
+		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64-container.config.system.build.toplevel",
 		"--override-input",
 		"userExtensions",
 		"path:/var/lib/cogbox/inst/plugins-flake",

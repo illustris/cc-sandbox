@@ -1147,6 +1147,36 @@
 							ExecStart = brainTrustScript;
 						};
 					};
+					# Crash-loop guard for the per-instance full toplevel. agentInit writes
+					# a toplevel.attempt marker (the out-path) BEFORE exec'ing a per-instance
+					# toplevel; this oneshot clears it once THIS booted system is confirmed to
+					# be that recorded toplevel. If the toplevel fails to boot, systemd never
+					# reaches here, the marker persists, and the next boot falls back to the
+					# baked base (quarantining the unbootable toplevel until a re-add produces a
+					# new out-path). Only clears when the running system IS the recorded
+					# toplevel, so a crash that fell back to base keeps the quarantine.
+					cogbox-toplevel-confirm = lib.mkIf isContainer {
+						description = "Clear the per-instance toplevel crash-loop marker on a good boot";
+						wantedBy = [ "multi-user.target" ];
+						after = [ stateUnit "cogbox-brain-materialize.service" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							Environment = [ "XDG_CONFIG_HOME=${stateRoot}/config" ];
+							PassEnvironment = [ "COGBOX_INSTANCE" ];
+						};
+						script = ''
+							inst="''${COGBOX_INSTANCE:-default}"
+							icd="${stateRoot}/config/cogbox/instances/$inst"
+							rec="$icd/toplevel.path"
+							[ -f "$rec" ] || exit 0
+							recorded="$(${pkgs.coreutils}/bin/head -n2 "$rec" | ${pkgs.coreutils}/bin/tail -n1)"
+							cur="$(${pkgs.coreutils}/bin/readlink -f /run/current-system)"
+							if [ -n "$recorded" ] && [ "$cur" = "$recorded" ]; then
+								${pkgs.coreutils}/bin/rm -f "$icd/toplevel.attempt"
+							fi
+						'';
+					};
 					# Assemble the L7 CA trust bundle: system store + the injected
 					# per-instance MITM CA (when terminate is active). Always
 					# produces ${l7CaBundle} so the CA env vars resolve even when
@@ -1506,11 +1536,23 @@
 				inst="''${COGBOX_INSTANCE:-default}"
 				icd="/var/lib/cogbox-state/config/cogbox/instances/$inst"
 				rec="$icd/toplevel.path"
+				attempt="$icd/toplevel.attempt"
 				if [ -f "$rec" ]; then
 					rev="$(${pkgs.coreutils}/bin/head -n1 "$rec")"
 					out="$(${pkgs.coreutils}/bin/head -n2 "$rec" | ${pkgs.coreutils}/bin/tail -n1)"
 					if [ "$rev" = "${self}" ] && [ -n "$out" ]; then
-						if ${pkgs.nix}/bin/nix-store --realise "$out" --option substituters "file://$icd/plugin-cache" --option require-sigs false --option build-users-group "" >/dev/null 2>&1 && [ -x "$out/init" ]; then
+						# Crash-loop guard: an attempt marker for THIS out-path means a
+						# previous boot exec'd it but it never reached the confirm oneshot
+						# (systemd failed to boot) -- do NOT re-boot the unbootable toplevel;
+						# fall back to the baked base so the sandbox stays usable (tools still
+						# land via the brain). A re-add yields a new out-path (marker mismatch),
+						# so a fixed plugin IS retried; the confirm oneshot clears the marker
+						# once the recorded toplevel boots successfully.
+						if [ -f "$attempt" ] && [ "$(${pkgs.coreutils}/bin/cat "$attempt" 2>/dev/null)" = "$out" ]; then
+							echo "cogbox-agent-init: per-instance toplevel $out failed a prior boot; booting baked base" >&2
+						elif ${pkgs.nix}/bin/nix-store --realise "$out" --option substituters "file://$icd/plugin-cache" --option require-sigs false --option build-users-group "" >/dev/null 2>&1 && [ -x "$out/init" ]; then
+							${pkgs.coreutils}/bin/mkdir -p "$icd" 2>/dev/null || true
+							echo "$out" > "$attempt" 2>/dev/null || true
 							top="$out"
 							echo "cogbox-agent-init: booting per-instance toplevel $out" >&2
 						else
@@ -1957,6 +1999,20 @@
 				vcpu = 16;
 				mem = 32768;
 				extraModules = cogboxModules system {};
+			};
+		}) supportedSystems)
+		# The CONTAINER config exposed as a buildable nixosConfiguration so the
+		# per-instance FULL toplevel builds via `--override-input userExtensions`
+		# (prebuildToplevelLocal / agentInit's realise target). SAME args as the
+		# let-bound containerSystem the agent-image bakes, so the base (no-plugin)
+		# toplevel here is the SAME derivation agentInit falls back to. This MUST be
+		# a separate attr from the VM `cogbox-<arch>`: `system.build.toplevel` is
+		# target-DEPENDENT -- the VM config's toplevel is a QEMU-guest system that
+		# cannot boot as an unprivileged container (unlike the target-independent brain).
+		// lib.listToAttrs (map (system: {
+			name = "${configName system}-container";
+			value = mkContainer system "cogbox" {
+				extraModules = cogboxModules system { target = "container"; };
 			};
 		}) supportedSystems) // {
 			# Test fixture used by tests/cogbox.nix Phase E. Pre-builds
