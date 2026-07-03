@@ -1730,6 +1730,13 @@
 					pkgs.cacert
 					pkgs.bashInteractive
 					pkgs.coreutils
+					# `kubectl cp <local> <worker>:<dst>` (cogworx, the
+					# STOPPED-instance archive-upload path) untars INTO this container, so it
+					# needs `tar` on the exec PATH -- coreutils does NOT ship it, and without it
+					# the cp fails "exec: tar: not found" before the plugin add runs. The agent
+					# image gets tar from /run/current-system/sw/bin; the worker is a plain
+					# userland, so add it explicitly.
+					pkgs.gnutar
 					# cogbox-launch.sh is `#!/usr/bin/env bash`; without /usr/bin/env
 					# the kernel can't find the interpreter and `cogbox init` ExecvFails.
 					pkgs.dockerTools.usrBinEnv
