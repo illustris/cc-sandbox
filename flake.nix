@@ -306,6 +306,15 @@
 								experimental-features = [ "nix-command" "flakes" ];
 								build-users-group = "";
 								sandbox = false;
+								# CoW /nix (cogworx's CoW store mode) mounts a
+								# node-shared READ-ONLY lower under a thin per-instance
+								# overlay upper. Store auto-optimisation hardlinks identical
+								# files together, which across the RO lower boundary either
+								# EROFSes or forces needless copy-ups that defeat the CoW
+								# savings. It buys nothing here anyway (the image store is
+								# already optimised at build). mkForce so a plugin's full
+								# NixOS module cannot re-enable it and break a cow instance.
+								auto-optimise-store = lib.mkForce false;
 								substituters = [ "https://cache.nixos.org" "https://cache.numtide.com" ];
 								trusted-public-keys = [
 									"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
