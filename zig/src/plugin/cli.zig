@@ -17,6 +17,13 @@ pub const Cmd = union(enum) {
 	del: DelArgs,
 	update: UpdateArgs,
 	resolve: ResolveArgs,
+	// `cogbox plugin reconcile` (no args): the boot-time reconcile for the container
+	// full-toplevel path. Builds + records the per-instance toplevel from the ALREADY
+	// materialized composition (no fetch/mutation), so a stopped/fresh add that never
+	// prebuilt the toplevel (only the running-agent add does) is picked up on the next
+	// boot. Run by the cogbox-toplevel-reconcile oneshot post-boot (egress up). No-op
+	// when nothing changed since the last record; removes the record when no plugins.
+	reconcile,
 };
 
 pub const AddArgs = struct {
@@ -76,6 +83,10 @@ pub fn parse(argv: []const []const u8) ParseError!Cmd {
 	if (std.mem.eql(u8, sub, "del")) return parseDel(rest);
 	if (std.mem.eql(u8, sub, "update")) return parseUpdate(rest);
 	if (std.mem.eql(u8, sub, "resolve")) return parseResolve(rest);
+	if (std.mem.eql(u8, sub, "reconcile")) {
+		if (rest.len != 0) return error.InvalidArgs;
+		return .reconcile;
+	}
 	return error.UnknownSubcommand;
 }
 
@@ -172,6 +183,11 @@ const t = std.testing;
 test "list parses, rejects extra args" {
 	try t.expect((try parse(&.{"list"})) == .list);
 	try t.expectError(error.InvalidArgs, parse(&.{ "list", "x" }));
+}
+
+test "reconcile parses, rejects extra args" {
+	try t.expect((try parse(&.{"reconcile"})) == .reconcile);
+	try t.expectError(error.InvalidArgs, parse(&.{ "reconcile", "x" }));
 }
 
 test "add with url only" {

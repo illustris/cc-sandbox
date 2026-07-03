@@ -84,6 +84,7 @@ pub fn dispatch(
 		.del => |d| try cmdDel(&ctx, &loaded, d),
 		.update => |u| try cmdUpdate(&ctx, &loaded, u),
 		.resolve => |r| try cmdResolve(&ctx, &loaded, r),
+		.reconcile => try cmdReconcile(&ctx, &loaded),
 	}
 }
 
@@ -1212,26 +1213,37 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 /// byte-identical to the one agentInit would derive. v1 copies the WHOLE closure (base
 /// included); a delta-vs-baked-base copy is a follow-up space/latency optimization.
 fn prebuildToplevelLocal(ctx: *const Ctx) void {
+	const env = ctx.parent_env;
+	const local = env.get("COGBOX_TOPLEVEL_PUSH_LOCAL") orelse return;
+	if (!std.mem.eql(u8, local, "1")) return;
+	_ = doToplevelBuild(ctx);
+}
+
+/// Build the per-instance CONTAINER toplevel (the plugin's whole module folded in), seed its
+/// closure into the plugin-cache, and write the toplevel.path record agentInit boots from.
+/// Returns true iff the record was written. Best-effort; every failure warns + returns false.
+/// Shared by the plugin-add gate (prebuildToplevelLocal, running-agent only) and the boot
+/// reconcile (cmdReconcile, which covers stopped/fresh adds). Determinism: nothing
+/// instance-specific is in the toplevel closure, so the out-path is byte-identical to the one
+/// agentInit derives. v1 copies the WHOLE closure; a delta-vs-base copy is a follow-up.
+fn doToplevelBuild(ctx: *const Ctx) bool {
 	const allocator = ctx.allocator;
 	const env = ctx.parent_env;
 
-	const local = env.get("COGBOX_TOPLEVEL_PUSH_LOCAL") orelse return;
-	if (!std.mem.eql(u8, local, "1")) return;
-
 	const flake_source = env.get("COGBOX_FLAKE_SOURCE") orelse {
-		warn(ctx, "toplevel prebuild: COGBOX_FLAKE_SOURCE unset; skipping (boot uses baked base)", .{}) catch {};
-		return;
+		warn(ctx, "toplevel build: COGBOX_FLAKE_SOURCE unset; skipping (boot uses baked base)", .{}) catch {};
+		return false;
 	};
 	const nixpkgs_source = env.get("COGBOX_NIXPKGS_SOURCE") orelse {
-		warn(ctx, "toplevel prebuild: COGBOX_NIXPKGS_SOURCE unset; skipping (boot uses baked base)", .{}) catch {};
-		return;
+		warn(ctx, "toplevel build: COGBOX_NIXPKGS_SOURCE unset; skipping (boot uses baked base)", .{}) catch {};
+		return false;
 	};
 	const arch = @tagName(builtin_mod.cpu.arch);
 
 	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
 	const substituters = blk: {
-		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
-		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return;
+		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return false;
+		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return false;
 	};
 	defer allocator.free(substituters);
 
@@ -1244,47 +1256,131 @@ fn prebuildToplevelLocal(ctx: *const Ctx) void {
 		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
 		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
 	}) catch {
-		warn(ctx, "toplevel prebuild: build failed to launch (boot uses baked base)", .{}) catch {};
-		return;
+		warn(ctx, "toplevel build: failed to launch (boot uses baked base)", .{}) catch {};
+		return false;
 	};
 	var o = out;
 	defer o.deinit(allocator);
 	if (!o.ok) {
-		warn(ctx, "toplevel prebuild: build failed (boot uses baked base): {s}", .{nix.stderrTail(o.stderr)}) catch {};
-		return;
+		warn(ctx, "toplevel build: failed (boot uses baked base): {s}", .{nix.stderrTail(o.stderr)}) catch {};
+		return false;
 	}
 	const out_path = std.mem.trim(u8, o.stdout, " \t\r\n");
 	const first = if (std.mem.indexOfScalar(u8, out_path, '\n')) |i| out_path[0..i] else out_path;
 	if (first.len == 0) {
-		warn(ctx, "toplevel prebuild: build produced no out-path (boot uses baked base)", .{}) catch {};
-		return;
+		warn(ctx, "toplevel build: produced no out-path (boot uses baked base)", .{}) catch {};
+		return false;
 	}
 
 	// Seed the per-instance plugin-cache with the toplevel closure so the egress-less boot
 	// substitutes it (zstd; require-sigs false on the read side -- agentInit).
-	const cache_url = std.fmt.allocPrint(allocator, "file://{s}?compression=zstd", .{ctx.cache_dir}) catch return;
+	const cache_url = std.fmt.allocPrint(allocator, "file://{s}?compression=zstd", .{ctx.cache_dir}) catch return false;
 	defer allocator.free(cache_url);
 	const copied = blk: {
 		if (nix.copyClosureTo(allocator, ctx.io, env, cache_url, first)) |cp| {
 			var c = cp;
 			defer c.deinit(allocator);
 			if (!c.ok) {
-				warn(ctx, "toplevel prebuild: copy to plugin-cache failed (boot uses baked base): {s}", .{nix.stderrTail(c.stderr)}) catch {};
+				warn(ctx, "toplevel build: copy to plugin-cache failed (boot uses baked base): {s}", .{nix.stderrTail(c.stderr)}) catch {};
 				break :blk false;
 			}
 			break :blk true;
 		} else |_| {
-			warn(ctx, "toplevel prebuild: copy to plugin-cache failed to launch (boot uses baked base)", .{}) catch {};
+			warn(ctx, "toplevel build: copy to plugin-cache failed to launch (boot uses baked base)", .{}) catch {};
 			break :blk false;
 		}
 	};
 
-	// Record ONLY after a successful copy: agentInit realises the recorded out-path from
-	// the file:// cache offline, so a record pointing at an un-cached path would make it
-	// fall back to the baked base anyway -- recording it would be pointless. The rev marker
-	// (flake_source == the baked ${self} agentInit compares against) self-heals across image
-	// bumps: a stale rev fails agentInit's guard and boots the baked base until the next add.
-	if (copied) writeToplevelRecord(ctx, flake_source, first);
+	// Record ONLY after a successful copy: agentInit realises the recorded out-path offline
+	// from the cache, so a record pointing at an un-cached path would fall back to base anyway.
+	// The rev marker (flake_source == the baked ${self} agentInit compares against) self-heals
+	// across image bumps; the comphash (composition flake.lock hash) is the reconcile guard.
+	if (!copied) return false;
+	writeToplevelRecord(ctx, flake_source, first, compositionHash(ctx));
+	return true;
+}
+
+/// The container boot reconcile (`cogbox plugin reconcile`, run by the cogbox-toplevel-reconcile
+/// oneshot post-boot when egress is up). It builds + records the per-instance toplevel from the
+/// ALREADY-materialized composition -- so a stopped/fresh add (which only ran the cheap brain
+/// prebuild in the worker, not the toplevel one) is picked up on the NEXT boot -- and self-heals
+/// after an image bump. Runs in the live agent pod, whose store has the base, so the build is the
+/// fast delta path (same as the running-agent add). No-op fast paths: (a) no plugins -> remove any
+/// stale record so boot reverts to the baked base; (b) the recorded toplevel is already current
+/// (rev marker + composition hash unchanged) -> skip the expensive rebuild. Best-effort.
+fn cmdReconcile(ctx: *Ctx, loaded: *config.Loaded) !void {
+	const arr = mutate.existingPluginsArray(loaded.root());
+	if (arr == null or arr.?.items.len == 0) {
+		// No plugins: drop any stale toplevel record so agentInit boots the baked base.
+		removeToplevelRecord(ctx);
+		return;
+	}
+	// Skip when the recorded toplevel is already current for this (image rev, composition).
+	if (toplevelRecordCurrent(ctx)) return;
+	_ = doToplevelBuild(ctx);
+}
+
+/// Hash of the composition identity: the plugins-flake flake.lock, which pins the plugin set
+/// AND each plugin source's narHash, so it changes on any add/del/update. The reconcile guard
+/// compares it against the record's stored hash to skip an unchanged rebuild. Null when the
+/// lock is unreadable (treated as "changed" -> rebuild, which is safe).
+fn compositionHash(ctx: *const Ctx) ?u64 {
+	const allocator = ctx.allocator;
+	const lock = std.fs.path.join(allocator, &.{ ctx.plugins_flake_dir, "flake.lock" }) catch return null;
+	defer allocator.free(lock);
+	const cwd = std.Io.Dir.cwd();
+	const file = cwd.openFile(ctx.io, lock, .{}) catch return null;
+	defer file.close(ctx.io);
+	var buf: [4096]u8 = undefined;
+	var reader = file.reader(ctx.io, &buf);
+	const data = reader.interface.allocRemaining(allocator, .limited(4 << 20)) catch return null;
+	defer allocator.free(data);
+	return std.hash.Wyhash.hash(0, data);
+}
+
+/// True iff toplevel.path exists AND line1 == COGBOX_FLAKE_SOURCE (image rev current) AND
+/// line3 == the current compositionHash (nothing added/removed/updated since it was built).
+/// Any read failure / mismatch / absent hash returns false (-> rebuild), which is safe.
+fn toplevelRecordCurrent(ctx: *const Ctx) bool {
+	const allocator = ctx.allocator;
+	const env = ctx.parent_env;
+	const flake_source = env.get("COGBOX_FLAKE_SOURCE") orelse return false;
+	const cur = compositionHash(ctx) orelse return false;
+
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return false;
+	const path = std.fs.path.join(allocator, &.{ instance_config_dir, "toplevel.path" }) catch return false;
+	defer allocator.free(path);
+	const cwd = std.Io.Dir.cwd();
+	const file = cwd.openFile(ctx.io, path, .{}) catch return false;
+	defer file.close(ctx.io);
+	var buf: [1024]u8 = undefined;
+	var reader = file.reader(ctx.io, &buf);
+	const data = reader.interface.allocRemaining(allocator, .limited(64 << 10)) catch return false;
+	defer allocator.free(data);
+
+	var lines = std.mem.splitScalar(u8, data, '\n');
+	const rev = lines.next() orelse return false;
+	_ = lines.next() orelse return false; // out-path (line 2)
+	const rec_hash = lines.next() orelse return false; // comphash (line 3)
+	if (!std.mem.eql(u8, std.mem.trim(u8, rev, " \t\r"), flake_source)) return false;
+
+	var hex: [16]u8 = undefined;
+	const cur_hex = std.fmt.bufPrint(&hex, "{x}", .{cur}) catch return false;
+	return std.mem.eql(u8, std.mem.trim(u8, rec_hash, " \t\r"), cur_hex);
+}
+
+/// Remove the toplevel record (+ its crash-loop attempt marker) so agentInit boots the baked
+/// base. Called by the reconcile when an instance has no plugins (all removed). Best-effort.
+fn removeToplevelRecord(ctx: *const Ctx) void {
+	const allocator = ctx.allocator;
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return;
+	const cwd = std.Io.Dir.cwd();
+	const names = [_][]const u8{ "toplevel.path", "toplevel.attempt" };
+	for (names) |name| {
+		const p = std.fs.path.join(allocator, &.{ instance_config_dir, name }) catch continue;
+		defer allocator.free(p);
+		cwd.deleteFile(ctx.io, p) catch {};
+	}
 }
 
 /// Best-effort pre-write of cogbox-launch.sh's runner.path fast-path record.
@@ -1338,19 +1434,20 @@ fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const 
 	};
 }
 
-/// Best-effort atomic write of agentInit's `toplevel.path` fast-path record: two
-/// newline-terminated lines, line1 = the image-rev marker (flake_source == the baked
-/// ${self} agentInit compares against), line2 = the per-instance toplevel out-path. Lives at
-/// <instance_config_dir>/toplevel.path on the state PVC (the SAME dir the launcher/boot read,
-/// dirname of plugins_flake_dir), byte-for-byte the shape agentInit parses (head/tail). Any
-/// failure is warned and swallowed -- a missing/partial record just makes agentInit boot the
-/// baked base toplevel, never a failed verb. Mirrors writeRunnerRecord.
-fn writeToplevelRecord(ctx: *const Ctx, flake_source: []const u8, toplevel: []const u8) void {
+/// Best-effort atomic write of agentInit's `toplevel.path` fast-path record: three
+/// newline-terminated lines, line1 = the image-rev marker (flake_source == the baked ${self}
+/// agentInit compares against), line2 = the per-instance toplevel out-path, line3 = the
+/// composition hash (compositionHash; empty when unknown) that the boot reconcile guard reads
+/// to skip an unchanged rebuild. Lives at <instance_config_dir>/toplevel.path on the state PVC
+/// (dirname of plugins_flake_dir). agentInit/confirm read only lines 1-2 (head/tail), so the
+/// 3rd line is invisible to them. Any failure is warned + swallowed -- a missing/partial record
+/// just makes agentInit boot the baked base, never a failed verb. Mirrors writeRunnerRecord.
+fn writeToplevelRecord(ctx: *const Ctx, flake_source: []const u8, toplevel: []const u8, comphash: ?u64) void {
 	const allocator = ctx.allocator;
 	const cwd = std.Io.Dir.cwd();
 
 	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse {
-		warn(ctx, "toplevel prebuild: plugins-flake dir has no parent; skipping record (boot uses baked base)", .{}) catch {};
+		warn(ctx, "toplevel build: plugins-flake dir has no parent; skipping record (boot uses baked base)", .{}) catch {};
 		return;
 	};
 	const path = std.fs.path.join(allocator, &.{ instance_config_dir, "toplevel.path" }) catch return;
@@ -1358,7 +1455,9 @@ fn writeToplevelRecord(ctx: *const Ctx, flake_source: []const u8, toplevel: []co
 	const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
 	defer allocator.free(tmp_path);
 
-	const contents = std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ flake_source, toplevel }) catch return;
+	var hex_buf: [16]u8 = undefined;
+	const hash_hex: []const u8 = if (comphash) |h| (std.fmt.bufPrint(&hex_buf, "{x}", .{h}) catch "") else "";
+	const contents = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n", .{ flake_source, toplevel, hash_hex }) catch return;
 	defer allocator.free(contents);
 
 	{

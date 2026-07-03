@@ -1177,6 +1177,39 @@
 							fi
 						'';
 					};
+					# Boot reconcile for the per-instance full toplevel. The add-time toplevel
+					# prebuild only runs on the LIVE agent pod (running-instance adds); a
+					# stopped/fresh add (worker pod) writes no toplevel record, so its
+					# non-package module surface wouldn't take effect. This oneshot -- run AFTER
+					# boot completes (multi-user.target => egress up, and the base is already in
+					# the image store) -- builds + records the toplevel from the already-
+					# materialized composition, so the NEXT Start boots the per-instance
+					# toplevel. It also self-heals across image bumps. `after multi-user.target`
+					# makes it truly background: the sandbox is Ready (the readiness probe gates
+					# on brain-materialize, well before this) while the reconcile builds. The
+					# `reconcile` verb no-ops fast when nothing changed (composition-hash guard)
+					# and removes the record when no plugins remain (revert to base). Best-effort.
+					cogbox-toplevel-reconcile = lib.mkIf isContainer {
+						description = "Reconcile + record the per-instance full toplevel for the next boot";
+						wantedBy = [ "multi-user.target" ];
+						after = [ "multi-user.target" ];
+						serviceConfig = {
+							Type = "oneshot";
+							PassEnvironment = [ "COGBOX_INSTANCE" ];
+						};
+						script = ''
+							inst="''${COGBOX_INSTANCE:-}"
+							cbx=${self.packages.${system}.cogbox-container}/bin/cogbox
+							# The plugin verb resolves the instance from -n only (not the env), and
+							# rejects the reserved name "default"; omit -n for the default instance.
+							# Best-effort: never fail the unit -- a miss just leaves the last record.
+							if [ -n "$inst" ] && [ "$inst" != "default" ]; then
+								"$cbx" plugin reconcile -n "$inst" || true
+							else
+								"$cbx" plugin reconcile || true
+							fi
+						'';
+					};
 					# Assemble the L7 CA trust bundle: system store + the injected
 					# per-instance MITM CA (when terminate is active). Always
 					# produces ${l7CaBundle} so the CA env vars resolve even when
