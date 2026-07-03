@@ -1810,7 +1810,15 @@
 				# it); with it gone NixOS builds a fresh writable /etc on the overlay
 				# rootfs at boot. The agent-init shim repeats this defensively at
 				# runtime in case the whiteout does not survive the layering.
-				extraCommands = "mkdir -m 1777 -p tmp var/tmp && mkdir -m 0700 -p root && rm -f etc";
+				# Bake a /bin/sh -> bash symlink: NixOS creates /bin/sh only during
+					# activation (setupBinSh), but cogworx's CoW-store seed init container
+					# runs `sh -c <script>` against THIS image BEFORE systemd/activation (to
+					# seed the node-shared /nix lower + mount the per-instance overlay), so it
+					# needs a shell at the raw-image /bin/sh. bashInteractive is root's login
+					# shell, already in the toplevel closure. The seed script is otherwise
+					# self-contained (globs coreutils/util-linux/grep out of the store), so
+					# /bin/sh is the ONLY userland entry it needs baked here.
+					extraCommands = "mkdir -m 1777 -p tmp var/tmp && mkdir -m 0700 -p root && rm -f etc && mkdir -p bin && ln -sf ${pkgs.bashInteractive}/bin/bash bin/sh";
 				# The store closure arrives via the toplevel (also referenced by
 				# Entrypoint); no extra userland layers are needed.
 				contents = [ containerToplevel ];
