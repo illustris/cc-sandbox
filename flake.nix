@@ -844,10 +844,33 @@
 
 					mkdir -p "$cdir"
 					chmod 700 "$persist" "$cdir"
-					# A minimal, non-secret ~/.claude.json must exist for claude-code to
-					# skip /login (the credential file alone is not enough). brain-trust
-					# enriches it (workspace trust); seed an empty object if absent.
-					[ -e "$cjson" ] || printf '{}\n' > "$cjson"
+					# claude-code gates INTERACTIVE startup on hasCompletedOnboarding in
+					# ~/.claude.json (observed on 2.1.191): without it the first-run
+					# wizard runs, and its "Select login method" step reads as an auth
+					# prompt -- a dead end in the sandbox, where the wizard's OAuth hosts
+					# are never in the l7 allow-list. The credential file alone is NOT
+					# enough for an interactive boot (`claude -p` works either way, which
+					# is how this gap survived the launch e2e). So seed (absent) or merge
+					# (present) the onboarding state: hasCompletedOnboarding is forced
+					# true (claude-code clears it on /logout; the next oneshot run
+					# re-forces it), theme is only defaulted (never clobbers a user's
+					# choice). The merge is a SINGLE slurped jq read (no guard-then-merge
+					# TOCTOU, and a multi-document file is rejected, not concatenated)
+					# and NON-FATAL: cogworx restarts this unit mid-session while
+					# claude-code may be rewriting the file through the symlink, and a
+					# torn read must neither kill the oneshot before the stub verb below
+					# runs nor seed-reset away the user's config -- on any parse/shape
+					# failure the file is left untouched (claude-code's own
+					# corrupt-config handling deals with real rot). brain-trust later
+					# enriches the same file (workspace trust).
+					seed='{"hasCompletedOnboarding":true,"theme":"dark"}'
+					if [ -e "$cjson" ]; then
+						if merged=$(${pkgs.jq}/bin/jq -es 'if length == 1 and (.[0] | type == "object") then .[0] | .hasCompletedOnboarding = true | .theme //= "dark" else error("not a single object") end' "$cjson" 2>/dev/null); then
+							printf '%s\n' "$merged" > "$cjson.tmp" && mv "$cjson.tmp" "$cjson" || rm -f "$cjson.tmp"
+						fi
+					else
+						printf '%s\n' "$seed" > "$cjson"
+					fi
 					chmod 600 "$cjson"
 					# /root/.claude{,.json} may pre-exist as REAL files/dirs (the image
 					# home skel / claude-code's own init runs before this oneshot). `ln
