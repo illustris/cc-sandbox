@@ -142,11 +142,15 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 		return die(allocator, io, "refusing to bind an empty secret value", .{}, 65);
 	}
 
+	// Stamp the bind time into the meta so `secret ls --json` (and the cogworx
+	// DB mirror of it) records WHEN a secret was bound -- groundwork for a UI
+	// surface (nothing renders it yet; consumers treat 0/null as unset).
+	const bound_at: i64 = @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
 	const meta: store.Meta = .{
 		.audience = audience,
 		.kind = kind,
 		.tier = "durable",
-		.bound_at = null,
+		.bound_at = bound_at,
 	};
 	store.add(allocator, io, secrets_dir, nm, value, meta) catch |err| {
 		return die(allocator, io, "failed to bind secret '{s}': {s}", .{ nm, @errorName(err) }, 73);
