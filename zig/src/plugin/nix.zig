@@ -240,6 +240,20 @@ pub fn copyClosureTo(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.
 	return runNix(allocator, io, env, &.{ "copy", "--to", dest, store_path });
 }
 
+/// `nix path-info --json --all` against the node CoW base store (the delta-only copy): enumerate every base store path in the lower
+/// (`local?root=<root>`, frozen -> read-only-local-store) with its narHash/narSize/
+/// references, so the caller can write narinfo STUBS into the per-instance plugin-cache
+/// and make the subsequent `nix copy <toplevel>` skip the ~2.3 GB base (the boot reads
+/// the base from its own CoW lower, never from the cache -- so the stubs' dangling NAR
+/// URLs are harmless). NO NARs are read here (metadata comes from the lower's nix DB
+/// that the base-closure seed load-db'd), so it costs a DB query, not GBs of I/O.
+pub fn basePathInfoJson(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8) !RunOut {
+	const store = try std.fmt.allocPrint(allocator, "local?root={s}&read-only=true", .{root});
+	defer allocator.free(store);
+	// read-only-local-store accumulates on top of runNix's "nix-command flakes".
+	return runNix(allocator, io, env, &.{ "path-info", "--json", "--all", "--store", store, "--extra-experimental-features", "read-only-local-store" });
+}
+
 /// Outcome of the cogboxPlugins.<attr> contract check. `missing` is the
 /// contract violation ("this flake is not a cogbox plugin"); `failed` is
 /// everything else that can go wrong with the eval (fetch error, eval error

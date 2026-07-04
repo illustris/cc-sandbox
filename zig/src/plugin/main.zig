@@ -1265,13 +1265,92 @@ fn prebuildToplevelLocal(ctx: *const Ctx) void {
 	_ = doToplevelBuild(ctx);
 }
 
+/// the delta-only copy: write narinfo STUBS for the node CoW base
+/// closure into the per-instance plugin-cache so the toplevel copyClosureTo skips the
+/// ~2.3 GB base and copies only the plugin DELTA to the state PVC. Each stub carries the
+/// real narHash/narSize/references (from the lower's nix DB via `nix path-info`, so NO NAR
+/// I/O) but a DANGLING NAR URL -- harmless because the egress-less boot realises the base
+/// from its OWN CoW lower, never from the cache. Best-effort: any failure just leaves the
+/// base to be copied whole (correct, slower). `base_root` is the validated (db-present)
+/// CoW lower root, same one the base-store substitution substitutes from.
+fn seedBaseNarinfos(ctx: *const Ctx, base_root: []const u8) void {
+	const allocator = ctx.allocator;
+	const info = nix.basePathInfoJson(allocator, ctx.io, ctx.parent_env, base_root) catch {
+		warn(ctx, "toplevel build: base path-info failed to launch (copying whole closure)", .{}) catch {};
+		return;
+	};
+	var o = info;
+	defer o.deinit(allocator);
+	if (!o.ok) {
+		warn(ctx, "toplevel build: base path-info failed (copying whole closure): {s}", .{nix.stderrTail(o.stderr)}) catch {};
+		return;
+	}
+	const parsed = std.json.parseFromSlice(std.json.Value, allocator, o.stdout, .{}) catch {
+		warn(ctx, "toplevel build: base path-info JSON unparseable (copying whole closure)", .{}) catch {};
+		return;
+	};
+	defer parsed.deinit();
+	if (parsed.value != .object) return;
+
+	// Ensure the plugin-cache dir exists (the brain prebuild usually created it, but do not
+	// depend on that): createDirPathOpen is a no-op if present.
+	{
+		var d = std.Io.Dir.cwd().createDirPathOpen(ctx.io, ctx.cache_dir, .{}) catch return;
+		d.close(ctx.io);
+	}
+	const cwd = std.Io.Dir.cwd();
+
+	var count: usize = 0;
+	var it = parsed.value.object.iterator();
+	while (it.next()) |entry| {
+		const path = entry.key_ptr.*;
+		const v = entry.value_ptr.*;
+		if (v != .object) continue;
+		const nh = v.object.get("narHash") orelse continue;
+		const ns = v.object.get("narSize") orelse continue;
+		if (nh != .string or ns != .integer) continue;
+		const base = std.fs.path.basename(path);
+		if (base.len < 32) continue;
+		const hash = base[0..32];
+
+		// References -> space-joined basenames (the on-disk narinfo form).
+		var refs: std.ArrayList(u8) = .empty;
+		defer refs.deinit(allocator);
+		if (v.object.get("references")) |rv| {
+			if (rv == .array) {
+				for (rv.array.items, 0..) |rp, i| {
+					if (rp != .string) continue;
+					if (i != 0) refs.append(allocator, ' ') catch {};
+					refs.appendSlice(allocator, std.fs.path.basename(rp.string)) catch {};
+				}
+			}
+		}
+
+		// Dangling URL + Compression: none -- never fetched (boot has the base locally).
+		const narinfo = std.fmt.allocPrint(allocator, "StorePath: {s}\nURL: nar/base-{s}.nar\nCompression: none\nNarHash: {s}\nNarSize: {d}\nReferences: {s}\n", .{ path, hash, nh.string, ns.integer, refs.items }) catch continue;
+		defer allocator.free(narinfo);
+		const fname = std.fmt.allocPrint(allocator, "{s}/{s}.narinfo", .{ ctx.cache_dir, hash }) catch continue;
+		defer allocator.free(fname);
+
+		const f = cwd.createFile(ctx.io, fname, .{ .truncate = true }) catch continue;
+		defer f.close(ctx.io);
+		var wbuf: [512]u8 = undefined;
+		var w = f.writer(ctx.io, &wbuf);
+		w.interface.writeAll(narinfo) catch continue;
+		w.flush() catch continue;
+		count += 1;
+	}
+	warn(ctx, "toplevel build: seeded {d} base narinfo stubs into the plugin-cache (delta copy)", .{count}) catch {};
+}
+
 /// Build the per-instance CONTAINER toplevel (the plugin's whole module folded in), seed its
 /// closure into the plugin-cache, and write the toplevel.path record agentInit boots from.
 /// Returns true iff the record was written. Best-effort; every failure warns + returns false.
 /// Shared by the plugin-add gate (prebuildToplevelLocal, running-agent only) and the boot
 /// reconcile (cmdReconcile, which covers stopped/fresh adds). Determinism: nothing
 /// instance-specific is in the toplevel closure, so the out-path is byte-identical to the one
-/// agentInit derives. v1 copies the WHOLE closure; a delta-vs-base copy is a follow-up.
+/// agentInit derives. the delta-only copy (seedBaseNarinfos) trims the copy to the plugin delta when the
+/// node CoW base store is mounted; otherwise the whole closure is copied.
 fn doToplevelBuild(ctx: *const Ctx) bool {
 	const allocator = ctx.allocator;
 	const env = ctx.parent_env;
@@ -1321,6 +1400,14 @@ fn doToplevelBuild(ctx: *const Ctx) bool {
 		warn(ctx, "toplevel build: produced no out-path (boot uses baked base)", .{}) catch {};
 		return false;
 	}
+
+	// the delta-only copy: when the node CoW base store is mounted
+	// (base_root non-null -- the same warm-node condition as the base-store substitution), pre-seed narinfo
+	// STUBS for the base closure into the plugin-cache so the copyClosureTo below skips the
+	// ~2.3 GB base and writes only the plugin DELTA to the state PVC (the boot reads the base
+	// from its own CoW lower, never from the cache). Best-effort: on any failure the whole
+	// closure is copied (correct, just slower).
+	if (base_root) |br| seedBaseNarinfos(ctx, br);
 
 	// Seed the per-instance plugin-cache with the toplevel closure so the egress-less boot
 	// substitutes it (zstd; require-sigs false on the read side -- agentInit).
