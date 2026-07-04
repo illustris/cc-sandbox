@@ -1224,29 +1224,6 @@ fn prebuildToplevelLocal(ctx: *const Ctx) void {
 	_ = doToplevelBuild(ctx);
 }
 
-/// True iff folding the plugins into the container system leaves the toplevel out-path
-/// UNCHANGED from the baked base -- i.e. the plugin set is brain-only (cogbox.packages/skills)
-/// and touches nothing in the NixOS module (no environment.systemPackages, services, etc.).
-/// EVALs both out-paths purely (no substitute/realise) and compares. Conservative: any eval
-/// failure, empty output, or IFD block returns false so the caller does the full build (a wrong
-/// "true" would boot the base and silently drop a real system change; a wrong "false" is just a
-/// slow-but-correct rebuild). Consistency of the base/plugin nixpkgs only affects the hit-rate.
-fn toplevelMatchesBase(ctx: *const Ctx, env: *const std.process.Environ.Map, b: nix.RunnerBuild) bool {
-	const allocator = ctx.allocator;
-	const base_out = nix.evalToplevelOutPath(allocator, ctx.io, env, b, false) catch return false;
-	var base = base_out;
-	defer base.deinit(allocator);
-	if (!base.ok) return false;
-	const with_out = nix.evalToplevelOutPath(allocator, ctx.io, env, b, true) catch return false;
-	var with = with_out;
-	defer with.deinit(allocator);
-	if (!with.ok) return false;
-	const base_path = std.mem.trim(u8, base.stdout, " \t\r\n");
-	const with_path = std.mem.trim(u8, with.stdout, " \t\r\n");
-	if (base_path.len == 0 or with_path.len == 0) return false;
-	return std.mem.eql(u8, base_path, with_path);
-}
-
 /// Build the per-instance CONTAINER toplevel (the plugin's whole module folded in), seed its
 /// closure into the plugin-cache, and write the toplevel.path record agentInit boots from.
 /// Returns true iff the record was written. Best-effort; every failure warns + returns false.
@@ -1275,7 +1252,7 @@ fn doToplevelBuild(ctx: *const Ctx) bool {
 	};
 	defer allocator.free(substituters);
 
-	const b: nix.RunnerBuild = .{
+	const out = nix.buildToplevel(allocator, ctx.io, env, .{
 		.flake_source = flake_source,
 		.nixpkgs_source = nixpkgs_source,
 		.plugins_flake_dir = ctx.plugins_flake_dir,
@@ -1283,22 +1260,7 @@ fn doToplevelBuild(ctx: *const Ctx) bool {
 		.substituters = substituters,
 		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
 		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
-	};
-
-	// Fast path: a cogbox.packages/skills-only plugin ships its tools via the brain, so folding
-	// its module in leaves the SYSTEM toplevel byte-identical to the baked base. EVAL both
-	// out-paths (pure, no ~4 GB substitute/realise) and, when equal, record the "base" sentinel so
-	// agentInit boots the baked base directly -- skipping the multi-minute cold realise+copy. This
-	// is purely an optimization: a plugin that DOES touch the system (environment.systemPackages,
-	// services, ...) changes the toplevel out-path, so it never matches and always takes the full
-	// build below. IFD-blocked eval that errors just falls through to the full build (never a wrong
-	// skip). See nix.evalToplevelOutPath.
-	if (toplevelMatchesBase(ctx, env, b)) {
-		writeToplevelRecord(ctx, flake_source, "base", compositionHash(ctx));
-		return true;
-	}
-
-	const out = nix.buildToplevel(allocator, ctx.io, env, b) catch {
+	}) catch {
 		warn(ctx, "toplevel build: failed to launch (boot uses baked base)", .{}) catch {};
 		return false;
 	};

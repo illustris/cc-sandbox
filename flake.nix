@@ -1587,15 +1587,7 @@
 				if [ -f "$rec" ]; then
 					rev="$(${pkgs.coreutils}/bin/head -n1 "$rec")"
 					out="$(${pkgs.coreutils}/bin/head -n2 "$rec" | ${pkgs.coreutils}/bin/tail -n1)"
-					if [ "$rev" = "${self}" ] && [ "$out" = "base" ]; then
-						# "base" sentinel: the plugin add EVAL'd the composition's toplevel
-						# equal to the baked base (a brain-only plugin -- cogbox.packages/skills
-						# -- that touches nothing in the NixOS module), so it recorded "base"
-						# instead of realising+copying the ~4 GB closure. Boot the baked base
-						# directly; the plugin's tools still land via the brain. No realise, no
-						# crash-loop marker (the base is known-bootable).
-						echo "cogbox-agent-init: toplevel record is the base sentinel (brain-only plugins); booting baked base" >&2
-					elif [ "$rev" = "${self}" ] && [ -n "$out" ]; then
+					if [ "$rev" = "${self}" ] && [ -n "$out" ]; then
 						# Crash-loop guard: an attempt marker for THIS out-path means a
 						# previous boot exec'd it but it never reached the confirm oneshot
 						# (systemd failed to boot) -- do NOT re-boot the unbootable toplevel;
