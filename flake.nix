@@ -1524,6 +1524,17 @@
 				extraModules = cogboxModules system { target = "container"; };
 			};
 			containerToplevel = containerSystem.config.system.build.toplevel;
+			# Registration (nix-store --dump-db format) for the WHOLE agent-image /nix
+			# closure, baked into the image at /etc/cogbox/base-reginfo. The CoW seed
+			# (cogworx's CoW-seed) `nix-store --load-db`s it into the frozen node lower
+			# so the stopped-add worker can SUBSTITUTE the base closure from the lower over
+			# local disk. Without a DB the lower
+			# is store-paths-only and unusable as a substituter. rootPaths = the image
+			# content root (containerToplevel; bashInteractive is already in its closure),
+			# so the registration covers every path `cp -a /nix/.` puts in the lower. The
+			# baked file is plain text (store-path strings already in the image closure), so
+			# it adds no new closure.
+			baseReginfo = pkgs.closureInfo { rootPaths = [ containerToplevel ]; };
 			# Pre-systemd boot shim for the unprivileged agent pod
 			# systemd PID1 cannot bring
 			# itself up under a stock Kubernetes pod for two container-specific
@@ -1818,7 +1829,7 @@
 					# shell, already in the toplevel closure. The seed script is otherwise
 					# self-contained (globs coreutils/util-linux/grep out of the store), so
 					# /bin/sh is the ONLY userland entry it needs baked here.
-					extraCommands = "mkdir -m 1777 -p tmp var/tmp && mkdir -m 0700 -p root && rm -f etc && mkdir -p bin && ln -sf ${pkgs.bashInteractive}/bin/bash bin/sh";
+					extraCommands = "mkdir -m 1777 -p tmp var/tmp && mkdir -m 0700 -p root && rm -f etc && mkdir -p bin && ln -sf ${pkgs.bashInteractive}/bin/bash bin/sh && mkdir -p etc/cogbox && cp ${baseReginfo}/registration etc/cogbox/base-reginfo";
 				# The store closure arrives via the toplevel (also referenced by
 				# Entrypoint); no extra userland layers are needed.
 				contents = [ containerToplevel ];
