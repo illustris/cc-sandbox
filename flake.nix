@@ -51,6 +51,17 @@
 		archSuffix = system: builtins.head (lib.splitString "-" system);
 		configName = system: "cogbox-${archSuffix system}";
 
+		# The plugin-less base brain for the container's materialize FALLBACK, built
+		# from an EXPLICIT no-op `userExt` so it can NEVER be reached by a
+		# `--override-input userExtensions <composition>` at per-instance toplevel
+		# build time. This is what keeps the container toplevel byte-identical to the
+		# baked base for a brain-only plugin (the eval-skip precondition). Equal to
+		# the default-userExt `cogbox-brain` when NO override is in play (both no-op),
+		# so it does not change the baked agent image's own toplevel out-path.
+		baseContainerBrain = system: (mkContainer system "cogbox" {
+			extraModules = cogboxModules system { target = "container"; userExt = { ... }: {}; };
+		}).config.system.build.cogboxBrain;
+
 		# Sentinel placeholder baked into the microvm runner's QEMU args
 		# (9p share sources, fw_cfg file paths). At launch the wrapper
 		# sed-rewrites this prefix to the resolved per-user XDG runtime
@@ -332,7 +343,16 @@
 		# position the runtime override-input would, so the resulting
 		# microvm runner has a deterministic .drvPath that matches what
 		# `nix run --override-input userExtensions ...` produces.
-		cogboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default, target ? "vm" }: let
+		# `baseBrain`: the container's brain-materialize FALLBACK, baked into the
+		# per-instance toplevel's oneshot. MUST be the plugin-less base brain and,
+		# crucially, INDEPENDENT of the `userExtensions` override -- else folding a
+		# brain-only plugin into the toplevel (via `--override-input userExtensions`)
+		# would perturb `cogbox-brain` -> the materialize script -> the toplevel
+		# out-path, defeating the eval-skip. Callers pass a brain built from an
+		# EXPLICIT no-op `userExt` (so the override can't reach it); null falls back
+		# to this config's own `cogbox-brain` (correct for the plugin-less base and
+		# the VM, whose runner is rebuilt per-instance anyway).
+		cogboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default, target ? "vm", baseBrain ? null }: let
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
 			inputs.nixfs.nixosModules.nixfs
@@ -698,7 +718,7 @@
 				# is forwarded into the unit (PassEnvironment); ${self}/${nixpkgs} are
 				# the image's baked flake + nixpkgs sources.
 				brainResolveContainer = ''
-					brain=${cogbox-brain}
+					brain=${if baseBrain != null then baseBrain else cogbox-brain}
 					inst="''${COGBOX_INSTANCE:-default}"
 					icd="''${XDG_CONFIG_HOME:-${stateRoot}/config}/cogbox/instances/$inst"
 					pcount=0
@@ -1035,8 +1055,14 @@
 				# Plugin-contributed tools (cogbox.packages). On the VM the runner
 				# rebuild bakes these into the guest closure here; on the container
 				# they reach PATH via cogbox-brain's $out/bin instead (the baked base
-				# image is plugin-less), so this line is an inert no-op there.
-				++ cfg.packages;
+				# image is plugin-less). MUST be gated to the VM: folding cfg.packages
+				# into the container's environment.systemPackages would perturb the
+				# per-instance toplevel out-path for a brain-only plugin (making it
+				# differ from the baked base), forcing a full ~4 GB toplevel rebuild
+				# for tools the brain already delivers -- the toplevelMatchesBase
+				# eval-skip relies on a cogbox.packages/skills-only plugin leaving the
+				# container toplevel byte-identical to the base.
+				++ lib.optionals isVm cfg.packages;
 
 				# Expose the materialized plugin "brain" as a build product so the
 				# container can rebuild it per-instance at boot. config.cogbox (hence
@@ -1521,7 +1547,10 @@
 			# module tree with target = "container". Its toplevel/init boots
 			# systemd PID1 in the agent-image below.
 			containerSystem = mkContainer system "cogbox" {
-				extraModules = cogboxModules system { target = "container"; };
+				# SAME args as nixosConfigurations."<arch>-container" (incl. baseBrain) so
+				# the baked agent-image toplevel is byte-identical to the base the
+				# per-instance build/agentInit fall back to.
+				extraModules = cogboxModules system { target = "container"; baseBrain = baseContainerBrain system; };
 			};
 			containerToplevel = containerSystem.config.system.build.toplevel;
 			# Pre-systemd boot shim for the unprivileged agent pod
@@ -2082,7 +2111,7 @@
 		// lib.listToAttrs (map (system: {
 			name = "${configName system}-container";
 			value = mkContainer system "cogbox" {
-				extraModules = cogboxModules system { target = "container"; };
+				extraModules = cogboxModules system { target = "container"; baseBrain = baseContainerBrain system; };
 			};
 		}) supportedSystems) // {
 			# Test fixture used by tests/cogbox.nix Phase E. Pre-builds
