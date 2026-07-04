@@ -215,6 +215,47 @@ pub fn buildToplevel(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.
 	return runNix(allocator, io, env, argv.items);
 }
 
+/// EVAL (not realise) the container toplevel's `.outPath`. A PURE eval: it reads the
+/// local flake + nixpkgs SOURCE and computes the derivation's out-path WITHOUT
+/// substituting or building the ~4 GB base. doToplevelBuild uses it to compare the
+/// COMPOSITION's toplevel to the BASE and skip the expensive realise when the plugins
+/// add nothing to the SYSTEM (a cogbox.packages/skills-only plugin ships its tools via
+/// the brain; its toplevel is byte-identical to the base). `with_plugins`: false evals
+/// the BASE (default userExtensions = the baked plugin-less system, reproducing
+/// ${containerToplevel}); true evals the composition's toplevel with the SAME
+/// --override-input set buildToplevel/boot use. Same `-container` target as
+/// toplevelBuildArgv. IFD is blocked, so a config that would need a build to eval fails
+/// here and the caller falls through to the full build (never a wrong skip).
+pub fn evalToplevelOutPath(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, b: RunnerBuild, with_plugins: bool) !RunOut {
+	const installable = try std.fmt.allocPrint(allocator, "path:{s}#nixosConfigurations.cogbox-{s}-container.config.system.build.toplevel.outPath", .{ b.flake_source, b.arch });
+	defer allocator.free(installable);
+	var argv: std.ArrayList([]const u8) = .empty;
+	defer argv.deinit(allocator);
+	try argv.appendSlice(allocator, &.{ "eval", installable, "--raw", "--no-allow-import-from-derivation" });
+	var plugins_input: ?[]u8 = null;
+	var nixpkgs_input: ?[]u8 = null;
+	defer if (plugins_input) |p| allocator.free(p);
+	defer if (nixpkgs_input) |p| allocator.free(p);
+	if (with_plugins) {
+		plugins_input = try std.fmt.allocPrint(allocator, "path:{s}", .{b.plugins_flake_dir});
+		nixpkgs_input = try std.fmt.allocPrint(allocator, "path:{s}", .{b.nixpkgs_source});
+		try argv.appendSlice(allocator, &.{ "--override-input", "userExtensions", plugins_input.?, "--override-input", "userExtensions/user/nixpkgs", nixpkgs_input.? });
+	}
+	// Same substituter/key/netrc knobs buildArgvFor passes: a pure eval still needs the
+	// contents of narHash-locked flake inputs, which may not be in-store yet -- let it
+	// fetch them from the cache instead of failing (which would just force the full build).
+	if (b.substituters.len > 0) {
+		try argv.appendSlice(allocator, &.{ "--option", "extra-substituters", b.substituters, "--option", "require-sigs", "false" });
+	}
+	if (b.trusted_public_keys.len > 0) {
+		try argv.appendSlice(allocator, &.{ "--option", "extra-trusted-public-keys", b.trusted_public_keys });
+	}
+	if (b.netrc_file.len > 0) {
+		try argv.appendSlice(allocator, &.{ "--option", "netrc-file", b.netrc_file });
+	}
+	return runNix(allocator, io, env, argv.items);
+}
+
 /// `nix copy --to <dest> <store_path>`: copy a realized store path AND its
 /// runtime closure into the `dest` binary cache (a `file://<dir>` URI). Used to
 /// seed the per-instance plugin-cache with the pre-built cogbox-brain closure so
