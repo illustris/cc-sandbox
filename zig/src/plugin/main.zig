@@ -1107,6 +1107,45 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 	if (pushed) writeRunnerRecord(ctx, flake_source, first);
 }
 
+/// Resolve the node-shared CoW base store a container pre-build can substitute the
+/// BASE closure from over LOCAL DISK instead of the shared cache (the base-store substitution). COGBOX_BASE_STORE_ROOT names a dir cogworx mounts
+/// the frozen agent-image lower into at `<root>/nix`, so `<root>/nix/store` is the
+/// store and `<root>/nix/var/nix/db` its chroot-store DB. Returns the root ONLY when
+/// that DB is present -- an absent/unseeded lower (fresh node, image never ran here,
+/// or the DirectoryOrCreate hostPath made an EMPTY dir) is a cache MISS: return null
+/// so the build falls back to the shared-cache substituter, never fails. cogworx sets
+/// the env only under CoW mode.
+fn baseStoreRoot(ctx: *const Ctx) ?[]const u8 {
+	const root = ctx.parent_env.get("COGBOX_BASE_STORE_ROOT") orelse return null;
+	if (root.len == 0) return null;
+	const cwd = std.Io.Dir.cwd();
+	// A real local store carries a nix DB; the db dir (or its db.sqlite) present =>
+	// a seeded lower we can substitute from. Either signal is enough.
+	inline for (.{ "nix/var/nix/db", "nix/var/nix/db/db.sqlite" }) |rel| {
+		const p = std.fs.path.join(ctx.allocator, &.{ root, rel }) catch return null;
+		defer ctx.allocator.free(p);
+		if (cwd.access(ctx.io, p, .{})) |_| return root else |_| {}
+	}
+	return null;
+}
+
+/// Assemble the `--extra-substituters` string a container pre-build passes to nix:
+/// the per-instance file:// plugin-cache, any COGBOX_EXTRA_SUBSTITUTERS shared cache,
+/// and -- when a node-shared CoW base store is mounted (base_root non-null, the base-store substitution) --
+/// that local store FIRST (`local?root=<r>&read-only=true`) so the BASE closure comes
+/// off local disk ahead of the network. Caller owns the result (allocator.free); null
+/// on OOM (the caller aborts the pre-build, best-effort, so boot rebuilds).
+fn buildSubstituters(allocator: std.mem.Allocator, cache_dir: []const u8, extra_subs: []const u8, base_root: ?[]const u8) ?[]const u8 {
+	const base = base_root orelse "";
+	if (base.len > 0 and extra_subs.len > 0)
+		return std.fmt.allocPrint(allocator, "local?root={s}&read-only=true file://{s} {s}", .{ base, cache_dir, extra_subs }) catch null;
+	if (base.len > 0)
+		return std.fmt.allocPrint(allocator, "local?root={s}&read-only=true file://{s}", .{ base, cache_dir }) catch null;
+	if (extra_subs.len > 0)
+		return std.fmt.allocPrint(allocator, "file://{s} {s}", .{ cache_dir, extra_subs }) catch null;
+	return std.fmt.allocPrint(allocator, "file://{s}", .{cache_dir}) catch null;
+}
+
 /// The container backend's local brain pre-build (the offline-boot counterpart
 /// of prebuildAndPushRunner). Runs only when cogworx's container backend requests
 /// it: COGBOX_BRAIN_PUSH_LOCAL == "1". Unlike the VM path there is NO remote push
@@ -1146,12 +1185,13 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 
 	// Combine the per-instance file:// cache with any remote substituters so the
 	// brain's transitive nixpkgs deps (e.g. the plugin tools' closure) substitute
-	// rather than build from source at add-time.
+	// rather than build from source at add-time. the base-store substitution:
+	// when cogworx RO-mounted the node-shared CoW lower (COGBOX_BASE_STORE_ROOT,
+	// CoW mode), prefer it for base paths over local disk; absent/unseeded =>
+	// null => today's shared-cache-only path (a cache miss, never a failure).
+	const base_root = baseStoreRoot(ctx);
 	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
-	const substituters = blk: {
-		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
-		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return;
-	};
+	const substituters = buildSubstituters(allocator, ctx.cache_dir, extra_subs, base_root) orelse return;
 	defer allocator.free(substituters);
 
 	const out = nix.buildBrain(allocator, ctx.io, env, .{
@@ -1162,6 +1202,7 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 		.substituters = substituters,
 		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
 		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
+		.base_store_root = base_root orelse "",
 	}) catch {
 		warn(ctx, "brain prebuild: build failed to launch (boot rebuilds)", .{}) catch {};
 		return;
@@ -1245,11 +1286,14 @@ fn doToplevelBuild(ctx: *const Ctx) bool {
 	};
 	const arch = @tagName(builtin_mod.cpu.arch);
 
+	// the base-store substitution: the transient stopped-add worker's /nix
+	// is COLD for the base, so substitute the container-toplevel BASE closure from the
+	// node-shared CoW lower (COGBOX_BASE_STORE_ROOT, RO-mounted by cogworx under cow)
+	// over LOCAL DISK instead of the shared cache. Absent/unseeded => null => today's
+	// shared-cache-only path (a cache miss, never a failure).
+	const base_root = baseStoreRoot(ctx);
 	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
-	const substituters = blk: {
-		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return false;
-		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return false;
-	};
+	const substituters = buildSubstituters(allocator, ctx.cache_dir, extra_subs, base_root) orelse return false;
 	defer allocator.free(substituters);
 
 	const out = nix.buildToplevel(allocator, ctx.io, env, .{
@@ -1260,6 +1304,7 @@ fn doToplevelBuild(ctx: *const Ctx) bool {
 		.substituters = substituters,
 		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
 		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
+		.base_store_root = base_root orelse "",
 	}) catch {
 		warn(ctx, "toplevel build: failed to launch (boot uses baked base)", .{}) catch {};
 		return false;
@@ -2008,4 +2053,37 @@ test "renderDeferredJson with no rules emits empty arrays" {
 	const line = try renderDeferredJson(a, "p", &.{}, &.{});
 	defer a.free(line);
 	try t.expectEqualStrings("{\"deferred\":{\"plugin\":\"p\",\"l4\":[],\"l7\":[]}}\n", line);
+}
+
+// the base-store substitution substituter-string assembly. The base
+// store (when present) goes FIRST as local?root=<r>&read-only=true so nix prefers it
+// for base paths; the per-instance file:// cache always follows; the shared cache is
+// last. Absent base store => today's file://cache string, unchanged.
+test "buildSubstituters: base store prepended, shared cache appended" {
+	const a = t.allocator;
+
+	// base store + shared cache: base first, then cache, then the shared cache.
+	{
+		const s = buildSubstituters(a, "/icd/plugin-cache", "https://cache.example.com", "/cogbox-basestore").?;
+		defer a.free(s);
+		try t.expectEqualStrings("local?root=/cogbox-basestore&read-only=true file:///icd/plugin-cache https://cache.example.com", s);
+	}
+	// base store, no shared cache: base first, then cache.
+	{
+		const s = buildSubstituters(a, "/icd/plugin-cache", "", "/cogbox-basestore").?;
+		defer a.free(s);
+		try t.expectEqualStrings("local?root=/cogbox-basestore&read-only=true file:///icd/plugin-cache", s);
+	}
+	// no base store (unseeded/absent), shared cache present: unchanged from today.
+	{
+		const s = buildSubstituters(a, "/icd/plugin-cache", "https://cache.example.com", null).?;
+		defer a.free(s);
+		try t.expectEqualStrings("file:///icd/plugin-cache https://cache.example.com", s);
+	}
+	// no base store, no shared cache: just the per-instance cache.
+	{
+		const s = buildSubstituters(a, "/icd/plugin-cache", "", null).?;
+		defer a.free(s);
+		try t.expectEqualStrings("file:///icd/plugin-cache", s);
+	}
 }

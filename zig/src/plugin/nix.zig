@@ -87,6 +87,12 @@ pub const RunnerBuild = struct {
 	substituters: []const u8,
 	trusted_public_keys: []const u8, // COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS ("" => skip)
 	netrc_file: []const u8, // COGBOX_NETRC_FILE ("" => skip)
+	// base_store_root: the node-shared CoW base store the caller prepended to
+	// `substituters` as `local?root=<base_store_root>&read-only=true` (the base-store substitution). Non-empty => append
+	// `--extra-experimental-features read-only-local-store` so nix accepts the FROZEN
+	// (chmod a-w, as the CoW-seed step leaves it) chroot store as a substituter. "" => skip
+	// (no seeded lower found; `substituters` is the shared-cache-only string).
+	base_store_root: []const u8 = "",
 };
 
 /// Build the `nix build` argv for the runner (everything after `nix
@@ -96,7 +102,9 @@ pub const RunnerBuild = struct {
 /// makes the worker-built out-path byte-identical to the one boot looks for --
 /// is unit-testable. The returned slice and every interpolated string it owns
 /// are freed by argvDeinit. Optional substituter/key/netrc knobs are appended
-/// only when non-empty (so an unconfigured worker emits no extra options).
+/// only when non-empty (so an unconfigured worker emits no extra options); a
+/// non-empty base_store_root additionally appends `--extra-experimental-features
+/// read-only-local-store` so nix accepts the frozen CoW lower as a store.
 fn runnerBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
 	return buildArgvFor(allocator, b, "", "config.microvm.declaredRunner");
 }
@@ -169,6 +177,12 @@ fn buildArgvFor(allocator: std.mem.Allocator, b: RunnerBuild, config_suffix: []c
 	}
 	if (b.netrc_file.len > 0) {
 		try argv.appendSlice(allocator, &.{ "--option", "netrc-file", b.netrc_file });
+	}
+	if (b.base_store_root.len > 0) {
+		// the base-store substitution: the base substituter in b.substituters
+		// is a FROZEN (chmod a-w) chroot store; nix only reads it as a store under this
+		// feature. Additive on top of runNix's "nix-command flakes".
+		try argv.appendSlice(allocator, &.{ "--extra-experimental-features", "read-only-local-store" });
 	}
 	return argv;
 }
@@ -633,4 +647,51 @@ test "toplevelBuildArgv: toplevel installable + boot-path override-inputs" {
 		"--max-substitution-jobs",
 		"4",
 	}, argv.items);
+}
+
+// the base-store substitution: when a node-shared CoW base store is
+// prepended to the substituters, base_store_root is set, and buildArgvFor appends
+// `--extra-experimental-features read-only-local-store` (additive on top of runNix's
+// "nix-command flakes") so nix accepts the FROZEN (chmod a-w) chroot store as a
+// substituter. It lands AFTER the substituter option pair.
+test "buildArgvFor: base_store_root appends read-only-local-store" {
+	var argv = try brainBuildArgv(t.allocator, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.plugins_flake_dir = "/pf",
+		.arch = "x86_64",
+		.substituters = "local?root=/cogbox-basestore&read-only=true file:///cache",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+		.base_store_root = "/cogbox-basestore",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try expectArgv(&.{
+		"--option",
+		"extra-substituters",
+		"local?root=/cogbox-basestore&read-only=true file:///cache",
+		"--option",
+		"require-sigs",
+		"false",
+		"--extra-experimental-features",
+		"read-only-local-store",
+	}, argv.items[10..]);
+}
+
+// The default (unset) base_store_root emits NO read-only-local-store flag, so a
+// build without a mounted lower is byte-for-byte today's argv.
+test "buildArgvFor: no base_store_root emits no read-only-local-store" {
+	var argv = try brainBuildArgv(t.allocator, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.plugins_flake_dir = "/pf",
+		.arch = "x86_64",
+		.substituters = "file:///cache",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	for (argv.items) |a| try t.expect(!std.mem.eql(u8, a, "read-only-local-store"));
 }
