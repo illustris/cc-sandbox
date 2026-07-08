@@ -2051,6 +2051,10 @@
 				nativeBuildInputs = [ pkgs.python3 ];
 			} ''
 				cp ${./l7-mitm-addon.py} l7-mitm-addon.py
+				# The single-source stub-token / no-env-stub assertions read these
+				# from ../ relative to tests/; stage them so the check can grep them.
+				cp ${./cogbox-launch.sh} cogbox-launch.sh
+				cp ${./flake.nix} flake.nix
 				mkdir tests
 				cp ${./tests/test_l7_addon.py} tests/test_l7_addon.py
 				python3 tests/test_l7_addon.py

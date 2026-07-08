@@ -1438,11 +1438,17 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token 
     # Config-driven injection end-to-end, with the token now redacted in the
     # guest: guest sends the stub Bearer; the addon overwrites it with the real
     # host-side token (anthropic-oauth). Origin echoes the Authorization.
+    # The guest MUST present its stubbed primary identity (the placeholder the
+    # launcher redacted into its cred file): the auto-generated inject-conf carries
+    # a stub_token, so should_inject only re-stamps a request bearing the stub (or
+    # no credential) -- any other bearer is treated as a legitimate secondary
+    # credential and passed through. An arbitrary Bearer would (correctly) NOT be
+    # injected, so this check must send the stub, matching what the harness does.
     machine.wait_until_succeeds(
         as_user("cogbox ssh --name injauto " + shlex.quote(
             "curl -sS --max-time 12 --cacert /run/cogbox/ca-bundle.crt "
             "--resolve api.anthropic.com:443:203.0.113.5 "
-            "-H 'Authorization: Bearer garbage' -H 'x-api-key: guest-key' "
+            "-H 'Authorization: Bearer " + stub + "' -H 'x-api-key: guest-key' "
             "https://api.anthropic.com/v1/x | grep -q 'auth=Bearer " + fake_tok + "'")),
         timeout=20,
     )
