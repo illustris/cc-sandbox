@@ -759,7 +759,8 @@ pub const L7RuleSet = struct {
 /// stay end-to-end (never decrypted by the host proxy). The operator must
 /// still `allow` these; this only governs the tier, not allow/deny. An
 /// explicit per-host `--terminate` overrides it. Provider-agnostic harnesses
-/// (e.g. opencode) should `--passthrough` their configured provider host.
+/// (opencode, pi, hermes-agent) should `--passthrough` their configured
+/// provider host.
 /// Note: new instances seed an explicit `terminate`+inject rule for the
 /// provider hosts of harnesses you're logged into (cogbox-launch.sh), which
 /// wins over this fallback; the auto-passthrough below then applies only to

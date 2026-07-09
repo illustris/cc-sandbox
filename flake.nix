@@ -717,11 +717,39 @@
 					${linkInto "$out/opencode/agents" ".md" agents}
 					${linkInto "$out/opencode/commands" ".md" commands}
 					cp ${opencodeConfig} $out/opencode.json
-				'' + lib.optionalString (harnesses ? "codex") ''
+				'' + lib.optionalString (harnesses ? "codex" || harnesses ? "pi") ''
+					# The agentskills.io project layout, read natively by BOTH codex
+					# (~/.agents/skills) and pi (.agents/skills in cwd/ancestors) --
+					# one tree serves whichever of the two is enabled.
 					mkdir -p $out/agents/skills
 					${linkInto "$out/agents/skills" "" skills}
 					ln -s ${indexSkill} $out/agents/skills/cogbox-plugins
+				'' + lib.optionalString (harnesses ? "codex") ''
 					${lib.optionalString (codexConfigAttrs != {}) "mkdir -p $out/codex && cp ${codexConfig} $out/codex/config.toml"}
+				'' + lib.optionalString (harnesses ? "hermes-agent") ''
+					# Hermes has no project-level skill discovery -- it only loads
+					# $HERMES_HOME/skills (same agentskills.io SKILL.md format). The
+					# materialize oneshot links these into /root/.hermes/skills; the
+					# writes land in the per-instance overlay upper, never the host.
+					mkdir -p $out/hermes/skills
+					${linkInto "$out/hermes/skills" "" skills}
+					ln -s ${indexSkill} $out/hermes/skills/cogbox-plugins
+				'' + lib.optionalString (rules != {}) ''
+					# Harness-neutral rules digest: pi and hermes auto-inject an
+					# AGENTS.md found in the cwd, and codex reads it natively -- none
+					# of them has a native per-file rules dir like claude-code's
+					# .claude/rules. Concatenate the merged rules into one AGENTS.md,
+					# linked into ~/work only-if-absent by the materialize oneshot.
+					# Path-scoped rules (paths: frontmatter) become always-on here,
+					# same trade-off as opencode's instructions glob; the frontmatter
+					# block itself is stripped (it is routing metadata, not prompt).
+					{
+						for f in $out/rules/*.md; do
+							echo "<!-- cogbox rule: $(basename "$f" .md) -->"
+							awk 'NR==1 && $0=="---" {fm=1; next} fm && $0=="---" {fm=0; next} !fm' "$f"
+							echo
+						done
+					} > $out/AGENTS.md
 				'' + lib.optionalString (cfg.packages != []) ''
 					# Plugin tools on PATH: the container's brain-materialize prepends
 					# $out/bin (via /root/work/.cogbox/brain/bin) to the guest PATH. On
@@ -815,11 +843,33 @@
 					linkleaves "$brain/opencode/agents"   "$WORK/.opencode/agents"
 					linkleaves "$brain/opencode/commands" "$WORK/.opencode/commands"
 
-					# codex: skills under ~/.agents/skills; global config.toml only if absent
+					# codex + pi: skills under .agents/skills (codex resolves it from
+					# ~, pi from cwd/ancestors -- the launchers cd to ~/work, and
+					# /root/work -> $WORK, so both see this same tree). codex global
+					# config.toml only if absent.
 					linkleaves "$brain/agents/skills" "$WORK/.agents/skills"
 					if [ -e "$brain/codex/config.toml" ] && [ ! -e /root/.codex/config.toml ]; then
 						mkdir -p /root/.codex
 						install -m600 "$brain/codex/config.toml" /root/.codex/config.toml || true
+					fi
+
+					# hermes-agent: skills only load from $HERMES_HOME/skills (no
+					# project-level discovery). Child symlinks land in the per-
+					# instance overlay upper, so the host's ~/.hermes is untouched
+					# and hermes's own (self-created) skills coexist alongside.
+					linkleaves "$brain/hermes/skills" /root/.hermes/skills
+
+					# Harness-neutral AGENTS.md (pi + hermes inject it from the cwd,
+					# codex reads it natively): linked THROUGH the stable brain path
+					# so it tracks brain rebuilds, and only-if-absent so a user's own
+					# AGENTS.md is never clobbered. A dangling link that is ours
+					# (rules removed by a plugin change) is dropped, not left broken.
+					if [ -L "$WORK/AGENTS.md" ] && [ ! -e "$WORK/AGENTS.md" ] \
+						&& [ "$(readlink "$WORK/AGENTS.md")" = ".cogbox/brain/AGENTS.md" ]; then
+						rm -f "$WORK/AGENTS.md"
+					fi
+					if [ -e "$brain/AGENTS.md" ] && [ ! -e "$WORK/AGENTS.md" ]; then
+						ln -sfn .cogbox/brain/AGENTS.md "$WORK/AGENTS.md"
 					fi
 				'';
 
@@ -1202,7 +1252,10 @@
 						before = [ "multi-user.target" "sshd.service" ];
 						after = [ stateUnit ]
 							++ lib.optional isContainer "cogbox-init.service"
-							++ lib.optional (isVm && harnesses ? "codex") "${utils.escapeSystemdPath "/root/.codex"}.mount";
+							++ lib.optional (isVm && harnesses ? "codex") "${utils.escapeSystemdPath "/root/.codex"}.mount"
+							# hermes skills are linked INTO /root/.hermes (overlay upper);
+							# linking before the mount would land them on the covered rootfs.
+							++ lib.optional (isVm && harnesses ? "hermes-agent") "${utils.escapeSystemdPath "/root/.hermes"}.mount";
 						requires = [ stateUnit ];
 						serviceConfig = {
 							Type = "oneshot";

@@ -291,6 +291,18 @@ NIX_EOF"""))
     machine.succeed(as_user(
         "cogbox ssh 'sed -n 1p /var/lib/cogbox/work/.claude/skills/cogbox-plugins/SKILL.md | grep -qx -- ---'"
     ))
+    # The codex/pi-shared .agents/skills tree is built whenever EITHER
+    # harness is enabled (pi is, by default -- previously this tree only
+    # existed with codex opted in), and hermes's skills land inside its
+    # home overlay upper. A plugin-less brain has no rules, so no
+    # AGENTS.md digest is linked into ~/work.
+    machine.succeed(as_user(
+        "cogbox ssh 'test -f /var/lib/cogbox/work/.agents/skills/cogbox-plugins/SKILL.md'"
+    ))
+    machine.succeed(as_user(
+        "cogbox ssh 'test -f /root/.hermes/skills/cogbox-plugins/SKILL.md'"
+    ))
+    machine.succeed(as_user("cogbox ssh 'test ! -e /root/work/AGENTS.md'"))
     # Claude workspace trust is pre-accepted for the new workdir.
     machine.succeed(as_user(
         "cogbox ssh 'grep -q /var/lib/cogbox/work /root/.claude.json'"
