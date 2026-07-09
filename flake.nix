@@ -333,7 +333,12 @@
 					config = {
 						boot.isContainer = true;
 						system.stateVersion = "25.11";
-						users.users.root.password = "";
+						# No empty (or any) root password on the container: console
+						# access is `kubectl exec` (a fresh process, no auth), and the
+						# certificate-authenticated sshd must never fall through to a
+						# password. Lock the account (`!`) instead of the VM's empty
+						# password. mkForce guards against a plugin's full NixOS module.
+						users.users.root.hashedPassword = lib.mkForce "!";
 						# Land login + non-login shells in ~/work, same as the VM
 						# (mkForce: no plugin appends a competing cd). Falls back to
 						# /root (NOT COGBOX_DATA, which holds cogbox_ed25519 +
@@ -1104,17 +1109,67 @@
 					source ${config.system.build.earlyMountScript}
 				'');
 
-				services.openssh.enable = lib.mkIf isVm true;
-				# `cogbox ssh` pins to a single key with IdentitiesOnly +
-				# IdentityAgent=none (see zig/src/cli/verbs/ssh.zig), so its
-				# default path makes exactly one auth attempt and can't exhaust
-				# the limit. The generous cap is kept for the --no-auto-keys
-				# opt-out path, where ssh falls back to the user's agent and
-				# ~/.ssh keys and a busy agent could otherwise burn through the
-				# default 6 attempts before a working key is reached. This guest
-				# is a local, ephemeral, single-user sandbox (sshd bound to
-				# 127.0.0.1), so a generous cap is safe.
-				services.openssh.settings.MaxAuthTries = lib.mkIf isVm 50;
+				# Enabled on BOTH targets. The VM keeps its historical loopback
+				# key-auth path (see below); the container adds a
+				# certificate-authenticated sshd the cogworx SSH gateway dials with
+				# a short-lived user cert (cogbox-sshd-ca staging the CA + principals).
+				services.openssh.enable = true;
+				# Auth hardening forced on BOTH targets. root has an EMPTY password on
+				# the guest (VM serial-console UX), so password/empty-password/keyboard-
+				# interactive auth MUST be unusable over the wire; root logs in by key
+				# (VM) or user cert (container) only. mkForce so a NixOS default or a
+				# plugin's full NixOS module can never re-enable them.
+				services.openssh.settings = {
+					PasswordAuthentication = lib.mkForce false;
+					KbdInteractiveAuthentication = lib.mkForce false;
+					PermitEmptyPasswords = lib.mkForce false;
+					PermitRootLogin = lib.mkForce "prohibit-password";
+					# `cogbox ssh` pins to a single key with IdentitiesOnly +
+					# IdentityAgent=none (see zig/src/cli/verbs/ssh.zig), so its
+					# default path makes exactly one auth attempt and can't exhaust
+					# the limit. The generous cap is kept for the --no-auto-keys
+					# opt-out path, where ssh falls back to the user's agent and
+					# ~/.ssh keys and a busy agent could otherwise burn through the
+					# default 6 attempts before a working key is reached. This guest
+					# is a local, ephemeral, single-user sandbox (sshd bound to
+					# 127.0.0.1), so a generous cap is safe. The container gets a tight
+					# cap below.
+					MaxAuthTries = lib.mkIf isVm 50;
+				} // lib.optionalAttrs isContainer {
+					# The gateway authenticates with a user certificate signed by a
+					# cogworx-held CA; trust that CA and require the cert's principal
+					# to match this instance (AuthorizedPrincipalsFile lists exactly
+					# the instance name, written by cogbox-sshd-ca). The VM path keeps
+					# plain authorized_keys and gets NEITHER of these keys.
+					TrustedUserCAKeys = "/etc/ssh/trusted_user_ca.pub";
+					AuthorizedPrincipalsFile = "/etc/ssh/principals/%u";
+					# The gateway only needs local (client-initiated) port forwards to
+					# reach in-sandbox services; deny everything else.
+					AllowTcpForwarding = "local";
+					AllowStreamLocalForwarding = "no";
+					GatewayPorts = "no";
+					X11Forwarding = false;
+					AllowAgentForwarding = false;
+					PermitTunnel = "no";
+					MaxAuthTries = 3;
+					LoginGraceTime = 20;
+					ClientAliveInterval = 30;
+					ClientAliveCountMax = 4;
+					AllowUsers = [ "root" ];
+				};
+				# Container sshd binds all interfaces so the gateway pod can reach it;
+				# the VM keeps the module default (reached only via the QEMU loopback
+				# forward on 127.0.0.1:2222).
+				services.openssh.listenAddresses = lib.mkIf isContainer [
+					{ addr = "0.0.0.0"; port = 22; }
+				];
+				# Persist the container host key on the per-instance state PVC so the
+				# gateway's host-key pin survives restarts (cogbox-container-state /
+				# cogbox-sshd-ca create the dir 0700 before sshd's keygen runs). The
+				# VM keeps ephemeral keys in /etc/ssh (module default).
+				services.openssh.hostKeys = lib.mkIf isContainer [
+					{ type = "ed25519"; path = "${stateRoot}/ssh/ssh_host_ed25519_key"; }
+				];
 
 				environment.systemPackages = with pkgs; [
 					git
@@ -1549,7 +1604,10 @@
 							RemainAfterExit = true;
 							ExecStart = pkgs.writeShellScript "cogbox-container-state" ''
 								set -e
-								mkdir -p ${cogboxData} ${stateRoot}/config /run/cogbox
+								mkdir -p ${cogboxData} ${stateRoot}/config ${stateRoot}/ssh /run/cogbox
+								# sshd writes the persisted host key here (0700 so the
+								# private key is not group/world readable).
+								chmod 700 ${stateRoot}/ssh
 								ln -sfn ${cogboxData} /var/lib/cogbox
 							'';
 						};
@@ -1605,6 +1663,52 @@
 								"COGBOX_DATA=${cogboxData}"
 							];
 							ExecStart = claudeStubScript;
+						};
+					};
+
+					# Container backend: install the SSH user-CA trust anchor and this
+					# instance's authorized-principals file BEFORE sshd starts. The
+					# gateway presents a short-lived user certificate signed by the
+					# cogworx-held CA; sshd (TrustedUserCAKeys) verifies the signature
+					# and (AuthorizedPrincipalsFile) that the cert carries this
+					# instance's name as a principal. Fail closed: if the CA is not
+					# supplied no anchor is written (no cert can validate); if the
+					# instance name is empty the principals file is empty (no principal
+					# matches). sshd reads both files at connection time, so ordering
+					# this unit before sshd is sufficient.
+					cogbox-sshd-ca = lib.mkIf isContainer {
+						description = "Install the SSH user-CA trust anchor + per-instance principals (container backend)";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "sshd.service" ];
+						after = [ "cogbox-container-state.service" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							# systemd does not forward PID1's env; the pod sets these and
+							# they are passed through explicitly (mirrors COGBOX_INSTANCE
+							# elsewhere).
+							PassEnvironment = [ "COGBOX_SSH_CA_PUB" "COGBOX_SSH_PRINCIPAL" "COGBOX_INSTANCE" ];
+							ExecStart = pkgs.writeShellScript "cogbox-sshd-ca" ''
+								set -eu
+								mkdir -p /etc/ssh/principals ${stateRoot}/ssh
+								chmod 700 ${stateRoot}/ssh
+								ca="''${COGBOX_SSH_CA_PUB:-}"
+								if [ -n "$ca" ]; then
+									printf '%s\n' "$ca" > /etc/ssh/trusted_user_ca.pub
+									chmod 644 /etc/ssh/trusted_user_ca.pub
+								fi
+								# Exactly one principal, keyed on a GLOBALLY-UNIQUE id
+								# (cogworx sets COGBOX_SSH_PRINCIPAL to the full instance ID,
+								# accountID-name). Falls back to the bare COGBOX_INSTANCE name
+								# only if the manifest has not set it yet -- but note the bare
+								# name is unique only per-account, so a shared CA + bare-name
+								# principal would let a captured cert replay across tenants;
+								# the dedicated principal env closes that. Empty when neither
+								# is set -> no cert principal can match -> sshd denies.
+								principal="''${COGBOX_SSH_PRINCIPAL:-''${COGBOX_INSTANCE:-}}"
+								printf '%s\n' "$principal" > /etc/ssh/principals/root
+								chmod 644 /etc/ssh/principals/root
+							'';
 						};
 					};
 				};
