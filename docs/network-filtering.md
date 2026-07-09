@@ -252,7 +252,7 @@ Documented, not silently assumed safe:
 
 ## Host-side credential injection
 
-By default, cogbox inherits the harness's auth from the host by mounting the host's credential files into the guest (see [harnesses](harnesses.md)). Those files carry the agent's long-lived secrets -- for the OAuth harnesses, an `accessToken` **and a `refreshToken`** (in `~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.local/share/opencode/auth.json`). A compromised or prompt-injected agent inside the sandbox can read them, so the credential -- including the refresh token, which mints fresh access tokens indefinitely -- can be exfiltrated and reused off-box, long after the instance is gone.
+By default, cogbox inherits the harness's auth from the host by mounting the host's credential files into the guest (see [harnesses](harnesses.md)). Those files carry the agent's long-lived secrets -- for the OAuth harnesses, an `accessToken` **and a `refreshToken`** (in `~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.local/share/opencode/auth.json`, `~/.pi/agent/auth.json`); for hermes-agent, the provider API keys in `~/.hermes/.env`. A compromised or prompt-injected agent inside the sandbox can read them, so the credential -- including the refresh token, which mints fresh access tokens indefinitely -- can be exfiltrated and reused off-box, long after the instance is gone.
 
 Host-side credential injection removes the secret from the sandbox. Because the terminate tier already MITMs a host's TLS host-side, the proxy can **rewrite the request's auth header** with the real token read from the host's own credential file -- so the guest only ever carries a stub, and the real token (especially the refresh token) never crosses the 9p / fw_cfg boundary into the VM.
 

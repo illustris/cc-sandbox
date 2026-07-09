@@ -178,12 +178,20 @@ H_KIND[opencode:state]=ephemeral
 H_KIND[codex:home]=overlay
 H_HOST[codex:home]="${COGBOX_CODEX_HOME:-$REAL_HOME/.codex}"
 
+H_KIND[hermes-agent:home]=overlay
+H_HOST[hermes-agent:home]="${COGBOX_HERMES_HOME:-$REAL_HOME/.hermes}"
+
+H_KIND[pi:home]=overlay
+H_HOST[pi:home]="${COGBOX_PI_HOME:-$REAL_HOME/.pi}"
+
 # Path keys per harness, in declared order.
 harness_pathkeys() {
 	case "$1" in
 		claude-code) printf '%s\n' config auth ;;
 		opencode) printf '%s\n' config data cache state ;;
 		codex) printf '%s\n' home ;;
+		hermes-agent) printf '%s\n' home ;;
+		pi) printf '%s\n' home ;;
 	esac
 }
 
@@ -194,6 +202,8 @@ harness_summary() {
 		claude-code) echo "creates ~/.claude/, ~/.claude.json" ;;
 		opencode)    echo "creates ~/.config/opencode/, ~/.local/share/opencode/" ;;
 		codex)       echo "creates ~/.codex/" ;;
+		hermes-agent) echo "creates ~/.hermes/" ;;
+		pi)           echo "creates ~/.pi/" ;;
 	esac
 }
 

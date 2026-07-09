@@ -115,6 +115,8 @@ with subtest("Phase A: CLI / state without booting"):
     machine.succeed("test -d /home/testuser/.claude")
     machine.succeed("test -d /home/testuser/.config/opencode")
     machine.succeed("test -d /home/testuser/.local/share/opencode")
+    machine.succeed("test -d /home/testuser/.hermes")
+    machine.succeed("test -d /home/testuser/.pi")
     # codex is opt-in and not built by default, so its host dir is NOT seeded.
     machine.fail("test -d /home/testuser/.codex")
     machine.succeed(
@@ -124,6 +126,7 @@ with subtest("Phase A: CLI / state without booting"):
         "cat /home/testuser/.local/share/cogbox/instances/default/.config/active-harnesses"
     ).strip().splitlines()
     assert "claude-code" in active and "opencode" in active, active
+    assert "hermes-agent" in active and "pi" in active, active
     assert "codex" not in active, active
     # Old top-level default config must NOT be created any more.
     machine.fail("test -e /home/testuser/.config/cogbox/config.json")
@@ -597,6 +600,9 @@ with subtest("Phase F: opencode harness wired into the VM (codex opt-in, exclude
     c_path = machine.succeed(as_user("cogbox ssh 'command -v c'")).strip()
     oc_path = machine.succeed(as_user("cogbox ssh 'command -v oc'")).strip()
     assert c_path and oc_path, (c_path, oc_path)
+    h_path = machine.succeed(as_user("cogbox ssh 'command -v h'")).strip()
+    p_path = machine.succeed(as_user("cogbox ssh 'command -v p'")).strip()
+    assert h_path and p_path, (h_path, p_path)
     # codex is opt-in (disabled by default), so its `cx` launcher is absent.
     machine.succeed(as_user("cogbox ssh '! command -v cx'"))
 
@@ -606,6 +612,12 @@ with subtest("Phase F: opencode harness wired into the VM (codex opt-in, exclude
     ))
     machine.succeed(as_user(
         "cogbox ssh 'mountpoint -q /root/.local/share/opencode'"
+    ))
+    machine.succeed(as_user(
+        "cogbox ssh 'mountpoint -q /root/.hermes'"
+    ))
+    machine.succeed(as_user(
+        "cogbox ssh 'mountpoint -q /root/.pi'"
     ))
     # Ephemeral paths (cache + state) bind from the harness overlay.
     machine.succeed(as_user(

@@ -13,8 +13,10 @@ prompting -- without that blast radius reaching the host.
 
 Currently supported harnesses: `claude-code`
 ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)),
-`opencode` ([opencode](https://github.com/sst/opencode)), and
-`codex` ([OpenAI Codex CLI](https://github.com/openai/codex)). Codex is
+`opencode` ([opencode](https://github.com/sst/opencode)),
+`codex` ([OpenAI Codex CLI](https://github.com/openai/codex)),
+`hermes-agent` ([Hermes Agent](https://github.com/NousResearch/hermes-agent)),
+and `pi` ([pi coding agent](https://github.com/earendil-works/pi)). Codex is
 opt-in and **disabled by default** (its Rust build is slow); enable it by
 setting `enableCodex = true` in `flake.nix`. The architecture is
 harness-agnostic; see [Harnesses](docs/harnesses.md) for the model and
@@ -60,9 +62,10 @@ symlink); once it's on your `PATH`, the two names are interchangeable
 (`cbx stop`, `cbx list`, ...).
 
 Each enabled harness ships a launcher inside the VM: `c` for
-`claude-code`, `oc` for `opencode`, `cx` for `codex`. All three binaries
-are installed unconditionally (subject to per-architecture availability),
-so once the VM boots any of them is on `$PATH`.
+`claude-code`, `oc` for `opencode`, `cx` for `codex`, `h` for
+`hermes-agent`, `p` for `pi`. All the binaries are installed
+unconditionally (subject to per-architecture availability), so once the
+VM boots any of them is on `$PATH`.
 
 ## Documentation
 
@@ -317,8 +320,9 @@ Architecture-conditional extras: `bpftrace` (x86_64, aarch64), `nix-mcp`
 - Linux host with KVM. Build targets: `x86_64-linux`, `aarch64-linux`,
   `riscv64-linux`.
 - Per-harness platform availability varies. `claude-code`, `opencode`,
-  and `codex` all come from `numtide/llm-agents.nix`, which builds them
-  for `x86_64-linux` and `aarch64-linux` only.
+  `codex`, `hermes-agent`, and `pi` all come from
+  `numtide/llm-agents.nix`, which builds them for `x86_64-linux` and
+  `aarch64-linux` only.
 - One instance per name at a time (PID lock per runtime directory).
   Multiple differently-named instances can run simultaneously.
 - The writable nix store overlay is a tmpfs -- installed packages do not

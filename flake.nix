@@ -32,7 +32,6 @@
 		nixfs = {
 			url = "github:illustris/nixfs";
 			inputs.nixpkgs.follows = "nixpkgs";
-			inputs.illustris-lib.follows = "illustris-lib";
 		};
 		# Intentionally not setting inputs.nixpkgs.follows: llm-agents.nix
 		# publishes its builds to cache.numtide.com against its own pinned
@@ -180,6 +179,57 @@
 					# matching opencode's auth-inside-data pattern.
 					home = {
 						guest = "/root/.codex";
+						kind = "overlay";
+					};
+				};
+			};
+
+			hermes-agent = {
+				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				package = inputs.llm-agents.packages.${system}.hermes-agent;
+				launcher = {
+					name = "h";
+					# `HERMES_YOLO_MODE=1` bypasses hermes's dangerous-command
+					# approval prompts (equivalent to `--yolo`, but the env var
+					# covers every subcommand -- chat, gateway, cron -- not just
+					# the ones that grow the flag). Hermes's hardline blocklist
+					# (rm -rf /, fork bombs, ...) stays active regardless; that
+					# is a code-level constant, not a prompt.
+					flags = [];
+					env = { HERMES_YOLO_MODE = "1"; };
+				};
+				paths = {
+					# Hermes keeps everything under $HERMES_HOME (default
+					# ~/.hermes): config.yaml, the .env credential file
+					# (provider API keys), skills, and session state. A single
+					# overlay covers it all, matching codex's pattern.
+					home = {
+						guest = "/root/.hermes";
+						kind = "overlay";
+					};
+				};
+			};
+
+			pi = {
+				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				package = inputs.llm-agents.packages.${system}.pi;
+				launcher = {
+					name = "p";
+					# pi has no permission system at all (documented upstream:
+					# no built-in restriction of filesystem/process/network
+					# access), so full-auto needs no flag or env -- the outer
+					# microvm sandbox is the only containment, same as the
+					# other harnesses.
+					flags = [];
+					env = {};
+				};
+				paths = {
+					# pi keeps config, auth (auth.json: per-provider API keys
+					# and OAuth tokens), models.json, settings.json, and
+					# sessions/ together under ~/.pi/agent. Mount the whole
+					# ~/.pi so sibling pi-mono tools' state is covered too.
+					home = {
+						guest = "/root/.pi";
 						kind = "overlay";
 					};
 				};

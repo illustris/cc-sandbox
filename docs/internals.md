@@ -54,6 +54,8 @@ $XDG_RUNTIME_DIR/cogbox[-<name>]/
   opencode-config        -> $COGBOX_OPENCODE_CONFIG
   opencode-data          -> $COGBOX_OPENCODE_DATA
   codex-home             -> $COGBOX_CODEX_HOME
+  hermes-agent-home      -> $COGBOX_HERMES_HOME
+  pi-home                -> $COGBOX_PI_HOME
   .harness-stubs/        # empty stubs for inactive harnesses (so QEMU
                          # 9p sources resolve even when the host has no
                          # state for a given harness)
@@ -91,7 +93,7 @@ The base module declares the `cogbox.*` option tree and folds the merged `config
 1. `cogbox-brain-materialize` creates the `~/work` (`/root/work` → `/var/lib/cogbox/work`) symlink, the `~/work/.cogbox/brain` link to the RO store derivation, and per-leaf child symlinks into each harness's real writable dirs (`.claude/skills/<s>`, `.opencode/agents/<a>.md`, `.agents/skills/<s>`, …). It only ever drops *child* symlinks, never whole-dir links, so the harness can scaffold session state alongside and peers coexist. It reads only closure-resident store paths, so it works offline.
 2. `cogbox-brain-trust` pre-accepts Claude Code workspace trust for `~/work` (both `/root/work` and the `/var/lib/cogbox/work` it resolves to) and reconciles stale pre-migration project keys.
 
-The workdir/cwd is base-owned: `programs.bash.loginShellInit` and the `c`/`oc`/`cx` launchers `cd ~/work` (the launcher also exports `OPENCODE_CONFIG` and merges `cogbox.env`). The contract has no `loginShellInit`/`cwd` surface, so a plugin cannot fight over cwd. See [plugins](plugins.md) for the full contract.
+The workdir/cwd is base-owned: `programs.bash.loginShellInit` and the harness launchers (`c`/`oc`/`cx`/`h`/`p`) `cd ~/work` (the launcher also exports `OPENCODE_CONFIG` and merges `cogbox.env`). The contract has no `loginShellInit`/`cwd` surface, so a plugin cannot fight over cwd. See [plugins](plugins.md) for the full contract.
 
 ## Network enforcement
 
@@ -111,6 +113,8 @@ Override where data lives on the host with environment variables:
 | `COGBOX_OPENCODE_CONFIG` | `$XDG_CONFIG_HOME/opencode` | Host opencode config (overlay lower in VM) |
 | `COGBOX_OPENCODE_DATA` | `$XDG_DATA_HOME/opencode` | Host opencode data (auth lives here as `auth.json`) |
 | `COGBOX_CODEX_HOME` | `$HOME/.codex` | Host codex home (config, auth, sessions; overlay lower in VM) |
+| `COGBOX_HERMES_HOME` | `$HOME/.hermes` | Host hermes-agent home (config.yaml, `.env` credentials, skills; overlay lower in VM) |
+| `COGBOX_PI_HOME` | `$HOME/.pi` | Host pi home (`agent/` holds auth.json, settings, sessions; overlay lower in VM) |
 
 ```sh
 COGBOX_DATA=/mnt/fast/cogbox nix run .

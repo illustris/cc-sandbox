@@ -1,6 +1,6 @@
 # Harnesses
 
-A *harness* is a coding-agent CLI that cogbox installs in the guest and mounts host state for. The currently-supported harnesses are `claude-code` (launcher: `c`), `opencode` (launcher: `oc`), and `codex` (launcher: `cx`). Codex is opt-in and disabled by default (its Rust build is slow) -- set `enableCodex = true` in `flake.nix` to build it in. When a harness is not built in, its launcher, mounts, and host-state seeding are all omitted (the launcher's `HARNESSES` list is generated from the same `mkHarnesses` set).
+A *harness* is a coding-agent CLI that cogbox installs in the guest and mounts host state for. The currently-supported harnesses are `claude-code` (launcher: `c`), `opencode` (launcher: `oc`), `codex` (launcher: `cx`), `hermes-agent` (launcher: `h`), and `pi` (launcher: `p`). Codex is opt-in and disabled by default (its Rust build is slow) -- set `enableCodex = true` in `flake.nix` to build it in. When a harness is not built in, its launcher, mounts, and host-state seeding are all omitted (the launcher's `HARNESSES` list is generated from the same `mkHarnesses` set).
 
 ## The harness model
 
@@ -17,6 +17,8 @@ Host state shared across all instances:
 | claude-code | `~/.claude/` | `~/.claude.json` |
 | opencode | `~/.config/opencode/` | `~/.local/share/opencode/` (includes `auth.json`) |
 | codex | `~/.codex/` | `~/.codex/` (includes `auth.json`) |
+| hermes-agent | `~/.hermes/` | `~/.hermes/` (includes `.env` with provider API keys) |
+| pi | `~/.pi/` | `~/.pi/` (includes `agent/auth.json`) |
 
 Inside the guest, host config dirs are mounted read-only (9p) as overlay lowerdirs, with each instance's writes captured in its own overlay image -- so per-instance harness settings persist independently while authentication stays shared. Single-file auth tokens are injected at boot via `fw_cfg`.
 
@@ -35,6 +37,8 @@ Independently of the shared host config above, [plugins](plugins.md) contribute 
 - `c` (claude-code) sets `IS_SANDBOX=1` and passes `--dangerously-skip-permissions`.
 - `oc` (opencode) sets `OPENCODE_PERMISSION='{"edit":"allow","bash":"allow","webfetch":"allow","doom_loop":"allow","external_directory":"allow"}'`. Opencode `JSON.parse`s that env var and merges it into `config.permission`. As of opencode 1.16.2 the value must be the object form keyed by permission category (`edit`/`bash`/`webfetch`/`doom_loop`/`external_directory`, each `ask|allow|deny`; `bash` may also be a `{pattern: action}` map) -- the old bare-string shorthand `"allow"` is rejected with a fatal `ConfigInvalidError` (the schema indexes the string char-by-char: `Expected PermissionAction, got "a"`), which blocks startup. Setting every category to `allow` matches every tool/pattern so opencode never prompts. opencode's own `--dangerously-skip-permissions` flag exists only on the `run` subcommand (one-shot mode) and is rejected by the default TUI command's strict yargs parser, so the env-var path is the universal bypass.
 - `cx` (codex) sets `IS_SANDBOX=1` and passes `--dangerously-bypass-approvals-and-sandbox`, codex's documented escape hatch that skips all confirmation prompts and disables codex's own command sandbox. The outer microvm provides the actual sandbox.
+- `h` (hermes-agent) sets `HERMES_YOLO_MODE=1`, which bypasses hermes's dangerous-command approval prompts. The env var is equivalent to the `--yolo` flag but covers every subcommand (chat, gateway, cron). Hermes's hardline blocklist (`rm -rf /`, fork bombs, disk formatting) stays active regardless -- it is a code-level constant, not a prompt.
+- `p` (pi) needs no flag or env var: pi has no built-in permission system at all (documented upstream), so it never prompts. The outer microvm is the only containment, same as the other harnesses.
 
 ## Adding a new harness
 
