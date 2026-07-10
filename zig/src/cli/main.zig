@@ -148,7 +148,16 @@ pub fn main(init: std.process.Init) !void {
 			(std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
 		else
 			false;
-		return l7proxy_module.run(allocator, rest[0], base, accept_mode, listen_addr, funnel_all);
+		// COGBOX_L7_PEEK_MS: fast-path classification-peek deadline (ms) for the
+		// raw-L4-eligible silent-client case (SSH/SMTP/...). Default 300. Fail-safe
+		// both directions in run(): an unparseable/non-positive value falls back to
+		// the default (never uncaps the peek), and a tiny positive value is floored
+		// (never small enough to skip classifying a prompt client).
+		const peek_ms: i32 = if (env.get("COGBOX_L7_PEEK_MS")) |v|
+			(std.fmt.parseInt(i32, v, 10) catch 300)
+		else
+			300;
+		return l7proxy_module.run(allocator, rest[0], base, accept_mode, listen_addr, funnel_all, peek_ms);
 	}
 	if (std.mem.eql(u8, verb, "__divertshim")) {
 		// The separate-pod enforcer's in-pod nft-REDIRECT shim. Listens on

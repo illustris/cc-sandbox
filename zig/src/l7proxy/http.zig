@@ -91,6 +91,59 @@ pub fn parseRequestHead(buf: []const u8, out_host: []u8, out_path: []u8) ParseRe
 	return .{ .ok = .{ .host = out_host[0..host.len], .path = norm } };
 }
 
+pub const Precheck = enum { plausible, deny };
+
+/// Fail-fast "could these bytes still become an HTTP/1.x request line?" check for
+/// the peek classifier, run on the bytes buffered so far each recv iteration.
+/// Its whole job is to reject a non-HTTP server-speaks-first flow (e.g. an SSH
+/// banner "SSH-2.0-...") the instant a byte can't belong to a request line --
+/// WITHOUT waiting for a complete head, which for such a flow never arrives and
+/// would otherwise cost the entire peek timeout. It never rejects genuine HTTP:
+/// an incomplete-but-plausible prefix returns .plausible and parseRequestHead
+/// makes the real (byte-identical) decision.
+pub fn requestLinePrecheck(buf: []const u8) Precheck {
+	// Method: 1..16 uppercase-ASCII bytes terminated by a single SP. Reject the
+	// moment a byte can't be part of that -- "SSH-2.0-..." trips on the '-' at
+	// offset 3, long before any CRLF.
+	var i: usize = 0;
+	while (i < buf.len) : (i += 1) {
+		const ch = buf[i];
+		if (ch == ' ') {
+			if (i == 0) return .deny; // empty method
+			break; // method [0..i] complete; validate the rest below
+		}
+		if (ch < 'A' or ch > 'Z') return .deny;
+		if (i >= 16) return .deny; // method exceeds 16 bytes without an SP
+	}
+	if (i >= buf.len) {
+		// No SP seen yet: still a plausible in-progress method. Guard only against
+		// an unbounded first line that never terminates (mirrors parseRequestHead).
+		if (buf.len > max_head) return .deny;
+		return .plausible;
+	}
+
+	// buf[i] == ' ': the method is valid. Wait for a full request line before
+	// validating its shape; until then the prefix stays plausible.
+	const eol = std.mem.indexOf(u8, buf, "\r\n") orelse {
+		if (buf.len > max_head) return .deny;
+		return .plausible;
+	};
+	const line = buf[0..eol];
+
+	// Full request line present: validate METHOD SP TARGET SP HTTP/1.x, mirroring
+	// parseRequestHead's request-line checks. A shape violation here means this
+	// was never HTTP -> deny (parseRequestHead would reject it too).
+	var rl = std.mem.splitScalar(u8, line, ' ');
+	const method = rl.next() orelse return .deny;
+	const target = rl.next() orelse return .deny;
+	const version = rl.next() orelse return .deny;
+	if (rl.next() != null) return .deny; // extra tokens
+	if (!isValidMethod(method)) return .deny;
+	if (target.len == 0) return .deny;
+	if (!std.mem.startsWith(u8, version, "HTTP/1.")) return .deny;
+	return .plausible;
+}
+
 fn isValidMethod(m: []const u8) bool {
 	if (m.len == 0 or m.len > 16) return false;
 	for (m) |ch| {
@@ -276,6 +329,38 @@ test "parse need_more on partial head" {
 	var oh: [256]u8 = undefined;
 	var op: [256]u8 = undefined;
 	try t.expect(parse("GET / HTTP/1.1\r\nHost: a.te", &oh, &op) == .need_more);
+}
+
+test "precheck: SSH banner denied (full and partial, no CRLF needed)" {
+	// The bug this fixes: an SSH banner starts with an uppercase 'S', so
+	// isHttpStart routes it here; the precheck must deny it without waiting for a
+	// CRLF that never comes.
+	try t.expect(requestLinePrecheck("SSH-2.0-OpenSSH_9.9\r\n") == .deny);
+	try t.expect(requestLinePrecheck("SSH-") == .deny); // denied on the '-' alone
+}
+
+test "precheck: plausible in-progress prefixes are not rejected" {
+	try t.expect(requestLinePrecheck("SS") == .plausible); // partial method
+	try t.expect(requestLinePrecheck("GET / HT") == .plausible); // partial version
+	try t.expect(requestLinePrecheck("GET / HTTP/1.1\r\n") == .plausible); // line ok, head not done
+}
+
+test "precheck: malformed request lines denied" {
+	try t.expect(requestLinePrecheck("ABCDEFGHIJKLMNOPQ /x HTTP/1.1\r\n") == .deny); // 17-char method
+	try t.expect(requestLinePrecheck("GET /x HTTP/1.1 extra\r\n") == .deny); // extra token
+	try t.expect(requestLinePrecheck("GET /x FTP/1.1\r\n") == .deny); // not HTTP/1.
+	try t.expect(requestLinePrecheck(" /x HTTP/1.1\r\n") == .deny); // empty method
+}
+
+test "precheck: genuine methods up to 16 bytes stay plausible" {
+	try t.expect(requestLinePrecheck("GET / HTTP/1.1\r\n") == .plausible);
+	try t.expect(requestLinePrecheck("ABCDEFGHIJKLMNOP / HTTP/1.1\r\n") == .plausible); // exactly 16
+}
+
+test "precheck: a lowercase first byte is out of scope (isHttpStart gates it)" {
+	// peekClassify only calls the precheck when isHttpStart(buf[0]) is true, so a
+	// lowercase-led flow never reaches here. Documented: it would deny anyway.
+	try t.expect(requestLinePrecheck("ssh-2.0\r\n") == .deny);
 }
 
 test "normalizePath root and pops past root" {

@@ -33,11 +33,24 @@ const c = @cImport({
 	@cInclude("netinet/in.h");
 	@cInclude("netdb.h");
 	@cInclude("sys/time.h");
+	@cInclude("time.h"); // clock_gettime / struct timespec for the peek deadline
 	@cInclude("poll.h");
 	@cInclude("unistd.h");
 	@cInclude("errno.h");
 	@cInclude("string.h");
 });
+
+// CLOCK_MONOTONIC (numeric per the stable Linux ABI; not surfaced as a named
+// constant by the time.h cImport under our FORTIFY-disabled translate-c).
+const CLOCK_MONOTONIC: c_int = 1;
+
+/// Monotonic milliseconds, used only to bound the fast-path classification peek.
+/// Monotonic (not wall-clock) so a clock step can't lengthen or shorten it.
+pub fn monotonicMs() i64 {
+	var ts: c.struct_timespec = std.mem.zeroes(c.struct_timespec);
+	_ = c.clock_gettime(CLOCK_MONOTONIC, &ts);
+	return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), std.time.ns_per_ms);
+}
 
 // open(2) -- declared directly to dodge fcntl.h's FORTIFY macros (same
 // reasoning as the netfilter shim).
@@ -68,6 +81,32 @@ const relay_buf: usize = 32 * 1024;
 const io_timeout_secs: i32 = 15;
 const relay_idle_ms: c_int = 120_000;
 const max_conns: usize = 512;
+
+// Fast-path classification-peek deadline (ms) for the raw-L4-eligible silent
+// server-speaks-first case (SSH/SMTP/...). Overridable via COGBOX_L7_PEEK_MS.
+// 300ms comfortably covers a real TLS ClientHello / HTTP request (both arrive in
+// the first RTT) while bounding a silent client that would otherwise hold the
+// peek for the full io_timeout_secs before falling through to the raw-L4 splice.
+// Set once in run(); read by worker(). Applies ONLY when a raw-L4 splice to the
+// flow's dst would be allowed anyway (see worker) -- never on the L7/hostname
+// path, where classification is the flow's only way forward.
+const peek_fast_ms_default: i32 = 300;
+// Lower bound for a COGBOX_L7_PEEK_MS override. A real TLS ClientHello / HTTP
+// request lands within the first RTT, so 50ms is comfortably enough to classify
+// a prompt client on the fast path; flooring here stops an operator typo from
+// shrinking the deadline so far that a legitimate first-flight is cut off.
+const peek_fast_ms_floor: i32 = 50;
+var peek_fast_ms: i32 = peek_fast_ms_default;
+
+/// Sanitize a COGBOX_L7_PEEK_MS override into the effective fast-path deadline.
+/// Fail-safe both directions: a non-positive value would UNCAP the peek (a silent
+/// client stalls the full io_timeout_secs) -> fall back to the default; a tiny
+/// positive value (an operator typo like 5) would effectively skip classifying a
+/// prompt client on the fast path -> floor it at peek_fast_ms_floor.
+pub fn clampPeekMs(peek_ms: i32) i32 {
+	if (peek_ms <= 0) return peek_fast_ms_default;
+	return @max(peek_ms, peek_fast_ms_floor);
+}
 
 // --- shared state ---
 var runtime_dir_buf: [4096]u8 = undefined;
@@ -127,7 +166,7 @@ fn unlockRules() void {
 var reload_pending = std.atomic.Value(bool).init(false);
 var conn_count = std.atomic.Value(usize).init(0);
 
-pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: AcceptMode, listen_addr: u32, funnel: bool) !void {
+pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: AcceptMode, listen_addr: u32, funnel: bool, peek_ms: i32) !void {
 	if (runtime_dir.len >= runtime_dir_buf.len) return error.PathTooLong;
 	@memcpy(runtime_dir_buf[0..runtime_dir.len], runtime_dir);
 	runtime_dir_len = runtime_dir.len;
@@ -135,6 +174,7 @@ pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: Ac
 	accept_mode = mode;
 	listen_addr_host = listen_addr;
 	funnel_all = funnel;
+	peek_fast_ms = clampPeekMs(peek_ms);
 	installSignals();
 	loadRules();
 
@@ -299,7 +339,27 @@ fn worker(client_fd: c_int) void {
 	var out_path: [2048]u8 = undefined;
 	var out_sni: [256]u8 = undefined;
 	var buffered: usize = 0;
-	const cl = peekClassify(client_fd, &buf, &buffered, &out_host, &out_path, &out_sni);
+
+	// Latency heuristic ONLY -- the authoritative gate stays in rawL4Splice under
+	// the rules lock. If a raw-L4 splice to this exact orig dst would be allowed
+	// anyway (the flow's .deny arm would splice it), cap the classification peek at
+	// a short deadline: a silent server-speaks-first client (SSH/SMTP/...) sends no
+	// first byte, so classification can't progress and would otherwise stall the
+	// full io_timeout_secs before falling through to that same splice. When NOT
+	// fast-raw (the dst is reachable only via an L7/hostname rule), classification
+	// is the flow's only path forward -- keep the full blocking peek (browsers
+	// preconnect idle sockets and send the request seconds later; those must still
+	// classify). Rules changing between this snapshot and rawL4Splice's re-check is
+	// harmless: this only sets a timeout, it never authorizes a connect.
+	var peek_deadline_ms: i32 = 0;
+	if (rawL4Eligible(accept_mode, funnel_all)) {
+		lockRules();
+		const fast_raw = rawL4Allowed(&cidr_rs, orig);
+		unlockRules();
+		if (fast_raw) peek_deadline_ms = peek_fast_ms;
+	}
+
+	const cl = peekClassify(client_fd, &buf, &buffered, &out_host, &out_path, &out_sni, peek_deadline_ms);
 
 	var host: []const u8 = undefined;
 	var path: ?[]const u8 = null;
@@ -604,6 +664,12 @@ fn isHttpStart(b: u8) bool {
 	return b >= 'A' and b <= 'Z';
 }
 
+/// Peek + classify the client's first app bytes. `deadline_ms > 0` bounds the
+/// TOTAL classification time (poll before each recv, .deny on expiry with
+/// whatever is buffered) -- the fast path for a raw-L4-eligible silent client.
+/// `deadline_ms <= 0` disables it and classification blocks on the socket's own
+/// SO_RCVTIMEO, byte-identical to the original behavior (used on the L7/hostname
+/// path and by the unit tests that feed a socketpair + EOF).
 pub fn peekClassify(
 	fd: c_int,
 	buf: []u8,
@@ -611,9 +677,33 @@ pub fn peekClassify(
 	out_host: []u8,
 	out_path: []u8,
 	out_sni: []u8,
+	deadline_ms: i32,
 ) Classified {
 	var n: usize = 0;
+	const deadline_at: i64 = if (deadline_ms > 0) monotonicMs() + deadline_ms else 0;
 	while (true) {
+		if (deadline_ms > 0) {
+			const now = monotonicMs();
+			if (now >= deadline_at) {
+				buffered.* = n;
+				return .deny;
+			}
+			const remaining_ms: c_int = @intCast(deadline_at - now); // >= 1 (now < deadline_at)
+			var pfd = [_]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
+			const pr = c.poll(&pfd, 1, remaining_ms);
+			if (pr == 0) { // deadline reached with no readable data -> deny
+				buffered.* = n;
+				return .deny;
+			}
+			if (pr < 0) {
+				// EINTR (e.g. a SIGHUP reload delivered to this worker thread): retry
+				// within the remaining budget. Any other, persistent poll error ->
+				// fail closed rather than busy-spin until the deadline.
+				if (c.__errno_location().* == c.EINTR) continue;
+				buffered.* = n;
+				return .deny;
+			}
+		}
 		const got = c.recv(fd, @ptrCast(buf.ptr + n), buf.len - n, 0);
 		if (got <= 0) {
 			buffered.* = n;
@@ -629,6 +719,11 @@ pub fn peekClassify(
 				.deny => return .deny,
 			}
 		} else if (isHttpStart(buf[0])) {
+			// Fail-fast: reject a non-HTTP flow that merely starts with an uppercase
+			// byte (an SSH banner) the instant it can't be a request line, instead of
+			// waiting out the peek for a "\r\n\r\n" that never comes. Genuine HTTP is
+			// .plausible here and parseRequestHead makes the byte-identical decision.
+			if (http.requestLinePrecheck(buf[0..n]) == .deny) return .deny;
 			switch (http.parseRequestHead(buf[0..n], out_host, out_path)) {
 				.ok => |p| return .{ .http = p },
 				.need_more => if (n >= buf.len) return .deny,

@@ -28,6 +28,7 @@ const c = @cImport({
 	@cDefine("_GNU_SOURCE", "1");
 	@cInclude("sys/socket.h");
 	@cInclude("netinet/in.h");
+	@cInclude("sys/time.h"); // struct timeval for the SO_RCVTIMEO fallback test
 });
 
 // libc bits the socketpair-driven classify tests need.
@@ -226,7 +227,10 @@ fn classifyBytes(bytes: []const u8, oh: []u8, op: []u8, os: []u8) main.Classifie
 
 	var buf: [16 * 1024]u8 = undefined; // peek buffer; not aliased by the result
 	var buffered: usize = 0;
-	return main.peekClassify(sv[0], &buf, &buffered, oh, op, os);
+	// deadline 0: block on SO_RCVTIMEO / EOF -- byte-identical to the original
+	// classify path. The SHUT_WR above turns a "need more" into EOF, so this never
+	// hangs on the socketpair.
+	return main.peekClassify(sv[0], &buf, &buffered, oh, op, os, 0);
 }
 
 test "classify: a TLS ClientHello on :443 classifies as .tls (not raw-L4)" {
@@ -357,4 +361,106 @@ test "classify: an ECH ClientHello is still refused on the splice tier" {
 	try t.expect(!needs_term);
 	const is_tls = true;
 	try t.expect(is_tls and cl.tls.ech and !needs_term);
+}
+
+test "peek: COGBOX_L7_PEEK_MS override is clamped both directions" {
+	// A sane override passes through.
+	try t.expectEqual(@as(i32, 300), main.clampPeekMs(300));
+	try t.expectEqual(@as(i32, 120), main.clampPeekMs(120));
+	// Non-positive would uncap the peek -> default (300).
+	try t.expectEqual(@as(i32, 300), main.clampPeekMs(0));
+	try t.expectEqual(@as(i32, 300), main.clampPeekMs(-1));
+	// A tiny positive typo would skip classification -> floored to 50.
+	try t.expectEqual(@as(i32, 50), main.clampPeekMs(5));
+	try t.expectEqual(@as(i32, 50), main.clampPeekMs(50));
+}
+
+// --- peek deadline / precheck (the server-speaks-first stall fix) ---
+//
+// The bug: an SSH-style silent-or-uppercase-banner client made peekClassify
+// block for the whole io_timeout_secs before the flow fell through to raw-L4.
+// Part 1 (http.requestLinePrecheck) denies an SSH banner instantly; Part 2 (the
+// injected classify deadline) bounds a truly silent client on the raw-L4-eligible
+// fast path. The deadline is a peekClassify parameter precisely so these tests
+// inject a small value instead of sleeping out the production 300ms.
+
+test "peek: an SSH banner is classified .deny immediately (precheck, no timeout)" {
+	// Uppercase 'S' start routes it to the HTTP arm; the precheck denies on the
+	// '-' at offset 3 without waiting for a CRLF. classifyBytes SHUT_WRs, but the
+	// precheck fires before EOF would even matter.
+	var oh: [256]u8 = undefined;
+	var op: [2048]u8 = undefined;
+	var os: [256]u8 = undefined;
+	const cl = classifyBytes("SSH-2.0-OpenSSH_9.9\r\n", &oh, &op, &os);
+	try t.expect(cl == .deny);
+}
+
+// Drive peekClassify on a socketpair whose write end stays OPEN (no bytes, no
+// SHUT_WR) so recv would block forever -- only the injected deadline can return
+// it. Returns the result and the elapsed wall time.
+fn classifySilent(deadline_ms: i32) struct { cl: main.Classified, elapsed_ms: i64 } {
+	var sv: [2]c_int = undefined;
+	std.debug.assert(socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) == 0);
+	defer _ = close(sv[0]);
+	defer _ = close(sv[1]);
+	var buf: [16 * 1024]u8 = undefined;
+	var buffered: usize = 0;
+	var oh: [256]u8 = undefined;
+	var op: [2048]u8 = undefined;
+	var os: [256]u8 = undefined;
+	const start = main.monotonicMs();
+	const cl = main.peekClassify(sv[0], &buf, &buffered, &oh, &op, &os, deadline_ms);
+	return .{ .cl = cl, .elapsed_ms = main.monotonicMs() - start };
+}
+
+test "peek: a silent client returns .deny within the injected fast deadline" {
+	const r = classifySilent(100);
+	try t.expect(r.cl == .deny);
+	// It waited roughly the deadline (not an instant deny) but nowhere near the
+	// 15s SO_RCVTIMEO the non-fast path would incur.
+	try t.expect(r.elapsed_ms >= 80);
+	try t.expect(r.elapsed_ms < 2000);
+}
+
+test "peek: with no fast deadline a silent client relies on SO_RCVTIMEO (unchanged)" {
+	// deadline 0 disables the poll fast-path -> classification blocks on the fd's
+	// own SO_RCVTIMEO, exactly as the original code did. We set a short timeout so
+	// the suite doesn't stall the production 15s.
+	var sv: [2]c_int = undefined;
+	std.debug.assert(socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) == 0);
+	defer _ = close(sv[0]);
+	defer _ = close(sv[1]);
+	var tv: c.struct_timeval = .{ .tv_sec = 0, .tv_usec = 200 * 1000 };
+	_ = c.setsockopt(sv[0], c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+	var buf: [16 * 1024]u8 = undefined;
+	var buffered: usize = 0;
+	var oh: [256]u8 = undefined;
+	var op: [2048]u8 = undefined;
+	var os: [256]u8 = undefined;
+	const start = main.monotonicMs();
+	const cl = main.peekClassify(sv[0], &buf, &buffered, &oh, &op, &os, 0);
+	const elapsed = main.monotonicMs() - start;
+	try t.expect(cl == .deny);
+	try t.expect(elapsed >= 150); // it actually waited on SO_RCVTIMEO, not the poll deadline
+}
+
+test "peek: a fast deadline still lets a prompt TLS ClientHello classify" {
+	// The deadline bounds the silent case without breaking a client that speaks
+	// first: a full ClientHello is already buffered, so classification wins the
+	// race well inside the deadline.
+	var raw: [1200]u8 = undefined;
+	const hello = buildHello(&raw, "app.example.com", false);
+	var sv: [2]c_int = undefined;
+	std.debug.assert(socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) == 0);
+	defer _ = close(sv[0]);
+	defer _ = close(sv[1]);
+	_ = write(sv[1], hello.ptr, hello.len);
+	var buf: [16 * 1024]u8 = undefined;
+	var buffered: usize = 0;
+	var oh: [256]u8 = undefined;
+	var op: [2048]u8 = undefined;
+	var os: [256]u8 = undefined;
+	const cl = main.peekClassify(sv[0], &buf, &buffered, &oh, &op, &os, 300);
+	try t.expect(cl == .tls);
+	try t.expectEqualStrings("app.example.com", cl.tls.name);
 }

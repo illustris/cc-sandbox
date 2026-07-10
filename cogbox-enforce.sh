@@ -116,6 +116,11 @@ start_l7mitm() {
 # 0.0.0.0:$BASE (the agent pod's shim CONNECTs here carrying the orig dst), with
 # the funnel-all gate for non-HTTP/TLS flows. Writes l7proxy.pid so the hot-reload
 # verbs (rule/secret edits kubectl-exec'd into this pod) can SIGHUP it.
+#
+# Optional tuning: COGBOX_L7_PEEK_MS (default 300) bounds the pre-connect
+# classification peek for raw-L4-allowed flows, so a silent server-speaks-first
+# client (SSH/SMTP/...) doesn't stall on the general I/O timeout before its flow
+# falls through to the raw-L4 splice. Left unset here to use the built-in default.
 start_l7proxy() {
 	@cogbox@ __l7proxy "$RUNTIME" "$BASE" &
 	L7PROXY_PID=$!
