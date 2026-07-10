@@ -95,6 +95,12 @@ The base module declares the `cogbox.*` option tree and folds the merged `config
 
 The workdir/cwd is base-owned: `programs.bash.loginShellInit` and the harness launchers (`c`/`oc`/`cx`/`h`/`p`) `cd ~/work` (the launcher also exports `OPENCODE_CONFIG` and merges `cogbox.env`). The contract has no `loginShellInit`/`cwd` surface, so a plugin cannot fight over cwd. See [plugins](plugins.md) for the full contract.
 
+## Guest environment and non-Nix binaries
+
+The L7 CA-trust env (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, …, all pointing at the assembled `/run/cogbox/ca-bundle.crt`) is set both as `environment.variables` (login shells) and `environment.sessionVariables`. The latter matters because the container sshd runs `UsePAM yes`, so `pam_env` delivers `sessionVariables` to *non-interactive* `ssh host cmd` execs — which source no login shell. That is the path VS Code Remote-SSH uses, so its server and tools see the CA bundle.
+
+`programs.nix-ld` is enabled so downloaded, dynamically-linked non-Nix ELF binaries run in the otherwise pure-Nix guest. VS Code Remote-SSH ships a prebuilt glibc `node` (vscode-server) that expects a standard `/lib64/ld-linux` loader; nix-ld provides the `/lib64` stub loader and delivers `NIX_LD`/`NIX_LD_LIBRARY_PATH` via the same `sessionVariables`/`pam_env` mechanism. The stock library set is extended with `stdenv.cc.cc.lib`, `icu`, and `libsecret` for common VS Code extension native binaries.
+
 ## Network enforcement
 
 In `rules` network mode, the wrapper loads a Zig shared library (`libnetfilter.so`) into passt via `LD_PRELOAD`. The library intercepts outbound socket calls (`connect`, `sendto`, `sendmsg`, `sendmmsg`) and checks destination addresses against the configured CIDR rules; denied connections receive `ENETUNREACH`. It initializes via `.init_array` (before `main()`) so all file I/O for rule loading completes before passt activates its seccomp-bpf sandbox. Rules hot-reload via `SIGUSR1`; the L7 proxy reloads via `SIGHUP`. Details, including the remap/SOCKS5 layer and the L7 proxy architecture, are in [network filtering](network-filtering.md).

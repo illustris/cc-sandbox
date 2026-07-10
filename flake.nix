@@ -1014,6 +1014,28 @@
 				# harness launchers also bake these in for non-login `cogbox
 				# ssh -- c` invocations).
 				environment.variables = l7CaEnv;
+				# environment.variables reaches login shells only. The gateway's
+				# sshd runs `UsePAM yes`, so a non-interactive `ssh host cmd`
+				# exec (VS Code Remote-SSH's transport) sources pam_env but NOT a
+				# login shell -- it would otherwise get no CA env. Mirror the CA
+				# trust into sessionVariables (delivered via pam_env) so TLS tools
+				# work over exec sessions too. NixOS merges sessionVariables
+				# across modules, so this coexists with nix-ld's own NIX_LD*
+				# entries below (disjoint keys).
+				environment.sessionVariables = l7CaEnv;
+
+				# nix-ld lets dynamically-linked, non-Nix ELF binaries run in the
+				# sandbox: VS Code Remote-SSH downloads a prebuilt glibc `node`
+				# (vscode-server) and extension host that expect a standard
+				# /lib64/ld-linux loader, which a pure-Nix guest lacks. The module
+				# sets environment.ldso (the /lib64 stub), NIX_LD, and
+				# NIX_LD_LIBRARY_PATH via environment.sessionVariables -- again
+				# pam_env-delivered, so it reaches the exec sessions the server
+				# runs under. The stock default library set (zlib, openssl, curl,
+				# systemd, stdenv.cc.cc, ...) covers vscode-server's node; these
+				# extras cover common VS Code extension native binaries.
+				programs.nix-ld.enable = true;
+				programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib icu libsecret ];
 
 				# Container target DNS: the kubelet writes /etc/resolv.conf (cluster
 				# DNS, e.g. `nameserver 10.96.0.10`) into the pod and manages it at
