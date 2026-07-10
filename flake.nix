@@ -1149,7 +1149,12 @@
 					AllowStreamLocalForwarding = "no";
 					GatewayPorts = "no";
 					X11Forwarding = false;
-					AllowAgentForwarding = false;
+					# Permit ssh-agent forwarding so in-sandbox tools can reuse the
+					# user's keys (e.g. git push). sshd only sets the ceiling here; the
+					# gateway's short-lived cert (permit-agent-forwarding) is the actual
+					# per-connection gate, driven by cogworx's COGWORX_SSH_AGENT_FORWARDING
+					# (default on) -- with that off the sshd allowance is simply unused.
+					AllowAgentForwarding = true;
 					PermitTunnel = "no";
 					MaxAuthTries = 3;
 					LoginGraceTime = 20;
