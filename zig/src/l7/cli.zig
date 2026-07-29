@@ -3,7 +3,10 @@
 //
 //   cogbox l7 --config CFG --runtime RT list
 //   cogbox l7 --config CFG --runtime RT add allow|deny HOST [--at N]
+//        [--path P] [--method M[,M]] [--exact] [--service SVC]
+//        [--terminate|--passthrough|--insecure-upstream] [--plugin TAG]
 //   cogbox l7 --config CFG --runtime RT del INDEX
+//   cogbox l7 --config CFG --runtime RT clear --plugin TAG  (drop all TAG rules)
 //   cogbox l7 --config CFG --runtime RT set                 (reads stdin)
 //   cogbox l7 --config CFG --runtime RT mode passthrough|terminate
 
@@ -14,6 +17,7 @@ pub const Cmd = union(enum) {
 	list,
 	add: AddArgs,
 	del: DelArgs,
+	clear: ClearArgs,
 	set,
 	mode: ModeArgs,
 };
@@ -27,12 +31,25 @@ pub const AddArgs = struct {
 	insecure: bool = false, // skip upstream cert verification; implies terminate
 	passthrough: bool = false, // opt OUT of the terminate default (SNI-only)
 	// --plugin NAME: tag the inserted rule with `"plugin": "<name>"` so a later
-	// `plugin del <name>` removes exactly it (admin-approved deferred plugin rule).
+	// `plugin del <name>` / `l7 clear --plugin <name>` removes exactly it
+	// (admin-approved deferred plugin rule, or a git-grant-tagged rule).
 	plugin: ?[]const u8 = null,
+	// --method M[,M]: constrain the rule to an uppercase HTTP method list.
+	methods: ?[]const u8 = null,
+	// --exact: match the path by full equality instead of the default prefix.
+	exact: bool = false,
+	// --service SVC: constrain to a git smart-HTTP service (git-upload-pack /
+	// git-receive-pack).
+	service: ?[]const u8 = null,
 };
 
 pub const DelArgs = struct {
 	index: usize, // 1-based
+};
+
+pub const ClearArgs = struct {
+	// Remove every rule tagged with this `"plugin"` value (e.g. `git-grants`).
+	plugin: []const u8,
 };
 
 pub const ModeArgs = struct {
@@ -96,6 +113,7 @@ pub fn parse(argv: []const []const u8) ParseError!Args {
 	}
 	if (std.mem.eql(u8, sub, "add")) return parseAdd(cfg_path, rt_path, sub_args);
 	if (std.mem.eql(u8, sub, "del")) return parseDel(cfg_path, rt_path, sub_args);
+	if (std.mem.eql(u8, sub, "clear")) return parseClear(cfg_path, rt_path, sub_args);
 	if (std.mem.eql(u8, sub, "mode")) return parseMode(cfg_path, rt_path, sub_args);
 	return error.UnknownSubcommand;
 }
@@ -110,6 +128,9 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 	var insecure = false;
 	var passthrough = false;
 	var plugin: ?[]const u8 = null;
+	var methods: ?[]const u8 = null;
+	var exact = false;
+	var service: ?[]const u8 = null;
 
 	var i: usize = 2;
 	while (i < args.len) : (i += 1) {
@@ -133,6 +154,18 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 			i += 1;
 			if (i >= args.len) return error.InvalidArgs;
 			plugin = args[i];
+		} else if (std.mem.eql(u8, args[i], "--method")) {
+			i += 1;
+			if (i >= args.len) return error.InvalidArgs;
+			methods = args[i];
+			if (!validMethods(methods.?)) return error.InvalidArgs;
+		} else if (std.mem.eql(u8, args[i], "--exact")) {
+			exact = true;
+		} else if (std.mem.eql(u8, args[i], "--service")) {
+			i += 1;
+			if (i >= args.len) return error.InvalidArgs;
+			service = args[i];
+			if (service.?.len == 0) return error.InvalidArgs;
 		} else {
 			return error.InvalidArgs;
 		}
@@ -140,17 +173,44 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 
 	// A path constraint is only enforceable on a terminated stream, and
 	// skipping upstream cert verification only makes sense when we terminate
-	// (it governs the proxy<->upstream TLS leg); both imply terminate.
-	if (path != null or insecure) terminate = true;
+	// (it governs the proxy<->upstream TLS leg); both imply terminate. A
+	// method/exact/service constraint is likewise only meaningful on the
+	// terminated leg, so it implies terminate too.
+	if (path != null or insecure or methods != null or exact or service != null) terminate = true;
 
 	// --passthrough is the opt-OUT of the terminate default; it can't be
 	// combined with anything that forces (or implies) terminate.
-	if (passthrough and (terminate or path != null or insecure)) return error.InvalidArgs;
+	if (passthrough and (terminate or path != null or insecure or methods != null or exact or service != null)) return error.InvalidArgs;
 
 	return .{
 		.config_path = cfg,
 		.runtime_path = rt,
-		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate, .insecure = insecure, .passthrough = passthrough, .plugin = plugin } },
+		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate, .insecure = insecure, .passthrough = passthrough, .plugin = plugin, .methods = methods, .exact = exact, .service = service } },
+	};
+}
+
+/// A `--method` value is a non-empty comma-separated list of uppercase-ASCII
+/// method tokens (`GET` / `GET,POST`). Rejects lowercase / empty / stray chars
+/// so the rendered l7-rules line's METHODS token round-trips through the zig
+/// parser (which admits only all-uppercase-and-comma method tokens).
+fn validMethods(s: []const u8) bool {
+	if (s.len == 0) return false;
+	var saw_letter = false;
+	for (s) |c| switch (c) {
+		'A'...'Z' => saw_letter = true,
+		',' => {},
+		else => return false,
+	};
+	return saw_letter;
+}
+
+fn parseClear(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseError!Args {
+	if (args.len != 2 or !std.mem.eql(u8, args[0], "--plugin")) return error.InvalidArgs;
+	if (args[1].len == 0) return error.InvalidArgs;
+	return .{
+		.config_path = cfg,
+		.runtime_path = rt,
+		.cmd = .{ .clear = .{ .plugin = args[1] } },
 	};
 }
 
@@ -269,6 +329,37 @@ test "add --plugin tag" {
 	try t.expect(c.cmd.add.terminate);
 	// --plugin without a value errors.
 	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "api.example.com", "--plugin" }));
+}
+
+test "add --method/--exact/--service parse and imply terminate" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "git.example.internal", "--method", "POST", "--exact", "--service", "git-upload-pack", "--path", "/g/p.git/git-upload-pack", "--plugin", "git-grants" });
+	try t.expect(a.cmd == .add);
+	try t.expectEqualStrings("POST", a.cmd.add.methods.?);
+	try t.expect(a.cmd.add.exact);
+	try t.expectEqualStrings("git-upload-pack", a.cmd.add.service.?);
+	try t.expectEqualStrings("git-grants", a.cmd.add.plugin.?);
+	try t.expect(a.cmd.add.terminate); // any of method/exact/service implies terminate
+	// A comma method list is accepted.
+	const b = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "h.test", "--method", "GET,POST" });
+	try t.expectEqualStrings("GET,POST", b.cmd.add.methods.?);
+	// Back-compat: no new flags -> all empty/false.
+	const c = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "h.test" });
+	try t.expect(c.cmd.add.methods == null);
+	try t.expect(!c.cmd.add.exact);
+	try t.expect(c.cmd.add.service == null);
+	// lowercase / empty method values reject; --passthrough can't mix with them.
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "h.test", "--method", "get" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "h.test", "--passthrough", "--exact" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "h.test", "--service" }));
+}
+
+test "clear --plugin parses; rejects missing/other flag" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "clear", "--plugin", "git-grants" });
+	try t.expect(a.cmd == .clear);
+	try t.expectEqualStrings("git-grants", a.cmd.clear.plugin);
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "clear" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "clear", "git-grants" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "clear", "--plugin", "" }));
 }
 
 test "mode terminate parses (no longer rejected at parse)" {

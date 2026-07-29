@@ -52,29 +52,34 @@ check(m.normalize_path("/../..") == "/", "pop past root")
 
 
 # evaluate: first-match, default-deny, path-gated
+# Rule tuple: (action, host, path, insecure, methods, exact, service, tag).
 class _R:
     def __init__(self, rules, mode_terminate=False):
         self.rules = rules
         self.mode_terminate = mode_terminate
 
 
+def _rule(action, host, path=None, insecure=False, methods=None, exact=False, service=None, tag=None):
+    return (action, host, path, insecure, methods, exact, service, tag)
+
+
 rs = _R([
-    ("allow", "api.example.com", "/v1/", False),
-    ("allow", "plain.test", None, False),
-    ("deny", "*", None, False),
+    _rule("allow", "api.example.com", "/v1/"),
+    _rule("allow", "plain.test"),
+    _rule("deny", "*"),
 ])
 check(m.evaluate(rs, "api.example.com", "/v1/x") == "allow", "path allow")
 check(m.evaluate(rs, "api.example.com", "/v2/x") == "deny", "path deny")
 check(m.evaluate(rs, "plain.test", "/anything") == "allow", "host allow")
 check(m.evaluate(rs, "other.test", "/") == "deny", "default deny via catch-all")
-check(m.evaluate(_R([("allow", "only.test", None, False)]), "x.test", "/") == "deny", "default deny")
+check(m.evaluate(_R([_rule("allow", "only.test")]), "x.test", "/") == "deny", "default deny")
 
 # host_insecure: only allow-rules flagged insecure match; host-level (path-independent)
 ri = _R([
-    ("allow", "internal.svc", "/api/", True),
-    ("allow", "secure.svc", None, False),
-    ("deny", "nope.svc", None, True),
-    ("allow", "*.lab.test", None, True),
+    _rule("allow", "internal.svc", "/api/", True),
+    _rule("allow", "secure.svc"),
+    _rule("deny", "nope.svc", None, True),
+    _rule("allow", "*.lab.test", None, True),
 ])
 check(m.host_insecure(ri, "internal.svc"), "insecure host flagged")
 check(m.host_insecure(ri, "internal.svc."), "insecure host flagged (trailing dot)")
@@ -82,6 +87,126 @@ check(not m.host_insecure(ri, "secure.svc"), "non-insecure host not flagged")
 check(not m.host_insecure(ri, "nope.svc"), "deny rule never insecure-allows")
 check(not m.host_insecure(ri, "unlisted.svc"), "unlisted host not insecure")
 check(m.host_insecure(ri, "box.lab.test"), "insecure wildcard host")
+
+# --- method / exact / service matching (git-grant rule extensions) --------
+# Parity with filter.zig: METHODS token is all-uppercase-and-comma; unknown
+# tokens reject the whole line; evaluate honors methods + exact + service.
+
+check(m._is_methods_token("GET"), "methods token: single")
+check(m._is_methods_token("GET,POST"), "methods token: list")
+check(not m._is_methods_token("get"), "methods token: lowercase rejected")
+check(not m._is_methods_token("service=x"), "methods token: service= not a method")
+check(not m._is_methods_token(",,"), "methods token: needs a letter")
+
+# effective_git_service: PATH WINS over the query; query only on the info/refs advertisement
+check(m.effective_git_service("/g/p.git/git-upload-pack") == "git-upload-pack", "git svc: upload endpoint")
+check(m.effective_git_service("/g/p.git/git-receive-pack") == "git-receive-pack", "git svc: receive endpoint")
+check(m.effective_git_service("/g/p.git/info/refs", "git-upload-pack") == "git-upload-pack", "git svc: from query on info/refs")
+check(m.effective_git_service("/g/p.git/info/refs") is None, "git svc: info/refs has no endpoint service")
+check(m.is_pack_endpoint("/g/p.git/git-upload-pack"), "pack endpoint: upload")
+check(not m.is_pack_endpoint("/g/p.git/info/refs"), "pack endpoint: info/refs is not one")
+# a client-supplied ?service= CANNOT launder a receive-pack (push) into upload (clone):
+# the pack-endpoint path segment wins over the query (round-2 blocker fix).
+check(m.effective_git_service("/g/p.git/git-receive-pack", "git-upload-pack") == "git-receive-pack",
+      "git svc: pack-endpoint path wins over spoofed query")
+# a ?service= on a NON-info/refs, non-pack path is ignored (round-2 should-fix): a wildcard
+# read grant must not authorize arbitrary group resources via an appended ?service= query.
+check(m.effective_git_service("/grp/proj/-/archive/main/proj.tar.gz", "git-upload-pack") is None,
+      "git svc: query ignored on non-info/refs path")
+check(m.effective_git_service("/grp/proj.git/info/refs", "git-upload-pack") == "git-upload-pack",
+      "git svc: query honored on wildcard info/refs advertisement")
+
+# maybe_reload: parse the new tokens; reject a line with a genuinely-unknown token
+import tempfile as _tf1
+_rd = _tf1.mkdtemp()
+_rp = os.path.join(_rd, "l7-rules")
+with open(_rp, "w") as f:
+    f.write(
+        "mode terminate\n"
+        "allow git.example.internal POST /g/p.git/git-upload-pack exact\n"
+        "allow git.example.internal GET,POST /grp/ service=git-upload-pack\n"
+        "allow git.example.internal GET /grp/ tag=git-grants\n"  # tagged, kept
+        "allow bad.test bogustoken\n"          # unknown token -> whole line dropped
+        "allow tier.test terminate passthrough\n"  # tier tokens ignored, line kept
+        "allow both.test GET /x/ tag=git-grants bogustoken\n"  # tag + unknown -> dropped
+        "allow look.test tagx=foo\n"           # lookalike prefix -> dropped (parity w/ zig)
+    )
+m.RULES_PATH = _rp
+_R2 = m.Rules()
+_R2.maybe_reload()
+# 4 kept (exact, service, tagged, tier-token rules); the 3 bad/lookalike lines dropped
+check(len(_R2.rules) == 4, "maybe_reload: unknown-token line dropped, others kept")
+_exact = _R2.rules[0]
+check(_exact[4] == frozenset({"POST"}) and _exact[5] is True and _exact[6] is None,
+      "maybe_reload: exact rule methods+exact parsed")
+check(_exact[7] is None, "maybe_reload: an untagged rule's tag is None")
+_svc = _R2.rules[1]
+check(_svc[4] == frozenset({"GET", "POST"}) and _svc[6] == "git-upload-pack",
+      "maybe_reload: method list + service parsed")
+_tagged = _R2.rules[2]
+check(_tagged[7] == "git-grants", "maybe_reload: tag=git-grants parsed into the tuple")
+# the tag+unknown line and the tagx= lookalike are both dropped: no rule for those hosts
+check(not any(r[1] == "both.test" for r in _R2.rules),
+      "maybe_reload: tag + genuinely-unknown token still drops the whole line")
+check(not any(r[1] == "look.test" for r in _R2.rules),
+      "maybe_reload: tagx= lookalike is a genuinely-unknown token -> line dropped")
+
+# evaluate: method + exact + endpoint-derived service (mirrors the zig test)
+_git = _R([
+    _rule("allow", "git.example.internal", "/g/p.git/git-upload-pack", methods=frozenset({"POST"}), exact=True),
+    _rule("allow", "git.example.internal", "/grp/", methods=frozenset({"GET", "POST"}), service="git-upload-pack"),
+])
+check(m.evaluate(_git, "git.example.internal", "/g/p.git/git-upload-pack", "POST") == "allow",
+      "git evaluate: exact clone POST allowed")
+check(m.evaluate(_git, "git.example.internal", "/g/p.git/git-upload-pack", "GET") == "deny",
+      "git evaluate: wrong method fails closed")
+check(m.evaluate(_git, "git.example.internal", "/g/p.git/git-upload-pack/x", "POST") == "deny",
+      "git evaluate: exact rejects a longer path")
+# wildcard prefix + service: clone POST allowed, push POST (receive-pack) denied
+check(m.evaluate(_git, "git.example.internal", "/grp/proj.git/git-upload-pack", "POST") == "allow",
+      "git evaluate: wildcard clone allowed")
+check(m.evaluate(_git, "git.example.internal", "/grp/proj.git/git-receive-pack", "POST") == "deny",
+      "git evaluate: wildcard push (receive-pack) denied by endpoint-derived service")
+# info/refs advertisement matched via the ?service= query
+check(m.evaluate(_R([_rule("allow", "git.example.internal", "/g/p.git/info/refs",
+                           methods=frozenset({"GET"}), exact=True, service="git-upload-pack")]),
+                 "git.example.internal", "/g/p.git/info/refs", "GET", "git-upload-pack") == "allow",
+      "git evaluate: info/refs allowed via query service")
+# ADVERSARIAL (round-2 blocker): a spoofed ?service=git-upload-pack on a git-receive-pack POST
+# must NOT match the wildcard read rule -- the enforcer must deny the push on a read-only grant.
+check(m.evaluate(_git, "git.example.internal", "/grp/victim.git/git-receive-pack", "POST", "git-upload-pack") == "deny",
+      "git evaluate: spoofed ?service= cannot push under a wildcard read grant")
+# ADVERSARIAL (round-2 should-fix): a wildcard read grant must NOT reach arbitrary non-repo
+# group resources by appending ?service=git-upload-pack to a non-info/refs path.
+check(m.evaluate(_git, "git.example.internal", "/grp/proj/-/archive/main/proj.tar.gz", "GET", "git-upload-pack") == "deny",
+      "git evaluate: wildcard read does not leak group archives via spoofed ?service=")
+check(m.evaluate(_git, "git.example.internal", "/grp/proj.git/info/refs", "GET", "git-upload-pack") == "allow",
+      "git evaluate: wildcard read still allows the info/refs advertisement")
+
+# --- evaluate tag gate: reachability vs credential delegation -------------
+# THE HOLE: a generic whole-host allow (untagged) coexists with a narrow
+# git-grant-tagged rule. The full rule set (require_tag=None) still allows
+# everything (reachability). require_tag="git-grants" considers ONLY the tagged
+# rule -> the token is inject-eligible on exactly the granted method+path, never
+# on the paths only the whole-host allow reached.
+_gate = _R([
+    _rule("allow", "git.example.internal"),  # untagged whole-host allow (the hole)
+    _rule("allow", "git.example.internal", "/grp/proj.git/",
+          methods=frozenset({"GET"}), tag="git-grants"),  # narrow tagged grant
+    _rule("deny", "*"),
+])
+check(m.evaluate(_gate, "git.example.internal", "/anything") == "allow",
+      "gate: whole-host allow grants reachability (no require_tag)")
+check(m.evaluate(_gate, "git.example.internal", "/grp/proj.git/info/refs", "GET",
+                 require_tag="git-grants") == "allow",
+      "gate: a git-grant-tagged rule covers the request -> credential-eligible")
+check(m.evaluate(_gate, "git.example.internal", "/api/v4/projects/other", "GET",
+                 require_tag="git-grants") == "deny",
+      "gate: THE HOLE CLOSED -- the untagged whole-host allow is skipped, so a "
+      "path only it reached is NOT credential-eligible")
+# require_tag=None default is byte-for-byte today's behavior (regression guard).
+check(m.evaluate(_gate, "git.example.internal", "/api/v4/projects/other", "GET") == "allow",
+      "gate: require_tag=None reproduces the unrestricted allow/deny decision")
 
 # --- credential injection (host-side; keeps tokens out of the guest) ---
 
@@ -375,6 +500,114 @@ check(_hb.get("authorization") == "Basic " + _b64.b64encode(b"alice:s3cr3t").dec
       "basic style injects base64(user:pass) from a raw cred file")
 
 
+# --- a conf reload flushes the cred-value caches -------------------------
+# The cred caches are keyed on the cred file's MTIME, so any change that leaves
+# the mtime alone is invisible to them -- and the change that makes a bound
+# credential readable is exactly that: the host grants the proxy gid group-read
+# with a chmod (rules/credgrant.zig), and chmod moves ctime only. A rebind resets
+# the file to 0600 and the re-grant is a separate render, so a request landing in
+# that window caches (mtime, None) and every later request 403s forever. The
+# render writes the conf in the same pass as the grant, so a conf reload has to
+# drop the cred caches. Modelled below as a same-mtime VALUE change, which is the
+# same cache-key blindness without needing to fake an EACCES.
+_fc = os.path.join(_d, "flush.json")
+_fconf = os.path.join(_d, "flush-conf.json")
+_fspec = [{"host": "flush.example.com", "style": "bearer",
+           "cred_file": _fc, "token_path": "k"}]
+_write(_fc, {"k": "V1"}, 5000)
+_write(_fconf, _fspec, 5000)
+csf = m.CredStore(_fconf)
+check(csf.value_for(csf.spec_for("flush.example.com"), "token_path") == "V1",
+      "conf-reload flush: reads the initial json value")
+check(csf._file_cache, "conf-reload flush: the read populated the json cache")
+_write(_fc, {"k": "V2"}, 5000)  # new value, SAME mtime (as a chmod would leave it)
+check(csf.value_for(csf.spec_for("flush.example.com"), "token_path") == "V1",
+      "conf-reload flush: a same-mtime change is invisible while the conf is unchanged")
+_write(_fconf, _fspec, 6000)  # the render rewrites the conf, as writeL7Inject does
+_spf = csf.spec_for("flush.example.com")  # the reload happens on this next lookup
+check(csf._file_cache == {} and csf._raw_cache == {},
+      "conf-reload flush: a conf reload clears both cred caches")
+check(csf.value_for(_spf, "token_path") == "V2",
+      "conf-reload flush: the json cred is re-read after a conf reload")
+
+# Same for the raw path -- the arm the per-user Claude / git binds actually use.
+_fr = os.path.join(_d, "flush-raw")
+_rconf = os.path.join(_d, "flush-raw-conf.json")
+_rspec = [{"host": "raw-flush.example.com", "style": "bearer", "cred_format": "raw",
+           "cred_file": _fr}]
+_write_raw(_fr, "RAW-1\n", 5000)
+_write(_rconf, _rspec, 5000)
+csrf = m.CredStore(_rconf)
+check(csrf.token_for(csrf.spec_for("raw-flush.example.com")) == "RAW-1",
+      "conf-reload flush: reads the initial raw value")
+check(csrf._raw_cache, "conf-reload flush: the read populated the raw cache")
+_write_raw(_fr, "RAW-2\n", 5000)
+check(csrf.token_for(csrf.spec_for("raw-flush.example.com")) == "RAW-1",
+      "conf-reload flush: raw same-mtime change invisible while the conf is unchanged")
+_write(_rconf, _rspec, 6000)
+check(csrf.spec_for("raw-flush.example.com") is not None,
+      "conf-reload flush: the spec survives the reload")
+check(csrf._raw_cache == {}, "conf-reload flush: a conf reload clears the raw cache")
+check(csrf.token_for(csrf.spec_for("raw-flush.example.com")) == "RAW-2",
+      "conf-reload flush: the raw cred is re-read after a conf reload")
+# The refresh throttle is NOT part of the flush: clearing it would let a render
+# reset the per-cred-file cooldown that keeps a failing token endpoint from being
+# POSTed on every in-window request.
+csrf._last_attempt["sentinel"] = 1.0
+_write(_rconf, _rspec, 7000)
+csrf.spec_for("raw-flush.example.com")
+check(csrf._last_attempt.get("sentinel") == 1.0,
+      "conf-reload flush: leaves the refresh cooldown alone")
+
+
+# --- gitlab-oauth: path-dependent basic (git) vs bearer (API) injection ----
+# renderL7Inject emits a gitlab-oauth spec: style gitlab-oauth, cred_format raw,
+# git_user, the git stub sentinel, NO refresh block. The addon must raw-read the
+# token, pick basic auth (`git_user:<token>`) on git smart-HTTP paths and Bearer
+# on the REST API, and -- for credential-less `git` -- inject over the absent auth.
+GIT_STUB = "glpat-cogbox-host-injected-placeholder"
+_gitcred = os.path.join(_d, "git-gitlab")
+_write_raw(_gitcred, "glpat-REAL-ACCESS-TOKEN\n", 1000)
+_write(_conf, [{"host": "git.example.internal", "style": "gitlab-oauth",
+                "cred_file": _gitcred, "cred_format": "raw",
+                "git_user": "oauth2", "stub_token": GIT_STUB}], 9000)
+csg = m.CredStore(_conf)
+spg = csg.spec_for("git.example.internal")
+check(spg is not None, "credstore admits a raw gitlab-oauth spec (no token_path)")
+check(csg.token_for(spg) == "glpat-REAL-ACCESS-TOKEN",
+      "credstore raw-reads the gitlab-oauth access token value")
+check("refresh" not in spg, "gitlab-oauth spec carries no refresh block (central re-bind, single-use tokens)")
+
+# resolve_gitlab_style: git smart-HTTP paths -> basic + `git_user:` prefix; else bearer
+_st, _pref = m.resolve_gitlab_style(spg, "/g/p.git/git-upload-pack")
+check(_st == "basic" and _pref == "oauth2:", "gitlab-oauth: pack POST -> basic w/ git_user prefix")
+_st, _pref = m.resolve_gitlab_style(spg, "/g/p.git/info/refs")
+check(_st == "basic" and _pref == "oauth2:", "gitlab-oauth: info/refs -> basic")
+_st, _pref = m.resolve_gitlab_style(spg, "/g/p.git/git-receive-pack")
+check(_st == "basic", "gitlab-oauth: push POST -> basic")
+_st, _pref = m.resolve_gitlab_style(spg, "/api/v4/projects/1234/issues")
+check(_st == "bearer" and _pref == "", "gitlab-oauth: REST API path -> bearer")
+# a non-gitlab spec is unchanged
+check(m.resolve_gitlab_style({"style": "cookie"}, "/x") == ("cookie", ""), "resolve: non-gitlab unchanged")
+
+# credential-less git presents no auth -> should_inject True for both effective styles
+check(m.should_inject(CIDict({}), "basic", GIT_STUB), "gitlab-oauth: inject basic when no auth")
+check(m.should_inject(CIDict({}), "bearer", GIT_STUB), "gitlab-oauth: inject bearer when no auth")
+# a legitimately-obtained secondary Bearer passes through untouched
+check(not m.should_inject(CIDict({"Authorization": "Bearer real.secondary"}), "bearer", GIT_STUB),
+      "gitlab-oauth: pass a non-stub secondary bearer through")
+
+# apply: git path stamps Basic base64(oauth2:token); API path stamps Bearer
+_hg = CIDict({})
+m.apply_injection(_hg, "basic", "oauth2:" + csg.token_for(spg))
+check(_hg["authorization"] == "Basic " + _b64.b64encode(b"oauth2:glpat-REAL-ACCESS-TOKEN").decode(),
+      "gitlab-oauth: git path -> Basic base64(oauth2:token)")
+_ha = CIDict({})
+m.apply_injection(_ha, "bearer", csg.token_for(spg))
+check(_ha["authorization"] == "Bearer glpat-REAL-ACCESS-TOKEN",
+      "gitlab-oauth: API path -> Bearer token")
+
+
 # --- json_path_raw / json_path_set (refresh write-back helpers) ----------
 check(m.json_path_raw({"a": {"b": 5}}, "a.b") == 5, "json_path_raw numeric leaf")
 check(m.json_path_raw({"a": {"b": "x"}}, "a.b") == "x", "json_path_raw string leaf")
@@ -640,6 +873,91 @@ check(_fl.server_conn.sni is None, "http inject: no upstream SNI set on a no-SNI
 # which is unavailable without mitmproxy imported.)
 check(m.evaluate(m.RULES, "evil.internal.test", "/") == "deny",
       "http inject: unlisted host stays default-deny")
+
+
+# --- _enforce_and_inject: tag-gated injection end-to-end ------------------
+# The hole closed at the injection seam: a spec carrying rules_tag injects the
+# owner's token ONLY when a git-grant-tagged rule also allows the request. A
+# coexisting whole-host allow grants reachability (no 403) but not the token.
+class _GConn:
+    def __init__(self, sni=None):
+        self.sni = sni
+
+
+class _GReq:
+    def __init__(self, host, method, headers):
+        self.pretty_host = host
+        self.method = method
+        self.headers = headers
+
+
+class _GFlow:
+    def __init__(self, host, method, headers, sni):
+        self.client_conn = _GConn(sni)
+        self.server_conn = _GConn(None)
+        self.request = _GReq(host, method, headers)
+        self.response = None
+
+
+_gd = tempfile.mkdtemp()
+_GTOK = "glpat-FAKEFAKEGATE"          # fictional owner token (OSS-clean)
+_gcred = os.path.join(_gd, "git-gitlab")
+_write_raw(_gcred, _GTOK + "\n", 1000)
+_ghost = "git.example.internal"
+
+
+def _mk_git_flow(path_method="GET"):
+    return _GFlow(_ghost, path_method, CIDict({"Host": _ghost}), sni=_ghost)
+
+
+def _set_rules(text):
+    p = os.path.join(_gd, "l7-rules-%d" % (len(text)))
+    with open(p, "w") as f:
+        f.write(text)
+    m.RULES_PATH = p
+    m.RULES = m.Rules()  # _enforce_and_inject's maybe_reload() loads from RULES_PATH
+
+
+def _set_spec(with_tag):
+    spec = {"host": _ghost, "style": "gitlab-oauth", "cred_file": _gcred,
+            "cred_format": "raw", "git_user": "oauth2",
+            "stub_token": "glpat-cogbox-host-injected-placeholder"}
+    if with_tag:
+        spec["rules_tag"] = "git-grants"
+    conf = os.path.join(_gd, "inject-%s.json" % with_tag)
+    _write(conf, [spec], 1000)
+    m.CREDS = m.CredStore(conf)
+
+
+# Scenario A: spec WITH rules_tag, path NOT covered by any tagged rule.
+# Rules: untagged whole-host allow (reachability) + a tagged narrow allow that
+# does NOT cover /api/v4/projects/other. Injection must be gated OFF.
+_set_rules("mode terminate\n"
+           "allow git.example.internal\n"
+           "allow git.example.internal GET /api/v4/projects/1234/ tag=git-grants\n")
+_set_spec(with_tag=True)
+_flA = _mk_git_flow("GET")
+m._enforce_and_inject(_flA, "/api/v4/projects/other")
+check(_flA.response is None, "inject gate A: request still ALLOWED (reachability), not 403")
+check(_flA.request.headers.get("authorization") is None,
+      "inject gate A: owner token NOT injected on a path only the whole-host allow reached")
+
+# Scenario B: spec WITH rules_tag, path IS covered by a tagged rule -> inject.
+_set_spec(with_tag=True)
+_flB = _mk_git_flow("GET")
+m._enforce_and_inject(_flB, "/api/v4/projects/1234/issues")
+check(_flB.response is None, "inject gate B: tagged request allowed")
+check(_flB.request.headers.get("authorization") == "Bearer " + _GTOK,
+      "inject gate B: a git-grant-tagged rule covers the request -> owner token injected")
+
+# Scenario C: spec WITHOUT rules_tag (legacy / non-git) -> whole-host injection.
+_set_rules("mode terminate\nallow git.example.internal\n")
+_set_spec(with_tag=False)
+_flC = _mk_git_flow("GET")
+m._enforce_and_inject(_flC, "/api/v4/projects/1234/issues")
+check(_flC.response is None, "inject gate C: allowed")
+check(_flC.request.headers.get("authorization") == "Bearer " + _GTOK,
+      "inject gate C: a spec with no rules_tag keeps whole-host injection (ungated)")
 
 
 if fails:

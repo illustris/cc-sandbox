@@ -40,6 +40,7 @@ test "underivable urls error" {
 	try t.expectError(error.CannotDerive, name.deriveName(t.allocator, "path:/x/1234"));
 	try t.expectError(error.CannotDerive, name.deriveName(t.allocator, "github:owneronly"));
 	try t.expectError(error.CannotDerive, name.deriveName(t.allocator, "path:/x/user")); // reserved
+	try t.expectError(error.CannotDerive, name.deriveName(t.allocator, "path:/x/git-grants")); // reserved (backend L7 tag)
 }
 
 test "splitFragment" {
@@ -75,4 +76,5 @@ test "validator grammar" {
 	try t.expect(!name.isValidPluginName("1abc"));
 	try t.expect(!name.isValidPluginName("a_b"));
 	try t.expect(!name.isValidPluginName("user")); // reserved composition input
+	try t.expect(!name.isValidPluginName("git-grants")); // reserved backend L7 injection-gating tag
 }

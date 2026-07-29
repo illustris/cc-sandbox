@@ -56,6 +56,7 @@ pub fn dispatch(
 		.list => try cmdList(allocator, io, l7.*, rules_arr.*),
 		.add => |a| try cmdAdd(allocator, io, args, rules_arr, a, &loaded),
 		.del => |d| try cmdDel(allocator, io, args, rules_arr, d, &loaded),
+		.clear => |c| try cmdClear(allocator, io, args, rules_arr, c, &loaded),
 		.set => try cmdSet(allocator, io, args, rules_arr, &loaded),
 		.mode => |m| try cmdMode(allocator, io, args, l7, m, &loaded),
 	}
@@ -112,11 +113,31 @@ fn cmdList(allocator: std.mem.Allocator, io: std.Io, l7: std.json.Value, rules_a
 		});
 		try out.appendSlice(allocator, p.host);
 		var is_terminate = false;
+		if (r.object.get("methods")) |mv| {
+			if (mv == .string and mv.string.len > 0) {
+				try out.appendSlice(allocator, " ");
+				try out.appendSlice(allocator, mv.string);
+				is_terminate = true; // a method constraint implies terminate
+			}
+		}
 		if (r.object.get("path")) |pv| {
 			if (pv == .string) {
 				try out.appendSlice(allocator, " ");
 				try out.appendSlice(allocator, pv.string);
 				is_terminate = true; // a path constraint implies terminate
+			}
+		}
+		if (r.object.get("pathmode")) |pm| {
+			if (pm == .string and std.mem.eql(u8, pm.string, "exact")) {
+				try out.appendSlice(allocator, " exact");
+				is_terminate = true;
+			}
+		}
+		if (r.object.get("service")) |sv| {
+			if (sv == .string and sv.string.len > 0) {
+				try out.appendSlice(allocator, " service=");
+				try out.appendSlice(allocator, sv.string);
+				is_terminate = true;
 			}
 		}
 		if (r.object.get("terminate")) |tv| {
@@ -161,15 +182,24 @@ fn cmdAdd(
 	// The 0-based index of the rule object once inserted, so an optional --plugin
 	// tag can be stamped onto exactly it.
 	var inserted_idx: usize = undefined;
+	const attrs: rule.Attrs = .{
+		.path = a.path,
+		.terminate = a.terminate,
+		.insecure = a.insecure,
+		.passthrough = a.passthrough,
+		.methods = a.methods,
+		.exact = a.exact,
+		.service = a.service,
+	};
 	if (a.pos) |p| {
-		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, a.path, a.terminate, a.insecure, a.passthrough) catch |err| switch (err) {
+		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, attrs) catch |err| switch (err) {
 			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
 			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
 			else => return err,
 		};
 		inserted_idx = p - 1;
 	} else {
-		const n = rule.append(tree_alloc, rules_arr, a.action, a.host, a.path, a.terminate, a.insecure, a.passthrough) catch |err| switch (err) {
+		const n = rule.append(tree_alloc, rules_arr, a.action, a.host, attrs) catch |err| switch (err) {
 			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
 			else => return err,
 		};
@@ -223,6 +253,20 @@ fn cmdDel(
 
 	try config.save(allocator, io, args.config_path, loaded.root().*);
 	try announce(allocator, io, "Deleted l7 rule {d}.", .{d.index});
+	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
+}
+
+fn cmdClear(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	args: cli.Args,
+	rules_arr: *std.json.Array,
+	c: cli.ClearArgs,
+	loaded: *config.Loaded,
+) !void {
+	const removed = rule.deleteByPlugin(rules_arr, c.plugin);
+	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try announce(allocator, io, "Cleared {d} l7 rule(s) tagged '{s}'.", .{ removed, c.plugin });
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
 }
 

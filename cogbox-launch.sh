@@ -21,10 +21,31 @@
 #   --no-auto-keys        On first init, leave authorized_keys empty and skip
 #                         generating cogbox's own SSH identity.
 #   --yes                 Skip the interactive harness-selection prompt.
+#   --bind-addr ADDR      Seed `.bindAddr` (the address the guest's port
+#                         forwards are advertised at; default 127.0.0.1).
+#   --no-implicit-dns     Seed `.network.implicitDns = false`, so port 53 stops
+#                         escaping the L4 rule walk. Needed wherever the host
+#                         resolver IS an address the sandbox must not reach
+#                         (on GCE the VPC resolver is the metadata address).
+#   --dns-host ADDR       Seed `.network.dnsHost`: the loopback address the
+#                         ENCLOSING host runs its own DNS forwarder on. Re-admits
+#                         that ONE address on port 53 to the L4 walk, which is
+#                         what keeps guest DNS alive under --no-implicit-dns when
+#                         passt forwards the guest's queries there.
+#   --self-addr CIDR      Seed one `.network.selfAddrs` entry (repeatable): an
+#                         address of the ENCLOSING host, which the L7 proxy
+#                         adds to its non-overridable floor.
+# The last four seed config.json on FIRST init only, like every other init
+# flag. All four are absent by default, so a config written without them is
+# byte-identical to one written before they existed.
 INIT_ONLY=0
 FLAG_VCPU=""
 FLAG_MEM=""
 FLAG_NETWORK=""
+FLAG_BIND_ADDR=""
+FLAG_NO_IMPLICIT_DNS=0
+FLAG_DNS_HOST=""
+FLAG_SELF_ADDRS=()
 INSTANCE_NAME=""
 AUTO_KEYS=1
 ASSUME_YES=0
@@ -37,6 +58,10 @@ while [ $# -gt 0 ]; do
 		--vcpu) FLAG_VCPU="$2"; shift 2 ;;
 		--mem) FLAG_MEM="$2"; shift 2 ;;
 		--network) FLAG_NETWORK="$2"; shift 2 ;;
+		--bind-addr) FLAG_BIND_ADDR="$2"; shift 2 ;;
+		--no-implicit-dns) FLAG_NO_IMPLICIT_DNS=1; shift ;;
+		--dns-host) FLAG_DNS_HOST="$2"; shift 2 ;;
+		--self-addr) FLAG_SELF_ADDRS+=("$2"); shift 2 ;;
 		*) echo "cogbox-launch: error: unexpected argument $1 (Zig wrapper should have rejected this)" >&2; exit 70 ;;
 	esac
 done
@@ -56,6 +81,12 @@ fi
 [ -n "$FLAG_VCPU" ]     && ORIG_ARGS+=(--vcpu "$FLAG_VCPU")
 [ -n "$FLAG_MEM" ]      && ORIG_ARGS+=(--mem "$FLAG_MEM")
 [ -n "$FLAG_NETWORK" ]  && ORIG_ARGS+=(--network "$FLAG_NETWORK")
+[ -n "$FLAG_BIND_ADDR" ] && ORIG_ARGS+=(--bind-addr "$FLAG_BIND_ADDR")
+[ "$FLAG_NO_IMPLICIT_DNS" -eq 1 ] && ORIG_ARGS+=(--no-implicit-dns)
+[ -n "$FLAG_DNS_HOST" ] && ORIG_ARGS+=(--dns-host "$FLAG_DNS_HOST")
+for _self_addr in "${FLAG_SELF_ADDRS[@]}"; do
+	ORIG_ARGS+=(--self-addr "$_self_addr")
+done
 [ "$AUTO_KEYS" -eq 0 ]  && ORIG_ARGS+=(--no-auto-keys)
 [ "$ASSUME_YES" -eq 1 ] && ORIG_ARGS+=(--yes)
 
@@ -789,6 +820,33 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		NETWORK_JQ="\"$INIT_NETWORK\""
 	fi
 
+	# Host-topology hardening, seeded into `.network` from --no-implicit-dns /
+	# --dns-host / --self-addr. RULES MODE ONLY: in `full`/`none` the value is a
+	# bare string, there is no L4 filter to parameterize and no l7proxy to give a
+	# floor to -- the enclosing host's own packet filter is the only control
+	# there, by design. Say so rather than writing keys nothing reads. (--dns-host
+	# is rules-mode-only for the same reason and loses nothing by it: it exists to
+	# re-admit one socket to the L4 walk, and full mode has no L4 walk. passt's
+	# own --dns-host is a separate, mode-independent knob; see PASST_DNS_ARGS.)
+	if [ "$FLAG_NO_IMPLICIT_DNS" -eq 1 ] || [ -n "$FLAG_DNS_HOST" ] || [ "${#FLAG_SELF_ADDRS[@]}" -gt 0 ]; then
+		if [ "$INIT_NETWORK" = "rules" ]; then
+			IMPLICIT_DNS_JQ='{}'
+			[ "$FLAG_NO_IMPLICIT_DNS" -eq 1 ] && IMPLICIT_DNS_JQ='{"implicitDns":false}'
+			SELF_ADDRS_JQ=$(printf '%s\n' "${FLAG_SELF_ADDRS[@]}" \
+				| jq -R -s 'split("\n") | map(select(length > 0))')
+			NETWORK_JQ=$(jq -nc \
+				--argjson network "$NETWORK_JQ" \
+				--argjson implicit "$IMPLICIT_DNS_JQ" \
+				--arg dnshost "$FLAG_DNS_HOST" \
+				--argjson self "$SELF_ADDRS_JQ" \
+				'$network + $implicit
+				 + (if ($dnshost | length) > 0 then { dnsHost: $dnshost } else {} end)
+				 + (if ($self | length) > 0 then { selfAddrs: $self } else {} end)')
+		else
+			echo "cogbox-launch: warning: --no-implicit-dns/--dns-host/--self-addr apply to \"rules\" mode only; ignored for network mode \"$INIT_NETWORK\"." >&2
+		fi
+	fi
+
 	if [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
 		if [ -z "$INSTANCE_NAME" ]; then
 			INIT_SSH=2222
@@ -804,6 +862,7 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 			--argjson ssh "$INIT_SSH" \
 			--argjson http "$INIT_HTTP" \
 			--argjson l7base "$INIT_L7" \
+			--arg bindaddr "${FLAG_BIND_ADDR:-127.0.0.1}" \
 			'{
 				vcpu: $vcpu,
 				mem: $mem,
@@ -812,7 +871,7 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 				l7PortBase: $l7base,
 				overlaySize: "128M",
 				storeOverlaySize: "16G",
-				bindAddr: "127.0.0.1",
+				bindAddr: $bindaddr,
 				network: $network
 			}' > "$INSTANCE_CONFIG_DIR/config.json"
 		[ -n "$INSTANCE_NAME" ] && echo "Instance \"$INSTANCE_NAME\" ports: SSH=$INIT_SSH HTTP=$INIT_HTTP L7=$INIT_L7"
@@ -1056,6 +1115,107 @@ L7_MITM_PORT=$(( L7_BASE + 2 ))
 OVERLAY_SIZE=$(jq -r '.overlaySize // "128M"' "$ACTIVE_CONFIG")
 STORE_OVERLAY_SIZE=$(jq -r '.storeOverlaySize // "16G"' "$ACTIVE_CONFIG")
 BIND_ADDR=$(jq -r '.bindAddr // "127.0.0.1"' "$ACTIVE_CONFIG")
+
+# -- Host-integration knobs (all empty/off by default) --------------
+# Set by the enclosing platform, never by a user rule verb. Every one of them
+# appends nothing when unset, so a local or k8s launch runs the exact argv it
+# ran before they existed.
+#
+# COGBOX_PASST_RUNAS   passt --runas <user>: give passt a DEDICATED uid instead
+#                      of the ambient `nobody` it self-drops to, so a packet
+#                      filter on the host can express "guest-originated" as a
+#                      uid match. Needs initial euid 0 or CAP_SETUID; when the
+#                      launcher runs as root (the k8s pod already does) that
+#                      holds. Applied in BOTH rules and full mode: full mode is
+#                      the one with no L4 filter at all, so the host's uid-scoped
+#                      rule is its only floor.
+# COGBOX_PROXY_RUNAS   run l7proxy and the mitmproxy terminate backend under
+#                      <user>:<group> (setpriv). Same reason from the other
+#                      side: in rules mode the proxy re-resolves an allowed
+#                      vhost and opens the upstream socket under ITS uid, not
+#                      passt's, so a passt-only rule leaves the proxy as an
+#                      unscoped relay. The runtime dir, the per-instance CA dir
+#                      and the mitmproxy confdir must be writable by that uid.
+# COGBOX_GUEST_RESOLVER  passt --dns-forward <addr> AND --no-map-gw: advertise
+#                      <addr> to the guest as its nameserver and INTERCEPT the
+#                      guest's queries to it, re-emitting them host-side to
+#                      passt's --dns-host address; and stop mapping the gateway
+#                      address to the host. <addr> is therefore a handle, not a
+#                      destination: the guest's DNS packets never leave the tap,
+#                      so the address needs no routability and faces no L4 rule.
+#                      What the guest actually resolves is whatever the HOST's
+#                      resolver resolves -- internal names included, which is the
+#                      parity the local and k8s backends have for free.
+#
+#                      The two flags are ONE knob on purpose. --no-map-gw is
+#                      what closes the DNS carve-out: passt normally maps the
+#                      gateway to the host, and traffic to that address on port
+#                      53 is NOT translated to loopback but handled as
+#                      --dns-forward to the host's own resolver -- so the guest
+#                      reaches the host resolver at a destination `evaluate`
+#                      never sees as loopback. Where the host resolver is an
+#                      address the sandbox must not reach, that is the hole, in
+#                      BOTH modes (full mode has no L4 filter at all). But
+#                      --no-map-gw ALSO disables the remap of loopback resolvers
+#                      from /etc/resolv.conf, which is how a dev box running
+#                      systemd-resolved gives its guests DNS at all. Dropping
+#                      the mapping is therefore safe exactly when an explicit
+#                      guest resolver replaces it -- which is why this knob
+#                      carries both flags and neither is applied without it.
+#
+#                      NOT `-D`, and the difference is the whole mechanism.
+#                      passt applies -D BEFORE reading /etc/resolv.conf and then
+#                      SKIPS reading it (conf.c get_dns(): `dns4_set` short-
+#                      circuits), so dns_host is left unspecified and passt's own
+#                      DNS forwarding is silently disarmed -- the guest gets a
+#                      raw address it must then reach on its own, which on a host
+#                      whose resolver is fenced off means a PUBLIC resolver and
+#                      no internal names. With --dns-forward and no -D, passt
+#                      reads resolv.conf, sees the host's LOOPBACK forwarder
+#                      there, and (per its own add_dns_resolv4 comment for
+#                      "--dns-forward and --no-map-gw") advertises the
+#                      --dns-forward address in its place while mapping it to the
+#                      forwarder. That requires the host's first resolv.conf
+#                      nameserver to BE a loopback address; where it is not,
+#                      COGBOX_HOST_RESOLVER below pins the target explicitly.
+# COGBOX_HOST_RESOLVER  passt --dns-host <addr>: the address passt re-emits the
+#                      intercepted queries to, i.e. the loopback forwarder on the
+#                      enclosing host. Only applied together with
+#                      COGBOX_GUEST_RESOLVER, because alone it would pin a
+#                      forwarding target for a forwarding path nothing enabled.
+#                      passt takes a bare address here (conf.c parses it with
+#                      inet_pton, so a `host:port` spelling is rejected outright)
+#                      and, unlike --dns-forward, it accepts a loopback one.
+#                      The L4 shim needs the matching `cogbox init --dns-host`
+#                      seed to let that loopback socket through in rules mode;
+#                      the enclosing host's own packet filter needs a rule for
+#                      it too. Nothing sets this on a local, k8s or container
+#                      launch, so their argv is unchanged.
+# COGBOX_PASST_BIND_FORWARDS  bind the guest port forwards to $BIND_ADDR
+#                      instead of every address. Opt-in because the k8s and
+#                      local backends leave `.bindAddr` at 127.0.0.1 and depend
+#                      on the forwards being reachable at the pod/host address.
+PASST_RUNAS_ARGS=()
+[ -n "${COGBOX_PASST_RUNAS:-}" ] && PASST_RUNAS_ARGS=(--runas "$COGBOX_PASST_RUNAS")
+PASST_DNS_ARGS=()
+if [ -n "${COGBOX_GUEST_RESOLVER:-}" ]; then
+	PASST_DNS_ARGS=(--no-map-gw --dns-forward "$COGBOX_GUEST_RESOLVER")
+	[ -n "${COGBOX_HOST_RESOLVER:-}" ] && PASST_DNS_ARGS+=(--dns-host "$COGBOX_HOST_RESOLVER")
+fi
+# PHASE-0: passt(1) documents `-t 22:23` (port pair) and `-t 192.0.2.1/22`
+# (address-scoped) separately and never in combination; prove the composition
+# on the target passt build before relying on this knob.
+PASST_FWD_PREFIX=""
+[ -n "${COGBOX_PASST_BIND_FORWARDS:-}" ] && PASST_FWD_PREFIX="${BIND_ADDR}/"
+# Run a host-half helper under the proxy uid when one is configured. Expands to
+# nothing when it is not, so the command line is unchanged.
+# Accepts `user` (group of the same name) or `user:group`.
+PROXY_RUNAS_ARGS=()
+if [ -n "${COGBOX_PROXY_RUNAS:-}" ]; then
+	command -v setpriv >/dev/null 2>&1 \
+		|| die "COGBOX_PROXY_RUNAS is set but setpriv is not on PATH; refusing to run the proxies as the launching user instead." 70
+	PROXY_RUNAS_ARGS=(setpriv --reuid "${COGBOX_PROXY_RUNAS%%:*}" --regid "${COGBOX_PROXY_RUNAS#*:}" --clear-groups)
+fi
 
 # -- Classify network mode -----------------------------------------
 if [ -n "$FLAG_NETWORK" ]; then
@@ -1451,7 +1611,7 @@ wait_for_passt() {
 # real conflict, not a benign race), so the instance never boots with a funnel
 # that can't reach its proxy.
 start_l7proxy() {
-	@cogbox@ __l7proxy "$RUNTIME" "$L7_BASE" &
+	"${PROXY_RUNAS_ARGS[@]}" @cogbox@ __l7proxy "$RUNTIME" "$L7_BASE" &
 	L7PROXY_PID=$!
 	echo "$L7PROXY_PID" > "$RUNTIME/l7proxy.pid"
 	# Brief liveness check, then FAIL CLOSED. The proxy binds this instance's
@@ -1491,6 +1651,7 @@ start_l7mitm() {
 	[ -f "$inject_conf" ] || inject_conf=""
 	COGBOX_L7_RULES="$RUNTIME/l7-rules" \
 	COGBOX_L7_INJECT_CONF="$inject_conf" \
+	"${PROXY_RUNAS_ARGS[@]}" \
 	@mitmdump@ --mode "socks5@${L7_MITM_PORT}" --listen-host 127.0.0.1 \
 		--set confdir="$ca_dir" --set http2=false --set connection_strategy=lazy \
 		-s "@l7addon@" -q &
@@ -1531,11 +1692,16 @@ launch_vm() {
 }
 
 if [ "$NETWORK_MODE" = "rules" ]; then
-	# Rules mode: passt with LD_PRELOAD netfilter
+	# Rules mode: passt with LD_PRELOAD netfilter. The RUNAS / guest-DNS /
+	# forward-prefix pieces expand to NOTHING unless their knob is set (see the
+	# block near the config reads), so an unconfigured host runs the argv it
+	# ran before they existed. Guest DNS is a floor concern in BOTH modes, so
+	# the same pieces are applied to the full-mode invocation below.
 	NETFILTER_RULES="$RUNTIME/netfilter-rules" \
 	LD_PRELOAD="@netfilter@" \
 	passt --foreground --socket "$PASST_SOCK" \
-		-t "$SSH_PORT:22" -t "$HTTP_PORT:8080" &
+		"${PASST_RUNAS_ARGS[@]}" "${PASST_DNS_ARGS[@]}" \
+		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" &
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
@@ -1554,9 +1720,13 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	start_l7proxy
 	launch_vm
 elif [ "$NETWORK_MODE" != "none" ]; then
-	# Full mode: unrestricted passt
+	# Full mode: unrestricted passt. This is the mode with NO L4 filter, so
+	# whatever the host's own packet filter expresses about the guest is the
+	# only floor -- which is exactly why the uid and guest-DNS knobs must be
+	# applied here too, not only in rules mode.
 	passt --foreground --socket "$PASST_SOCK" \
-		-t "$SSH_PORT:22" -t "$HTTP_PORT:8080" &
+		"${PASST_RUNAS_ARGS[@]}" "${PASST_DNS_ARGS[@]}" \
+		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" &
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt

@@ -1,4 +1,9 @@
 result
+# `nix build` numbers its outputs result-1, result-2, ... whenever more than one
+# installable is built at once -- which is how the gce-* checks get run -- and
+# plain `result` does not match those. Untracked store symlinks sitting in the
+# repo root are one `git add -A` away from being committed.
+result-*
 ref
 .zig-cache
 .worktree

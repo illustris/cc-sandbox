@@ -336,7 +336,7 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	const plugin_name: []const u8 = blk: {
 		if (a.as) |as| {
 			if (!name_mod.isValidPluginName(as)) {
-				die(allocator, io, "invalid plugin name '{s}' (must start with a letter, [a-zA-Z0-9-], max 64; 'user' is reserved)", .{as}, 65);
+				die(allocator, io, "invalid plugin name '{s}' (must start with a letter, [a-zA-Z0-9-], max 64; 'user' and 'git-grants' are reserved)", .{as}, 65);
 			}
 			break :blk try allocator.dupe(u8, as);
 		}
@@ -1375,6 +1375,20 @@ fn doToplevelBuild(ctx: *const Ctx) bool {
 	const substituters = buildSubstituters(allocator, ctx.cache_dir, extra_subs, base_root) orelse return false;
 	defer allocator.free(substituters);
 
+	// nix --max-jobs for the toplevel build. cogworx sets COGBOX_WORKER_BUILD_JOBS ONLY
+	// on a transient worker pod sized with extra cores (never the live agent), so a
+	// parallel build can't OOM a running sandbox. Parse defensively: absent, unparseable,
+	// or <1 => "" => nix.zig keeps its hardcoded -j1 guard. Clamp against garbage (the
+	// worker is operator-sized, so a high ceiling is fine). Owned through buildToplevel.
+	const build_jobs: []const u8 = blk: {
+		const raw = env.get("COGBOX_WORKER_BUILD_JOBS") orelse break :blk "";
+		const n = std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10) catch break :blk "";
+		if (n < 1) break :blk "";
+		const clamped = @min(n, 64);
+		break :blk std.fmt.allocPrint(allocator, "{d}", .{clamped}) catch break :blk "";
+	};
+	defer if (build_jobs.len > 0) allocator.free(build_jobs);
+
 	const out = nix.buildToplevel(allocator, ctx.io, env, .{
 		.flake_source = flake_source,
 		.nixpkgs_source = nixpkgs_source,
@@ -1384,6 +1398,7 @@ fn doToplevelBuild(ctx: *const Ctx) bool {
 		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
 		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
 		.base_store_root = base_root orelse "",
+		.build_jobs = build_jobs,
 	}) catch {
 		warn(ctx, "toplevel build: failed to launch (boot uses baked base)", .{}) catch {};
 		return false;

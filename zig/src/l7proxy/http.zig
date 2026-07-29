@@ -13,6 +13,7 @@ const std = @import("std");
 pub const Parsed = struct {
 	host: []const u8, // aliases out_host, port stripped
 	path: []const u8, // aliases out_path, normalized
+	method: []const u8, // aliases the input `buf`, uppercase (e.g. GET/POST)
 };
 
 pub const ParseResult = union(enum) {
@@ -88,7 +89,9 @@ pub fn parseRequestHead(buf: []const u8, out_host: []u8, out_path: []u8) ParseRe
 
 	const norm = normalizePath(raw_path, out_path) orelse return .deny;
 	@memcpy(out_host[0..host.len], host);
-	return .{ .ok = .{ .host = out_host[0..host.len], .path = norm } };
+	// `method` aliases the caller's `buf` (the request bytes), which outlives
+	// the returned Parsed on every call site (peek buffer / test fixture).
+	return .{ .ok = .{ .host = out_host[0..host.len], .path = norm, .method = method } };
 }
 
 pub const Precheck = enum { plausible, deny };
@@ -268,6 +271,7 @@ test "parse basic GET" {
 	try t.expect(r == .ok);
 	try t.expectEqualStrings("vhost-a.test", r.ok.host);
 	try t.expectEqualStrings("/v1/x", r.ok.path);
+	try t.expectEqualStrings("GET", r.ok.method);
 }
 
 test "parse strips host port" {

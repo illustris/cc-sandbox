@@ -19,6 +19,10 @@ pub const FlagKind = enum {
 	bool,
 	/// `--flag VALUE` or `--flag=VALUE`
 	value,
+	/// `--flag VALUE`, REPEATABLE: every occurrence is retained in argv order
+	/// (`getAll`). `get`/`isSet` still see the last one, so a caller that does
+	/// not care about repetition behaves exactly like `.value`.
+	value_multi,
 };
 
 pub const Flag = struct {
@@ -41,16 +45,26 @@ pub const Spec = struct {
 	terminate_on_positional: bool = false,
 };
 
+/// One occurrence of a `.value_multi` flag.
+pub const MultiValue = struct {
+	name: []const u8, // flag long-name
+	value: []const u8,
+};
+
 pub const Parsed = struct {
 	/// Map from flag long-name to the parsed value. For bool flags the
 	/// value is "" (presence == set). Unset flags are absent.
 	values: std.StringHashMap([]const u8),
+	/// Every occurrence of every `.value_multi` flag, in argv order. A map
+	/// cannot hold these: it keeps one value per key by construction.
+	multi: std.ArrayList(MultiValue),
 	positional: std.ArrayList([]const u8),
 	trailing: std.ArrayList([]const u8),
 	allocator: std.mem.Allocator,
 
 	pub fn deinit(self: *Parsed) void {
 		self.values.deinit();
+		self.multi.deinit(self.allocator);
 		self.positional.deinit(self.allocator);
 		self.trailing.deinit(self.allocator);
 	}
@@ -62,6 +76,18 @@ pub const Parsed = struct {
 	pub fn get(self: *const Parsed, name: []const u8) ?[]const u8 {
 		return self.values.get(name);
 	}
+
+	/// Every value given for a repeatable flag, in argv order. Empty when the
+	/// flag was never given. Caller owns the returned slice; the values inside
+	/// it are borrowed from argv, like every other `Parsed` accessor.
+	pub fn getAll(self: *const Parsed, allocator: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+		var out: std.ArrayList([]const u8) = .empty;
+		errdefer out.deinit(allocator);
+		for (self.multi.items) |m| {
+			if (std.mem.eql(u8, m.name, name)) try out.append(allocator, m.value);
+		}
+		return try out.toOwnedSlice(allocator);
+	}
 };
 
 pub fn parse(
@@ -71,6 +97,7 @@ pub fn parse(
 	argv: []const []const u8,
 ) Parsed {
 	var values = std.StringHashMap([]const u8).init(allocator);
+	var multi: std.ArrayList(MultiValue) = .empty;
 	var positional: std.ArrayList([]const u8) = .empty;
 	var trailing: std.ArrayList([]const u8) = .empty;
 
@@ -99,6 +126,9 @@ pub fn parse(
 					util.die(allocator, io, spec.verb, exit_codes.usage, "--{s} does not take a value", .{name});
 				}
 				values.put(flag.long, val) catch oom();
+				if (flag.kind == .value_multi) {
+					multi.append(allocator, .{ .name = flag.long, .value = val }) catch oom();
+				}
 				continue;
 			}
 			// --key [value]
@@ -114,6 +144,9 @@ pub fn parse(
 				util.die(allocator, io, spec.verb, exit_codes.usage, "--{s} requires a value", .{rest});
 			}
 			values.put(flag.long, argv[i]) catch oom();
+			if (flag.kind == .value_multi) {
+				multi.append(allocator, .{ .name = flag.long, .value = argv[i] }) catch oom();
+			}
 			continue;
 		}
 
@@ -136,6 +169,9 @@ pub fn parse(
 				util.die(allocator, io, spec.verb, exit_codes.usage, "-{c} requires a value", .{c});
 			}
 			values.put(flag.long, argv[i]) catch oom();
+			if (flag.kind == .value_multi) {
+				multi.append(allocator, .{ .name = flag.long, .value = argv[i] }) catch oom();
+			}
 			continue;
 		}
 
@@ -156,6 +192,7 @@ pub fn parse(
 
 	return .{
 		.values = values,
+		.multi = multi,
 		.positional = positional,
 		.trailing = trailing,
 		.allocator = allocator,
@@ -260,6 +297,53 @@ test "isValidName" {
 	try std.testing.expect(!isValidName("-abc"));
 	try std.testing.expect(!isValidName("a_b"));
 	try std.testing.expect(!isValidName("a b"));
+}
+
+// `.value_multi` exists for one caller: `cogbox init --self-addr`, where the
+// enclosing host may have more than one address and dropping all but the last
+// would silently shrink a security floor to one entry.
+test "value_multi retains every occurrence in argv order" {
+	const flags = [_]Flag{
+		.{ .long = "self-addr", .kind = .value_multi },
+		.{ .long = "name", .short = 'n', .kind = .value },
+	};
+	var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+	defer threaded.deinit();
+	var p = parse(std.testing.allocator, threaded.io(), .{ .verb = "init", .flags = &flags }, &.{
+		"--self-addr", "10.0.0.1/32",
+		"--name",      "demo",
+		"--self-addr=10.0.0.2/32",
+	});
+	defer p.deinit();
+
+	const all = try p.getAll(std.testing.allocator, "self-addr");
+	defer std.testing.allocator.free(all);
+	try std.testing.expectEqual(@as(usize, 2), all.len);
+	try std.testing.expectEqualStrings("10.0.0.1/32", all[0]);
+	try std.testing.expectEqualStrings("10.0.0.2/32", all[1]);
+	// The single-value accessors keep working (last occurrence wins).
+	try std.testing.expect(p.isSet("self-addr"));
+	try std.testing.expectEqualStrings("10.0.0.2/32", p.get("self-addr").?);
+	try std.testing.expectEqualStrings("demo", p.get("name").?);
+}
+
+test "getAll returns empty for an unset or non-multi flag" {
+	const flags = [_]Flag{
+		.{ .long = "self-addr", .kind = .value_multi },
+		.{ .long = "name", .kind = .value },
+	};
+	var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+	defer threaded.deinit();
+	var p = parse(std.testing.allocator, threaded.io(), .{ .verb = "init", .flags = &flags }, &.{ "--name", "demo" });
+	defer p.deinit();
+
+	const none = try p.getAll(std.testing.allocator, "self-addr");
+	defer std.testing.allocator.free(none);
+	try std.testing.expectEqual(@as(usize, 0), none.len);
+	// A `.value` flag never lands in the repeat list, however often it appears.
+	const not_multi = try p.getAll(std.testing.allocator, "name");
+	defer std.testing.allocator.free(not_multi);
+	try std.testing.expectEqual(@as(usize, 0), not_multi.len);
 }
 
 test "looksLikeFlag" {

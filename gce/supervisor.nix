@@ -1,0 +1,173 @@
+# cogworx-supervisor.service -- the GCE transcription of the k8s sandbox pod
+# entrypoint, plus cogworx-cogbox-log.service, the unit that exists purely so
+# the cogbox runtime log CANNOT reach serial.
+#
+# The Requires= on both cogworx-attr-scrub.service and cogworx-floor.service is
+# the shape that preserves the identity contract: the sandbox is never started and the
+# unit reports failure" if either fails. `After=` alone would order the units
+# and then start the sandbox anyway on a floor-failed boot -- and a full-mode
+# guest on a floorless VM can reach the metadata API and FORGE the very guest
+# trusted attributes, so an unverified floor must be unable to
+# yield a Running sandbox.
+#
+# Serial classification. The earlier shape of this unit was
+# StandardOutput=journal+console with leg (g) piping `tail -F cogbox.log` into
+# the same stdout. On GCE `console` is ttyS0 -- the exact port Backend.Log reads
+# through instances.getSerialPortOutput, a provider-retained channel readable
+# under a coarser, separate grant from the control channel, and optionally
+# exported to Cloud Logging. cogbox.log is not a boot log: cogbox-launch.sh
+# redirects its whole process group there, so every backgrounded child inherits
+# it -- passt, QEMU stderr, l7proxy with its per-request allow/deny decisions,
+# and mitmdump running the credential-injection addon. That is the guest's full
+# L7 request stream plus the injection addon's output. On k8s the same leg was
+# safe because the pod log sits behind the same RBAC as exec; on GCE the
+# channel's trust domain changed, so:
+#
+#   - this unit is journal-only on both streams;
+#   - only classified boot/lifecycle lines reach serial, written explicitly by
+#     supervise.sh's emit() helper, never by stream inheritance;
+#   - the cogbox.log tail lives in its own journal-only unit below.
+#
+# The control plane deliberately does NOT compensate downstream with a scrubber
+# in Backend.Log, because a scrubber over a provider-retained channel is a false
+# sense of safety. That deferral is only legitimate because the source control
+# is here, so do not reintroduce `journal+console` or a tail on this stdout.
+{ config, lib, pkgs, ... }:
+let
+	cfg = config.cogworx.gce;
+
+	supervise = pkgs.runCommand "cogworx-supervise" { } ''
+		mkdir -p $out/bin
+		install -m0755 ${./supervise.sh} $out/bin/cogworx-supervise
+		patchShebangs $out/bin/cogworx-supervise
+	'';
+
+	# Level-held readiness: this covers the crash paths the poll loop cannot
+	# (unit stop, failure past the restart limit, a killed supervisor). Without
+	# it a dead sandbox coasts on a stamped attribute for the rest of the start
+	# epoch, which is exactly what the kubelet's level-checked pod readiness
+	# does not do.
+	stopPost = pkgs.writeShellApplication {
+		name = "cogworx-supervisor-stop";
+		runtimeInputs = [ pkgs.curl ];
+		text = ''
+			curl -fsS -o /dev/null -X DELETE -H 'Metadata-Flavor: Google' --max-time 10 \
+				"http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/cogworx/ready" \
+				2>/dev/null || true
+			echo "cogworx-supervisor: readiness attribute unpublished"
+		'';
+	};
+
+	cogboxLog = pkgs.writeShellApplication {
+		name = "cogworx-cogbox-log";
+		runtimeInputs = [ pkgs.curl pkgs.coreutils ];
+		text = ''
+			inst=$(curl -fsS -H 'Metadata-Flavor: Google' --max-time 10 \
+				"http://metadata.google.internal/computeMetadata/v1/instance/attributes/cogworx-instance" 2>/dev/null || true)
+			if [ -z "$inst" ]; then
+				echo "cogworx-cogbox-log: no cogworx-instance attribute; nothing to tail" >&2
+				exit 0
+			fi
+			log="''${XDG_RUNTIME_DIR:-/run/cogbox}/cogbox-$inst/cogbox.log"
+			# -F so the tail survives the file being created after this unit
+			# starts and re-created across a sandbox restart.
+			exec tail -n +1 -F "$log"
+		'';
+	};
+in
+{
+	config = {
+		systemd.services.cogworx-supervisor = {
+			description = "cogworx sandbox supervisor";
+			wantedBy = [ "multi-user.target" ];
+			# Requires=, not merely After=. See the header.
+			requires = [ "cogworx-attr-scrub.service" "cogworx-floor.service" ];
+			after = [
+				"cogworx-attr-scrub.service"
+				"cogworx-floor.service"
+				"network-online.target"
+				# The VM host key leg (a2) reads the key sshd-keygen writes.
+				"sshd.service"
+				# passt reads /etc/resolv.conf at launch and must find the
+				# resolved STUB there: that is what makes it advertise the
+				# --dns-forward address to the guest instead of the host's real
+				# resolver. NixOS points /etc/resolv.conf at a file resolved
+				# creates, so before resolved is up the symlink dangles and passt
+				# would fall back to advertising nothing at all.
+				"systemd-resolved.service"
+			];
+			wants = [ "network-online.target" "sshd.service" "systemd-resolved.service" ];
+			path = [
+				cfg.cogboxPackage
+				pkgs.curl
+				pkgs.coreutils
+				pkgs.util-linux
+				pkgs.gawk
+				pkgs.gnugrep
+				pkgs.gnused
+				pkgs.jq
+				pkgs.bash
+			];
+			environment = {
+				# Host-integration knobs. Both passt invocations (rules
+				# AND full mode) pick these up; full mode is the one with no L4
+				# filter at all, so the uid split is its only floor.
+				COGBOX_PASST_RUNAS = cfg.passtUser;
+				COGBOX_PROXY_RUNAS = "${cfg.proxyUser}:${cfg.proxyUser}";
+				# Bind the guest forwards at .bindAddr (the VM's own address)
+				# rather than every address. Opt-in in cogbox because the local
+				# and k8s backends leave bindAddr at loopback and depend on the
+				# forwards being reachable at the pod address.
+				COGBOX_PASST_BIND_FORWARDS = "1";
+				# The loopback socket passt re-emits the guest's intercepted DNS
+				# queries to (`--dns-host`), which is also what supervise.sh
+				# hands `cogbox init --dns-host` so the L4 shim admits that one
+				# socket. Both consumers read THIS value, and gce/floor.nix
+				# renders rule 3's accept and its probe from the same option, so
+				# the four cannot name different sockets.
+				COGBOX_HOST_RESOLVER = cfg.hostResolver;
+				XDG_CONFIG_HOME = "${cfg.stateDir}/config";
+				COGBOX_DATA = "${cfg.stateDir}/data/cogbox";
+				XDG_RUNTIME_DIR = "/run/cogbox";
+				COGWORX_STATE_DIR = cfg.stateDir;
+				COGWORX_SERIAL = cfg.serialDevice;
+				HOME = "/root";
+			};
+			serviceConfig = {
+				Type = "simple";
+				ExecStart = "${supervise}/bin/cogworx-supervise";
+				ExecStopPost = "${stopPost}/bin/cogworx-supervisor-stop";
+				Restart = "always";
+				RestartSec = 5;
+				# journal, NOT journal+console. See the header.
+				StandardOutput = "journal";
+				StandardError = "journal";
+				RuntimeDirectory = "cogbox";
+				RuntimeDirectoryPreserve = "yes";
+			};
+			unitConfig = {
+				# Keep retrying instead of allowing a systemd start limit to
+				# silently stop the supervisor.
+				StartLimitIntervalSec = 0;
+			};
+		};
+
+		systemd.services.cogworx-cogbox-log = {
+			description = "cogbox runtime log -> journal (never serial)";
+			wantedBy = [ "multi-user.target" ];
+			after = [ "cogworx-supervisor.service" ];
+			bindsTo = [ "cogworx-supervisor.service" ];
+			environment = {
+				XDG_RUNTIME_DIR = "/run/cogbox";
+			};
+			serviceConfig = {
+				Type = "simple";
+				ExecStart = "${cogboxLog}/bin/cogworx-cogbox-log";
+				Restart = "always";
+				RestartSec = 5;
+				StandardOutput = "journal";
+				StandardError = "journal";
+			};
+		};
+	};
+}

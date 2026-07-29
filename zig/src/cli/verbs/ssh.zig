@@ -143,10 +143,10 @@ pub fn readEndpoint(allocator: std.mem.Allocator, io: std.Io, inst_runtime: []co
 	return .{ .port = port_d, .host = host_d };
 }
 
-/// Replace this process with `ssh` pointed at `endpoint`. `extra` is appended
-/// after the `root@host` target (remote command and/or extra ssh args). Host
-/// key checking is disabled because the guest's root disk is ephemeral and its
-/// host keys regenerate on every boot.
+/// Replace this process with `ssh` pointed at `endpoint`. `extra` is the remote
+/// command, appended after the `root@host` target and quoted for the guest shell
+/// (see `appendRemoteCommand`). Host key checking is disabled because the guest's
+/// root disk is ephemeral and its host keys regenerate on every boot.
 ///
 /// When `identity` is non-null (cogbox's own managed key; see `defaultIdentity`)
 /// ssh is pinned to *only* that key -- `-i <identity>` plus IdentitiesOnly=yes
@@ -202,10 +202,12 @@ fn wantPty(extra: []const []const u8, stdin_is_tty: bool, stdout_is_tty: bool) b
 /// Append the full `ssh ...` argv for `endpoint` into `argv`. When `force_pty`
 /// is set a single `-t` is inserted just before the `root@host` target (an ssh
 /// option must precede the host) so ssh allocates a remote PTY; see `wantPty`
-/// for when `force_pty` is set. The target string and the list's backing are
-/// owned by `allocator`; on the normal path `exec` hands `argv` straight to
-/// execvp, so they live until this process is replaced. Split out from `exec`
-/// so the `-t` placement is unit-testable without a real exec or a local tty.
+/// for when `force_pty` is set. The remote command follows the target, quoted by
+/// `appendRemoteCommand` so ssh's space-join cannot let the guest shell re-parse
+/// it. The target string, the quoted arguments and the list's backing are owned
+/// by `allocator`; on the normal path `exec` hands `argv` straight to execvp, so
+/// they live until this process is replaced. Split out from `exec` so the `-t`
+/// placement and the quoting are unit-testable without a real exec or a local tty.
 fn buildArgv(
 	allocator: std.mem.Allocator,
 	argv: *std.ArrayList([]const u8),
@@ -242,7 +244,69 @@ fn buildArgv(
 	try argv.append(allocator, endpoint.port);
 	if (force_pty) try argv.append(allocator, "-t");
 	try argv.append(allocator, target);
-	for (extra) |t| try argv.append(allocator, t);
+	try appendRemoteCommand(allocator, argv, extra);
+}
+
+/// Append the caller's remote command to an `ssh` argv, quoted for the shell on
+/// the far side.
+///
+/// ssh does NOT execute the words after the target as an argv vector: it joins
+/// them with single spaces into ONE string, and the remote sshd hands that
+/// string to `sh -c`. Forwarded bare, every shell metacharacter in an argument
+/// is reinterpreted remotely and the word boundaries are gone. For example:
+///
+///   cogbox ssh -n <inst> tmux list-sessions -F '#{session_name}\t#{session_attached}'
+///
+/// arrived in the guest as `... -F #{session_name}<TAB>#{session_attached}`,
+/// where `#` opens a comment and tmux receives a bare `-F`.
+///
+/// So a command of TWO OR MORE arguments is an argv vector the caller built,
+/// and every element is single-quoted: each byte reaches the remote command
+/// literally, which is both the correctness fix and the injection fix (an
+/// element may be a plugin URL, an instance name, or anything else the caller
+/// did not vet). This is the same treatment the control plane already gives
+/// its own outer hop.
+///
+/// A LONE argument is passed through VERBATIM, because one argument is ssh's
+/// own remote-command-STRING form and cogbox has always had it -- the guest
+/// test suite is full of `cogbox ssh 'readlink -f $(command -v hello)'`, where
+/// the guest shell is meant to interpret the string. Quoting it would make the
+/// whole line a single command NAME. The two forms do not overlap: a caller who
+/// wants shell syntax with several words either passes it as one string or
+/// spells it `sh -c '<script>'` (which, quoted, still reaches the guest intact).
+///
+/// Empty `extra` appends nothing, so the interactive login is untouched.
+fn appendRemoteCommand(
+	allocator: std.mem.Allocator,
+	argv: *std.ArrayList([]const u8),
+	extra: []const []const u8,
+) !void {
+	if (extra.len < 2) {
+		for (extra) |t| try argv.append(allocator, t);
+		return;
+	}
+	for (extra) |t| try argv.append(allocator, try quoteArg(allocator, t));
+}
+
+/// Single-quote one argument for POSIX sh: inside single quotes every byte is
+/// literal except the quote itself, which is closed, escaped and reopened
+/// (`'\''`). An empty argument becomes `''`, so it survives as a word instead of
+/// vanishing in the join. The returned slice is owned by `allocator`; like
+/// `buildArgv`'s target it lives until execvp replaces the process (tests use an
+/// arena).
+fn quoteArg(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+	var out: std.ArrayList(u8) = .empty;
+	errdefer out.deinit(allocator);
+	try out.append(allocator, '\'');
+	for (s) |c| {
+		if (c == '\'') {
+			try out.appendSlice(allocator, "'\\''");
+		} else {
+			try out.append(allocator, c);
+		}
+	}
+	try out.append(allocator, '\'');
+	return out.toOwnedSlice(allocator);
 }
 
 /// Path to cogbox's managed SSH identity (`<data>/cogbox_ed25519`), or null if
@@ -426,6 +490,16 @@ fn argvIndex(argv: []const []const u8, needle: []const u8) ?usize {
 	return null;
 }
 
+/// The ONE string ssh actually sends: every argv element after `root@host`
+/// joined with single spaces, which is exactly what the remote sshd hands to
+/// `sh -c`. Asserting on this asserts on what the guest shell parses, not on
+/// an argv the guest never sees.
+fn remoteCommandLine(allocator: std.mem.Allocator, argv: []const []const u8, ep: Endpoint) ![]u8 {
+	const target = try std.fmt.allocPrint(allocator, "root@{s}", .{ep.host});
+	const host_i = argvIndex(argv, target).?;
+	return std.mem.join(allocator, " ", argv[host_i + 1 ..]);
+}
+
 test "buildArgv adds a single -t before the target only when force_pty" {
 	var arena = std.heap.ArenaAllocator.init(testing.allocator);
 	defer arena.deinit();
@@ -471,15 +545,17 @@ test "buildArgv adds a single -t before the target only when force_pty" {
 	}
 
 	// A multi-element command is appended in order as the argv tail, immediately
-	// after the target (and after `-t` when a PTY is forced).
+	// after the target (and after `-t` when a PTY is forced), one shell-quoted
+	// element each -- see `appendRemoteCommand`.
 	{
 		var argv: std.ArrayList([]const u8) = .empty;
 		const cmd = [_][]const u8{ "uname", "-a" };
+		const want = [_][]const u8{ "'uname'", "'-a'" };
 		try buildArgv(a, &argv, ep, null, &cmd, true);
 		const host_i = argvIndex(argv.items, "root@10.0.2.15").?;
 		try testing.expectEqual(cmd.len, argv.items.len - (host_i + 1));
-		for (cmd, 0..) |want, j| {
-			try testing.expectEqualStrings(want, argv.items[host_i + 1 + j]);
+		for (want, 0..) |w, j| {
+			try testing.expectEqualStrings(w, argv.items[host_i + 1 + j]);
 		}
 	}
 }
@@ -510,6 +586,85 @@ test "buildArgv pins to the cogbox key and disables the agent only with an ident
 		try testing.expect(argvIndex(argv.items, "IdentitiesOnly=yes") == null);
 		try testing.expect(argvIndex(argv.items, "IdentityAgent=none") == null);
 		try testing.expect(argvIndex(argv.items, "-i") == null);
+	}
+}
+
+test "buildArgv quotes a multi-word remote command so the guest shell sees the caller's words" {
+	var arena = std.heap.ArenaAllocator.init(testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	const ep: Endpoint = .{ .port = "2222", .host = "10.0.2.15" };
+
+	// A control plane may enumerate the guest's tmux sessions with
+	//   cogbox ssh -n <inst> tmux list-sessions -F '#{session_name}\t#{session_attached}'
+	// Forwarded bare, ssh's space-join handed the guest shell an unquoted
+	// `#{session_name}` -- which opens a COMMENT -- so tmux saw a bare `-F` and
+	// exits 1 ("command list-sessions: -F expects an argument").
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		const cmd = [_][]const u8{ "tmux", "list-sessions", "-F", "#{session_name}\t#{session_attached}" };
+		try buildArgv(a, &argv, ep, null, &cmd, false);
+		try testing.expectEqualStrings(
+			"'tmux' 'list-sessions' '-F' '#{session_name}\t#{session_attached}'",
+			try remoteCommandLine(a, argv.items, ep),
+		);
+	}
+
+	// Every metacharacter class the join would otherwise hand to the guest
+	// shell, as the third word of an argv command. The tab and the newline are
+	// word separators for the remote `sh -c`; the rest are expansions,
+	// comments, or a command separator (an injection, when any element is
+	// user-controlled).
+	{
+		const cases = [_]struct { arg: []const u8, want: []const u8 }{
+			.{ .arg = "#{session_name}", .want = "'#{session_name}'" },
+			.{ .arg = "two words", .want = "'two words'" },
+			.{ .arg = "it's", .want = "'it'\\''s'" },
+			.{ .arg = "'", .want = "''\\'''" },
+			.{ .arg = "$HOME", .want = "'$HOME'" },
+			.{ .arg = "`id`", .want = "'`id`'" },
+			.{ .arg = "a\tb", .want = "'a\tb'" },
+			.{ .arg = "a\nb", .want = "'a\nb'" },
+			.{ .arg = "a;id", .want = "'a;id'" },
+			.{ .arg = "*", .want = "'*'" },
+			.{ .arg = "", .want = "''" },
+		};
+		for (cases) |c| {
+			var argv: std.ArrayList([]const u8) = .empty;
+			const cmd = [_][]const u8{ "printf", "%s", c.arg };
+			try buildArgv(a, &argv, ep, null, &cmd, false);
+			try testing.expectEqualStrings(
+				try std.fmt.allocPrint(a, "'printf' '%s' {s}", .{c.want}),
+				try remoteCommandLine(a, argv.items, ep),
+			);
+		}
+	}
+}
+
+test "buildArgv keeps the lone remote-command string and the no-command login untouched" {
+	var arena = std.heap.ArenaAllocator.init(testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	const ep: Endpoint = .{ .port = "2222", .host = "10.0.2.15" };
+
+	// One argument is ssh's own remote-command-STRING form, which cogbox has
+	// always had and the guest test suite uses throughout; quoting it would turn
+	// the whole string into a single command NAME. It goes through verbatim.
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		try buildArgv(a, &argv, ep, null, &.{"readlink -f $(command -v hello)"}, false);
+		try testing.expectEqualStrings(
+			"readlink -f $(command -v hello)",
+			try remoteCommandLine(a, argv.items, ep),
+		);
+	}
+
+	// No command at all (interactive login, and `cogbox start`'s auto-ssh) sends
+	// nothing after the target -- a real login PTY, exactly as before.
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		try buildArgv(a, &argv, ep, null, &.{}, false);
+		try testing.expectEqualStrings("", try remoteCommandLine(a, argv.items, ep));
 	}
 }
 

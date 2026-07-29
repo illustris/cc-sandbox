@@ -24,6 +24,13 @@ pub fn run(
 		.{ .long = "vcpu", .kind = .value },
 		.{ .long = "mem", .kind = .value },
 		.{ .long = "network", .kind = .value },
+		// Host-integration seeds, written into config.json on FIRST init only,
+		// like every other init flag. Declared on `__launch` as well so the
+		// custom-flake re-exec replays the argv it was handed verbatim.
+		.{ .long = "bind-addr", .kind = .value },
+		.{ .long = "no-implicit-dns", .kind = .bool },
+		.{ .long = "dns-host", .kind = .value },
+		.{ .long = "self-addr", .kind = .value_multi },
 		.{ .long = "no-auto-keys", .kind = .bool },
 		.{ .long = "yes", .short = 'y', .kind = .bool },
 		.{ .long = "help", .short = 'h', .kind = .bool },
@@ -61,6 +68,13 @@ pub fn launchInPlace(
 		.{ .long = "vcpu", .kind = .value },
 		.{ .long = "mem", .kind = .value },
 		.{ .long = "network", .kind = .value },
+		// Host-integration seeds, written into config.json on FIRST init only,
+		// like every other init flag. Declared on `__launch` as well so the
+		// custom-flake re-exec replays the argv it was handed verbatim.
+		.{ .long = "bind-addr", .kind = .value },
+		.{ .long = "no-implicit-dns", .kind = .bool },
+		.{ .long = "dns-host", .kind = .value },
+		.{ .long = "self-addr", .kind = .value_multi },
 		.{ .long = "no-auto-keys", .kind = .bool },
 		.{ .long = "yes", .short = 'y', .kind = .bool },
 	};
@@ -111,6 +125,9 @@ pub fn validate(
 		break :blk v;
 	};
 
+	// Caller-owned (the process execs immediately after; tests free it).
+	const self_addrs = parsed.getAll(allocator, "self-addr") catch &.{};
+
 	return .{
 		.name = name,
 		.vcpu = vcpu,
@@ -118,6 +135,10 @@ pub fn validate(
 		.network = network,
 		.auto_keys = !parsed.isSet("no-auto-keys"),
 		.yes = parsed.isSet("yes"),
+		.bind_addr = parsed.get("bind-addr"),
+		.no_implicit_dns = parsed.isSet("no-implicit-dns"),
+		.dns_host = parsed.get("dns-host"),
+		.self_addrs = self_addrs,
 		.foreground = parsed.isSet("foreground"),
 		.no_ssh = parsed.isSet("no-ssh"),
 	};

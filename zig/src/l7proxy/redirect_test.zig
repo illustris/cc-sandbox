@@ -137,6 +137,33 @@ test "rawL4Allowed: IPv4-mapped metadata (::ffff:169.254.169.254) is dropped" {
 	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = mapped, .port = 80 }));
 }
 
+test "rawL4Allowed: a hard-deny address is refused even under allow-all" {
+	// The per-instance half of the floor: the
+	// enclosing host's own address is not in the built-in set, so before
+	// `hard-deny` an `allow 0.0.0.0/0` instance could raw-L4 splice straight
+	// back into the machine running the proxy.
+	const rs = filter.parseRules(
+		\\hard-deny 10.0.0.7/32
+		\\allow 0.0.0.0/0
+	);
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 10, 0, 0, 7 } }, .port = 22 }));
+	// The v4-mapped form of the same address is folded, not smuggled through.
+	const mapped = filter.IpAddr{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 7 } };
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = mapped, .port = 22 }));
+	// A neighbouring address is unaffected -- the floor is the host's OWN
+	// addresses, not a subnet-wide block nobody asked for.
+	try t.expect(main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 10, 0, 0, 8 } }, .port = 22 }));
+}
+
+test "rawL4Allowed: an instance with no hard-deny line is unchanged" {
+	// Default-preserving guarantee for the local and k8s backends, which render
+	// no `hard-deny`: identical verdicts to the pre-feature floor.
+	const rs = filter.parseRules("allow 0.0.0.0/0");
+	try t.expect(main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 10, 0, 0, 7 } }, .port = 22 }));
+	try t.expect(main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 93, 184, 216, 34 } }, .port = 443 }));
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 127, 0, 0, 1 } }, .port = 443 }));
+}
+
 // --- classify vs raw-L4 boundary (peekClassify on a real fd) ---
 
 // Minimal single-record TLS ClientHello builder -- mirrors tls.zig's test

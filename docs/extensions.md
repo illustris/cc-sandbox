@@ -50,5 +50,5 @@ The wrapper rebuilds the microvm runner with this module included on the next la
 
 - The first time `nix run` evaluates a per-instance `path:` flake, it writes a `flake.lock` next to the user's `flake.nix` (inside the `flake/` subdir). This is normal.
 - The mechanism re-execs once per launch (guarded internally so the loop ends after one hop). Non-launch verbs (`list`, `status`, `stop`, `rules`, `ssh`) never re-exec; neither does an unedited scaffold.
-- The first launch *with* a customized flake fetches and caches every cogbox flake input (microvm.nix, nixfs, nix-mcp, etc.) -- it needs network access on that one launch. Subsequent launches reuse the cache.
+- The first launch *with* a customized flake fetches and caches every cogbox flake input (microvm.nix, nix-mcp, etc.) -- it needs network access on that one launch. Subsequent launches reuse the cache.
 - When the instance has [plugins](plugins.md) installed, the user flake is not overridden in directly; it becomes the `user` input of the generated plugin-composition flake, which imports the plugin modules and your module together (yours last). Manual flake edits and plugins compose.

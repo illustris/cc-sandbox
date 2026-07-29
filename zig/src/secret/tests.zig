@@ -36,9 +36,15 @@ test "validKind allowlist accepts the injection styles incl. anthropic-oauth" {
 	// this the `claude-oauth` bind FAILS CLOSED at `secret add`.
 	try t.expect(main.validKind("anthropic-oauth"));
 	try t.expectEqualStrings("anthropic-oauth", main.anthropic_oauth_kind);
+	// The per-user GitLab (git OAuth) access-token bind; without this the
+	// `git-<provider>` bind FAILS CLOSED at `secret add`.
+	try t.expect(main.validKind("gitlab-oauth"));
+	try t.expectEqualStrings("gitlab-oauth", main.gitlab_oauth_kind);
+	try t.expectEqualStrings("oauth2", main.default_git_user);
 	// unknown styles are still rejected (fail closed)
 	try t.expect(!main.validKind("oauth"));
 	try t.expect(!main.validKind("anthropic"));
+	try t.expect(!main.validKind("gitlab"));
 	try t.expect(!main.validKind(""));
 }
 

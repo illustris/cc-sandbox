@@ -93,6 +93,12 @@ pub const RunnerBuild = struct {
 	// (chmod a-w, as the CoW-seed step leaves it) chroot store as a substituter. "" => skip
 	// (no seeded lower found; `substituters` is the shared-cache-only string).
 	base_store_root: []const u8 = "",
+	// build_jobs: nix --max-jobs for the TOPLEVEL build only (toplevelBuildArgv). A
+	// decimal string from COGBOX_WORKER_BUILD_JOBS, set by cogworx ONLY on the transient
+	// worker pod's reconcile exec (never the live agent, whose memory is the instance's).
+	// "" => keep the hardcoded -j1 OOM guard below. Default "" so runner/brain callers,
+	// which never set it, stay byte-identical.
+	build_jobs: []const u8 = "",
 };
 
 /// Build the `nix build` argv for the runner (everything after `nix
@@ -110,13 +116,18 @@ fn runnerBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList(
 }
 
 /// The container backend's counterpart: build `config.system.build.cogboxBrain`
-/// with the SAME --override-input set the container boot uses (flake.nix
-/// brainResolveContainer), so the pre-built out-path is byte-identical to the one
-/// boot evaluates. Pre-copying that closure into the per-instance file:// cache
+/// from the `-container` config -- the SAME eval target AND --override-input set
+/// the container boot uses (flake.nix brainResolveContainer) -- so the pre-built
+/// out-path is byte-identical to the one boot evaluates. cogboxBrain itself is
+/// target-independent (same drv from the VM and -container configs), but the VM
+/// config's eval forces the `microvm` flake input's SOURCE tree, unfetchable on a
+/// cold fail-closed pod, so targeting the VM config here silently failed the seed
+/// and left the plugin-cache empty (the boot rebuild then had nothing to
+/// substitute from). Pre-copying that closure into the per-instance file:// cache
 /// (copyClosureTo) turns the container's egress-less boot rebuild into a local
-/// substitution. Same RunnerBuild fields; only the installable leaf differs.
+/// substitution. Same RunnerBuild fields; only the installable differs.
 fn brainBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
-	return buildArgvFor(allocator, b, "", "config.system.build.cogboxBrain");
+	return buildArgvFor(allocator, b, "-container", "config.system.build.cogboxBrain");
 }
 
 /// Full-NixOS-module counterpart: build the per-instance CONTAINER `config.system.build.toplevel`
@@ -138,13 +149,20 @@ fn toplevelBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayLis
 	// RECONCILE (which runs on the LIVE agent, competing with the running harness for the
 	// 4GB) that spike OOM-killed a concurrent local build once. 4 keeps downloads
 	// reasonably parallel without the memory blow-up.
-	try argv.appendSlice(allocator, &.{ "--max-jobs", "1", "--max-substitution-jobs", "4" });
+	//
+	// The -j1 default is overridable via b.build_jobs (COGBOX_WORKER_BUILD_JOBS), which
+	// cogworx sets ONLY on a transient worker pod sized with extra cores/memory — never
+	// on the live agent, so the OOM guard still holds for the live reconcile. `jobs` is
+	// either the static "1" or the caller-owned build_jobs slice; both are non-freed by
+	// argvDeinit (which frees only indices 1/4/7), so no argvDeinit change is needed.
+	const jobs = if (b.build_jobs.len > 0) b.build_jobs else "1";
+	try argv.appendSlice(allocator, &.{ "--max-jobs", jobs, "--max-substitution-jobs", "4" });
 	return argv;
 }
 
 /// Shared `nix build` argv builder. `config_suffix` is appended after `cogbox-<arch>` to
-/// select the nixosConfiguration (`""` = the VM config for the runner/brain; `"-container"`
-/// = the container config for the toplevel). `installable_attr` is the leaf attribute. The
+/// select the nixosConfiguration (`""` = the VM config for the runner; `"-container"` = the
+/// container config for the brain and toplevel). `installable_attr` is the leaf attribute. The
 /// interpolated installable/inputs land at argv indices 1/4/7, which argvDeinit frees; the
 /// literal flags are static.
 fn buildArgvFor(allocator: std.mem.Allocator, b: RunnerBuild, config_suffix: []const u8, installable_attr: []const u8) !std.ArrayList([]const u8) {
@@ -578,10 +596,11 @@ test "runnerBuildArgv: substituters only, no keys/netrc" {
 	}, argv.items[10..]);
 }
 
-// The container brain build must be byte-identical to the runner build EXCEPT
-// the installable leaf (config.system.build.cogboxBrain vs the microvm runner):
-// the pre-built out-path only substitutes at boot if the installable +
-// --override-input set exactly match flake.nix's brainResolveContainer. Lock both.
+// The container brain build must target the `-container` config (never the VM
+// config, whose eval force-fetches the microvm input source -- the cold-node
+// seed failure) with the SAME --override-input set as flake.nix's
+// brainResolveContainer: the pre-built out-path only substitutes at boot if
+// installable + override set exactly match what boot evaluates. Lock both.
 test "brainBuildArgv: cogboxBrain installable + boot-path override-inputs" {
 	var argv = try brainBuildArgv(t.allocator, .{
 		.flake_source = "/nix/store/abc-cogbox-source",
@@ -596,7 +615,7 @@ test "brainBuildArgv: cogboxBrain installable + boot-path override-inputs" {
 
 	try expectArgv(&.{
 		"build",
-		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64.config.system.build.cogboxBrain",
+		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64-container.config.system.build.cogboxBrain",
 		"--override-input",
 		"userExtensions",
 		"path:/var/lib/cogbox/inst/plugins-flake",
@@ -623,7 +642,7 @@ test "brainBuildArgv: aarch64 config name + substituter knobs appended" {
 	});
 	defer argvDeinit(t.allocator, &argv);
 
-	try t.expectEqualStrings("path:/src#nixosConfigurations.cogbox-aarch64.config.system.build.cogboxBrain", argv.items[1]);
+	try t.expectEqualStrings("path:/src#nixosConfigurations.cogbox-aarch64-container.config.system.build.cogboxBrain", argv.items[1]);
 	try expectArgv(&.{
 		"--option", "extra-substituters", "file:///cache https://cache.example.com", "--option", "require-sigs", "false",
 	}, argv.items[10..]);
@@ -658,6 +677,40 @@ test "toplevelBuildArgv: toplevel installable + boot-path override-inputs" {
 		"--print-out-paths",
 		"--max-jobs",
 		"1",
+		"--max-substitution-jobs",
+		"4",
+	}, argv.items);
+}
+
+// build_jobs (COGBOX_WORKER_BUILD_JOBS, set by cogworx only on a beefed-up worker pod)
+// overrides the hardcoded -j1 for the toplevel build; --max-substitution-jobs stays 4.
+// The rest of the argv is unchanged from the default case above.
+test "toplevelBuildArgv: build_jobs overrides the hardcoded max-jobs" {
+	var argv = try toplevelBuildArgv(t.allocator, .{
+		.flake_source = "/nix/store/abc-cogbox-source",
+		.nixpkgs_source = "/nix/store/def-nixpkgs",
+		.plugins_flake_dir = "/var/lib/cogbox/inst/plugins-flake",
+		.arch = "x86_64",
+		.substituters = "",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+		.build_jobs = "6",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try expectArgv(&.{
+		"build",
+		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64-container.config.system.build.toplevel",
+		"--override-input",
+		"userExtensions",
+		"path:/var/lib/cogbox/inst/plugins-flake",
+		"--override-input",
+		"userExtensions/user/nixpkgs",
+		"path:/nix/store/def-nixpkgs",
+		"--no-link",
+		"--print-out-paths",
+		"--max-jobs",
+		"6",
 		"--max-substitution-jobs",
 		"4",
 	}, argv.items);

@@ -39,6 +39,30 @@ pub const claude_stub_token = "sk-ant-oat01-cogbox-host-injected-placeholder";
 /// bind can never name different hosts.
 pub const anthropic_api_host = "api.anthropic.com";
 
+/// The secret `kind` that selects HOST-SIDE path-dependent git injection (basic
+/// auth `oauth2:<token>` on git smart-HTTP paths, Bearer elsewhere) for a
+/// per-user GitLab (or any OAuth2 git host) access token. Admitted by the
+/// `--kind` allowlist; renderL7Inject keys the `gitlab-oauth` inject style +
+/// git_user off a resolved secret carrying this kind, and the container enforcer
+/// SEEDS an inject spec for every bound secret of this kind (seedGitInjectSpecs).
+/// Single-sourced so the verb, the seed and the renderer never drift.
+pub const gitlab_oauth_kind = "gitlab-oauth";
+
+/// The redacted git-token sentinel the host would stamp into a `glab` config so
+/// a git harness boots "logged-in but tokenless" -- the addon's should_inject
+/// stamps the real token ONLY over this placeholder (never a real one, which
+/// lives only in the enforcer secret store). Wired here for when glab
+/// stub-staging arrives (Phase 2); Phase 1 covers credential-less `git`, which
+/// needs no in-guest stub. Single-sourced so the (future) stub-stager and the
+/// renderer name one sentinel.
+pub const gitlab_stub_token = "glpat-cogbox-host-injected-placeholder";
+
+/// The default git username for basic-auth git smart-HTTP injection. GitLab
+/// accepts any non-empty username paired with an OAuth2/PAT token as the
+/// password; `oauth2` is the documented convention. renderL7Inject emits this
+/// as the spec's `git_user` (a per-provider override is deferred to Phase 2).
+pub const default_git_user = "oauth2";
+
 /// The reserved secret NAME cogworx binds the per-user Claude setup-token into
 /// kind=anthropic-oauth, audience=api.anthropic.com.
 /// The container enforcer seeds an inject spec referencing THIS name so a bound
@@ -71,7 +95,8 @@ pub fn stubCredentialJson(allocator: std.mem.Allocator) ![]u8 {
 /// enforcer stamps as a Bearer, gated by the redacted in-guest stub). Pure, so
 /// the allowlist is unit-testable without IO.
 pub fn validKind(kind: []const u8) bool {
-	return eql(kind, "bearer") or eql(kind, "cookie") or eql(kind, "basic") or eql(kind, anthropic_oauth_kind);
+	return eql(kind, "bearer") or eql(kind, "cookie") or eql(kind, "basic") or
+		eql(kind, anthropic_oauth_kind) or eql(kind, gitlab_oauth_kind);
 }
 
 pub fn dispatch(
@@ -123,7 +148,7 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 		return die(allocator, io, "invalid secret name '{s}' (use [A-Za-z0-9_-], max 64)", .{nm}, 65);
 	}
 	if (!validKind(kind)) {
-		return die(allocator, io, "invalid --kind '{s}' (expected bearer|cookie|basic|anthropic-oauth)", .{kind}, 65);
+		return die(allocator, io, "invalid --kind '{s}' (expected bearer|cookie|basic|anthropic-oauth|gitlab-oauth)", .{kind}, 65);
 	}
 	if (from_file != null and from_stdin) {
 		return die(allocator, io, "--from-file and --from-stdin are mutually exclusive", .{}, 64);

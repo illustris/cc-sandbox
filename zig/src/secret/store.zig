@@ -178,6 +178,32 @@ pub fn remove(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, name: [
 	return existed;
 }
 
+/// Enumerate the BOUND secret names under `dir` (value files present; the
+/// `.meta` sidecars and `.tmp` write-temps are skipped, invalid names ignored).
+/// Names are dup'd into `allocator` -- pass an arena. A never-bound store (no
+/// dir yet) yields an empty list, not an error. Used by the container enforcer
+/// render to seed an inject spec per bound git secret (it can't know provider
+/// names a priori, unlike the single reserved claude-oauth secret).
+pub fn listBound(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) ![][]const u8 {
+	var out: std.ArrayList([]const u8) = .empty;
+	errdefer out.deinit(allocator);
+	const cwd = std.Io.Dir.cwd();
+	var d = cwd.openDir(io, dir, .{ .iterate = true }) catch |err| switch (err) {
+		error.FileNotFound => return out.toOwnedSlice(allocator),
+		else => return err,
+	};
+	defer d.close(io);
+	var iter = d.iterate();
+	while (try iter.next(io)) |entry| {
+		if (entry.kind != .file) continue;
+		if (std.mem.endsWith(u8, entry.name, ".meta")) continue;
+		if (std.mem.endsWith(u8, entry.name, ".tmp")) continue;
+		if (!validName(entry.name)) continue;
+		try out.append(allocator, try allocator.dupe(u8, entry.name));
+	}
+	return out.toOwnedSlice(allocator);
+}
+
 pub const Resolved = struct {
 	/// Absolute path of the value file (the addon reads this as cred_file).
 	/// Allocated in the `allocator` passed to lookup.

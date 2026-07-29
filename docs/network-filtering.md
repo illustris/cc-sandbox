@@ -51,6 +51,20 @@ A new rules-mode instance is seeded with deny rules for private (RFC1918), link-
 }
 ```
 
+### Host-topology keys (`implicitDns`, `selfAddrs`)
+
+Two optional `.network` keys describe the machine cogbox itself runs on, rather than a user policy. Both are absent by default and are seeded at `cogbox init` time by whoever provisions the instance -- never by the `rules` verbs:
+
+| Key | init flag | Effect |
+|---|---|---|
+| `"implicitDns": false` | `--no-implicit-dns` | Removes the implicit port-53 allow (see [Enforcement internals](#enforcement-internals)), so DNS walks the ordered rules like any other port. |
+| `"selfAddrs": ["10.0.0.5/32"]` | `--self-addr` (repeatable) | Adds each address to the L7 proxy's [non-overridable hard floor](#how-l7-composes-with-l4). |
+| `"dnsHost": "127.0.0.53"` | `--dns-host` | Re-admits **exactly one address on port 53** to the rule walk: the loopback DNS forwarder the enclosing host runs. One bare address -- a prefix, a port or a proto qualifier is refused, because any of them would turn a one-socket exception into a loopback carve-out. |
+
+All three are rules-mode only: `full` and `none` store `.network` as a bare string, have no L4 filter to parameterize and no proxy to give a floor to, so `cogbox init` warns and ignores them there. They render into the runtime rules file as the directives `no-implicit-dns`, `hard-deny <cidr>` and `dns-host <addr>`, ahead of every rule, and hot-reload with everything else.
+
+Set them where the host's own resolver or addresses are things the sandbox must not reach -- a cloud VM whose DHCP resolver is also its metadata server is the motivating case. `--no-implicit-dns` and `--dns-host` are two halves of one arrangement: the first puts loopback DNS back under the filter's loopback deny, and the second re-opens the single socket passt re-emits the guest's forwarded queries on (`COGBOX_GUEST_RESOLVER` + `COGBOX_HOST_RESOLVER`, see [Host-integration knobs](#host-integration-knobs)). Use `--no-implicit-dns` **without** either and the guest's DNS has to reach a resolver the rules allow on its own -- one inside a denied range leaves it with **silently** broken DNS, because its queries are dropped like any other denied packet.
+
 ### How rules are evaluated and edited
 
 Rules are evaluated top-to-bottom on every outbound packet; the first matching rule wins, and a packet that matches no rule is denied. **Position matters**: a rule only fires if no earlier rule matches the same address first.
@@ -117,7 +131,113 @@ The filter works by intercepting passt's outbound `connect()`, `sendto()`, `send
 
 The `cogbox rules` subcommands edit `config.json`, regenerate the runtime rules file, and signal the running passt, so rule changes take effect without restarting the VM. The CLI shares the on-disk rule format parser with the LD_PRELOAD filter, so the formats stay in sync.
 
-One known boundary: traffic handled internally by passt (ARP, DHCP, gateway ping responses) never reaches the intercepted syscalls and is not subject to user rules. The implicit loopback deny prevents access to host services via the passt gateway.
+Two implicit rules sit above the user rules, in this order:
+
+1. **Port 53 is allowed**, to any destination, before the walk. It exists so a loopback resolver (`127.0.0.53`/systemd-resolved) keeps working, and it is checked first, so DNS also escapes the L7 mode's IPv6 fail-close, the seeded link-local deny and every private-range deny. `--no-implicit-dns` (`.network.implicitDns = false`) turns it off for an instance; the loopback deny below then applies to DNS as well.
+2. **Loopback is denied.** passt translates traffic aimed at the guest's default *gateway* into `127.0.0.1` on the host (`--map-host-loopback`, whose default is the gateway address; `--no-map-gw` turns it off), so allowing loopback would expose every host service to the sandbox. The remap path bypasses this deliberately (it never evaluates the rewritten destination). Note that this is the gateway address, **not** the host's own address: the guest is assigned the host interface's address by passt's DHCP, so it cannot name the host that way at all.
+
+One known boundary: traffic handled internally by passt (ARP, DHCP, gateway ping responses) never reaches the intercepted syscalls and is not subject to user rules.
+
+### Host-integration knobs
+
+Environment variables read by the launcher, all empty/off by default -- set by whatever provisions the host, never by a user. With none of them set, cogbox runs the exact command line it ran before they existed.
+
+| Variable | Effect |
+|---|---|
+| `COGBOX_PASST_RUNAS` | Run passt under a dedicated uid (`--runas`) instead of the ambient `nobody` it self-drops to, so a host packet filter can express "guest-originated" as a uid match. Needs the launcher to start as root (or hold `CAP_SETUID`). Applied in `rules` **and** `full` mode -- `full` is the one with no L4 filter at all, so the host's rule is its only floor. |
+| `COGBOX_PROXY_RUNAS` | Run the L7 proxy and the mitmproxy terminate backend under `user[:group]` (`setpriv`). The proxy re-resolves an allowed vhost and opens the upstream socket under **its own** uid, so a passt-only uid rule leaves it as an unscoped relay. Its runtime dir, per-instance CA dir and mitmproxy confdir must be writable by that uid, and whatever sends the hot-reload signals (`SIGHUP`/`SIGUSR1`) must be allowed to signal it. |
+| `COGBOX_GUEST_RESOLVER` | Advertise this address to the guest as its resolver **and intercept its queries to it** (`passt --dns-forward`), plus stop mapping the gateway to the host (`--no-map-gw`). The address is a handle, not a destination: passt consumes the guest's DNS at the tap and re-emits it host-side, so nothing ever routes to it. The two flags go together: `--no-map-gw` is what closes passt's DNS carve-out (traffic to the mapped gateway on port 53 is forwarded to the *host's* resolver rather than translated to loopback, so it never looks like loopback to the filter), but it also disables the remap of loopback resolvers from `/etc/resolv.conf` -- which is how a dev box running systemd-resolved gives its guests DNS at all. Dropping that mapping is therefore only safe when an explicit guest resolver replaces it. **Not `-D`:** passt applies `-D` before reading `/etc/resolv.conf` and then skips the read, leaving `dns_host` unspecified and its own forwarding silently disarmed. |
+| `COGBOX_HOST_RESOLVER` | Where those intercepted queries go (`passt --dns-host`): the loopback DNS forwarder on the enclosing host. Only applied together with `COGBOX_GUEST_RESOLVER`. A bare address -- passt parses it with `inet_pton`, so `host:port` is rejected -- and unlike `--dns-forward` it accepts a loopback one. The guest then resolves exactly what the host resolves, which is the point on a host whose real resolver the sandbox must not reach. Pair it with `cogbox init --dns-host <same address>` so the L4 filter admits that socket in `rules` mode, and with a rule in the host's own packet filter if it has one. |
+| `COGBOX_PASST_BIND_FORWARDS` | Bind the guest's SSH/HTTP forwards to `.bindAddr` instead of every address. Opt-in: the default `.bindAddr` is `127.0.0.1`, and deployments that reach the forwards at a pod or host address depend on the wildcard bind. |
+
+Whichever way the guest is handed its resolver, that resolver is the **only** one
+it has: the guest image pins systemd-resolved's `FallbackDNS` to empty, so the
+compiled-in public list (1.1.1.1, 8.8.8.8, 9.9.9.9, ...) never stands behind the
+link-scope server. Without that pin, a guest whose link-scope DNS is unset or
+failing falls through to a third-party resolver -- which does not merely answer
+with public data, it *sends the internal query name off-site* and turns an
+internal-DNS outage into an ordinary-looking NXDOMAIN. Empty means such a lookup
+fails visibly instead. The `guest-dns-no-public-fallback` flake check asserts it
+against the rendered `resolved.conf`.
+
+Both `RUNAS` uids exist so a host filter can name them, and the GCE image's
+`cogworx-floor.service` (`gce/floor.nix`) is the deployment that does: link-local
+is dropped for the passt uid, and OPENING a flow to the VM's own non-loopback
+addresses is dropped for **every** uid --
+`meta skuid 0-4294967294 ct direction original ip daddr <self> drop` -- with the
+control uid admitted to the guest SSH forward range above it so `cogbox ssh`
+still works. Every part of that spelling is deliberate.
+
+It cannot be narrowed to `skuid cogbox-passt` / `skuid cogbox-proxy`, because
+in-VM nix builds run as `nixbld*` under the daemon and passt creates its
+port-forward listeners *before* its privilege drop (`meta skuid` matches the
+fsuid frozen in at socket creation, so those are root-owned).
+
+It cannot be a blanket `daddr` drop with no `skuid` match either: on a same-host
+connection the return packets carry the machine's own address as their
+destination too, and the kernel's RST -- the reply when nothing is listening --
+has no owning socket, so a `meta skuid` rule cannot match it and it survives. A
+matchless drop swallows it.
+
+And `skuid` alone does not save a reply that *does* have a socket. Once passt is
+listening, the reply is a SYN-ACK from a real (pre-drop, root-owned) socket whose
+destination port is the client's ephemeral port, so it matches no `dport` accept
+and lands in the deny: an unscoped range would break `cogbox ssh`, Terminal,
+Console-over-ssh and the user SSH gateway while still passing shape checks and
+empty-port probes. `ct direction original`
+scopes the deny to the direction that OPENS a flow, which is the rule's actual
+intent. It is not `ct state new`: state-scoping would additionally exempt a flow
+that survived a floor reload for that flow's whole lifetime, whereas direction is
+a property of the packet and keeps the strength of the unscoped drop. It does
+mean the VM's network namespace now runs conntrack, whose table is a finite
+resource a busy guest can push on.
+
+A guest gains nothing from the direction scoping: its first packet is the one
+that opens the flow, the deny takes it, and a dropped OUTPUT packet is never
+confirmed into conntrack, so no reply direction ever exists for it to ride.
+Loopback is outside *that* rule so the L7 remap funnel is untouched; the proxy's
+own `--self-addr` hard floor covers the relay path a second time.
+`tests/test_floor.sh` loads the rendered ruleset into a throwaway netns and probes
+it with a real listener bound, because that is the only setup in which the broken
+and the correct rule behave differently.
+
+Loopback gets its own rule, and deliberately the **opposite** shape:
+`meta skuid cogbox-passt ct direction original ip daddr 127.0.0.0/8 drop` (plus
+the `::1` mirror), with the funnel's own targets accepted above it as an explicit
+port set -- `127.0.0.1:<l7base>` and `+1` for each triple `cogbox start` may slide
+onto. It stays scoped to the passt uid rather than covering every uid because
+loopback is where the trusted half talks to *itself*: l7proxy dials the mitm hop,
+mitmproxy dials its upstreams, sshd and the nix daemon live there. passt is the
+only process that turns guest bytes into host sockets, and its per-flow outbound
+sockets are created after the privilege drop, so that one uid is both necessary
+and sufficient. The third port of each triple -- the mitmproxy SOCKS5 hop, dialed
+by l7proxy under the *proxy* uid -- is deliberately not in the set, which is why
+it is a set and not a port range. `ct direction original` matters here for the
+same reason it does on rule 2: the funnel's SYN-ACK carries `daddr 127.0.0.1` and
+the client's ephemeral port, so a stateless deny would eat every funnel reply and
+take L7 down.
+
+The rule is defence in depth, and what it is defending is worth naming so nobody
+removes it as redundant. A guest cannot address the enclosing machine over
+loopback today for two reasons that are both upstream C: passt drops tap frames
+carrying a loopback source or destination, and `--no-map-gw` removes the
+gateway-to-loopback mapping that would otherwise turn an address the guest *can*
+name into `127.0.0.1` on the host. In `full` mode there is no L4 shim, so this
+rule independently enforces the loopback half of "a guest cannot reach the
+host's services." The funnel's remap table is also rendered from
+`.network.remap`, which accepts an arbitrary single loopback target, so anything
+that can write an instance's config can aim passt's own `connect()` at
+`127.0.0.1:22`.
+
+> **Testing note.** An in-guest probe of the *host's own address* proves nothing.
+> passt assigns the guest the host interface's own address over DHCP ("its own
+> address shadows that of the host", `passt(1) --map-guest-addr`), so a connect to
+> that address from inside the guest is delivered inside the guest -- to the
+> guest's own sshd, whose banner matches the host's when both run the same
+> nixpkgs. The floor's counters correctly stay still, because nothing was sent.
+> Compare SSH **host keys**, or probe a port only the host binds.
+
+Where the launcher's stderr is collected somewhere retained outside the machine (a cloud serial console, say), what it prints on a failure matters. Its error paths name **files, instances and harness keys, never credential values** -- the redaction failures say "token withheld" rather than echoing the token -- and it never dumps its environment or its own argv. One deliberate exception: an argument the Zig wrapper did not recognize is echoed back verbatim in `cogbox-launch: error: unexpected argument <arg>`, since the whole point of that branch is to name the offending token. It is unreachable through the CLI (the wrapper validates first) and only matters to something invoking the script directly with a secret in an argument position -- which is already the wrong shape: credentials reach cogbox on stdin or through a file, never argv.
 
 ## TCP destination remap
 
@@ -168,6 +288,8 @@ The proxy re-resolves the allowed name **host-side** (it never trusts the guest'
 | **not in any rule** | defer to L4 (dial if the IP is allowed, drop if blocked) |
 
 ...and a **non-overridable hard floor** (loopback, this-network `0.0.0.0/8`, and link-local incl. cloud metadata `169.254.169.254`) is *always* dropped, even for an allowed vhost.
+
+That built-in set is topology-independent, so it cannot include the address of the machine cogbox is running on -- and since an explicit L7 allow supersedes the L4 IP check, a sandbox owner who controls a DNS zone could otherwise point a name at that machine, allow the name, and obtain a guest-triggered connection back into the host half (under the *proxy's* uid, not passt's). Per-instance `--self-addr` entries (`.network.selfAddrs`, rendered as `hard-deny <cidr>`) extend the floor with exactly those addresses. They apply to every proxy dial path -- named splice, terminate handoff, and the raw-L4 splice -- and, being a floor, are never superseded by an allow. Loopback is untouched, so the L7 funnel itself keeps working.
 
 **Path constraints fail closed.** When an `allow` rule names a host but adds a path prefix (`allow api.example.com /v1/`), a request to that host on an *uncovered* path (e.g. `/v2/`) is **dropped**, not deferred to L4 -- otherwise the constraint would be silently bypassed whenever the IP is independently L4-allowed (the usual "allow the internet at L4, restrict vhosts at L7" setup). A `deny` rule with a path (`deny api.example.com /admin/`) only blocks that prefix and leaves other paths to L4, since you're carving out a hole, not whitelisting. On HTTPS this is enforced by the terminate tier; on cleartext HTTP the proxy enforces it inline from the request line.
 
@@ -242,12 +364,14 @@ cogbox l7 add allow api.example.com --path /v1/           # terminate + path
 cogbox l7 add deny '*' --at 1                             # explicit default-deny for vhosts
 ```
 
+A rendered rule line may also carry a trailing `tag=<name>` token (e.g. `tag=git-grants`, stamped on compiled git-grant rules). Both wire parsers handle it: the Zig proxy **accepts and ignores** it (it plays no part in allow/deny or tiering), and the mitmproxy addon **uses** it for credential-injection gating (an inject spec's `rules_tag` must match a rule's `tag` for the token to be injected -- see [Host-side credential injection](#host-side-credential-injection)). A line carrying any genuinely-unknown token is still dropped fail-closed by both.
+
 ### L7 caveats
 
 Documented, not silently assumed safe:
 
-- **QUIC / UDP-443 and all guest IPv6** are denied while L7 is active (the funnel is IPv4/TCP-only), so clients fall back to inspectable IPv4 TCP. DNS (port 53) still works.
-- Loopback, this-network, and link-local/metadata vhosts are never reachable through the proxy (the hard floor) -- consistent with the sandbox's LAN posture for those specific ranges.
+- **QUIC / UDP-443 and all guest IPv6** are denied while L7 is active (the funnel is IPv4/TCP-only), so clients fall back to inspectable IPv4 TCP. DNS (port 53) still works -- unless the instance was initialized with `--no-implicit-dns`, in which case DNS obeys the rules like everything else and the IPv6 fail-close covers it too.
+- Loopback, this-network, and link-local/metadata vhosts are never reachable through the proxy (the hard floor) -- consistent with the sandbox's LAN posture for those specific ranges. Add the host's own addresses with `--self-addr` if the deployment needs them covered too; the built-in floor cannot know them.
 - **Encrypted ClientHello (ECH)** is refused on **passthrough** hosts (logged `ech-on-splice`): the cleartext SNI that passthrough routes on could be a decoy for an encrypted inner name, so it can't be trusted to identify the real host. **Terminate** hosts accept ECH -- mitmproxy is the TLS endpoint and re-checks `Host == SNI` on the *decrypted* request, so an inner name can't be smuggled past it. Chrome/Chromium send a GREASE ECH extension on every handshake by default, so a browser client reaching a vhost must be on the terminate tier (the default); only an explicitly `--passthrough` vhost would drop it.
 
 ## Host-side credential injection
@@ -260,10 +384,11 @@ Host-side credential injection removes the secret from the sandbox. Because the 
 
 When an **inject-conf** is present (path in `COGBOX_L7_INJECT_CONF`, passed to the mitmproxy backend by `cogbox-launch.sh`), the terminate-tier addon (`l7-mitm-addon.py`), on every decrypted request whose host matches a configured spec, **after** the allow + `Host == SNI` checks pass, replaces the auth header from a host-side credential file:
 
-- the conf is a JSON list of specs `{host, style, cred_file, token_path?, cred_format?, cookie_name?, account_id_path?, refresh?, stub_token?}`;
+- the conf is a JSON list of specs `{host, style, cred_file, token_path?, cred_format?, cookie_name?, account_id_path?, refresh?, stub_token?, rules_tag?}`;
 - the addon reads `token_path` (a dotted path, e.g. `claudeAiOauth.accessToken`) out of `cred_file` and hot-reloads it on mtime change, so a rotated access token is picked up on the next request with no restart;
 - injection is **scoped to the stub identity**: when the spec carries a `stub_token` (the placeholder redacted into the guest's cred file), the addon replaces the credential **only** when the request presents that exact stub -- or no credential at all. The guest's stub is thus overwritten with the real token, but a **secondary credential the guest legitimately obtained through an already-injected call** -- e.g. claude-code Remote Control's per-session `worker_jwt` -- is forwarded **untouched** instead of being clobbered (which would 401). A spec with no `stub_token` (harnesses that still mount their real token in-guest) always replaces, as before;
 - if injection should fire for this request but the host-side token can't be read, the request **fails closed** (`403`) rather than forwarding the stub.
+- when a spec carries `rules_tag`, the addon injects the credential **only if** the request is allowed by a rule bearing that tag (a second, tag-restricted evaluation over the same rule set). The full rule set still decides overall allow/deny, so a broad `allow <host>` grants **reachability** to the host but **not the token** -- the token rides only on a request a tagged rule matches. Emitted for the per-user `gitlab-oauth` bind as `rules_tag: git-grants`, matching the `tag=git-grants` wire token stamped on the compiled git-grant rules; a spec without `rules_tag` (the harness OAuth binds) is unaffected and injects on every allowed request as before.
 
 `style` shapes the wire format: `bearer` (`Authorization: Bearer <token>`), `anthropic-oauth` (Bearer + `anthropic-beta: …,oauth-2025-04-20`, drops `x-api-key`), `anthropic-apikey` (`x-api-key`, drops `Authorization`), `openai-chatgpt` (Bearer + `ChatGPT-Account-Id`), and `cookie` (replaces **only** the named cookie -- the spec's `cookie_name` -- in the request `Cookie` header, leaving every other cookie verbatim). The conf and the credential files live **host-side only** -- they are never on a 9p share or fw_cfg slot, and `mitmdump` reads them as the launching user. For an **HTTPS** host this applies only on the **terminate** tier (so the addon sees the decrypted request); an explicit `cogbox l7 add allow <host> --passthrough` opts an HTTPS host out of both terminate and injection (the legacy "guest carries its own token end-to-end" behavior).
 
@@ -281,7 +406,7 @@ Injection rewrites the request host-side, but on its own the harness's credentia
 
 Because the redacted file keeps the OAuth `scopes`, claude-code starts up as a normally logged-in subscriber and the placeholder token is harmless: it sends the placeholder accessToken as a Bearer, the host proxy overwrites it on the wire (only over the stub) with the real token, and the far-future `expiresAt` stops the guest from ever trying (and failing) to refresh the placeholder itself. Keeping a real (logged-in) identity in the guest -- rather than the older "drop the file, run on an `ANTHROPIC_AUTH_TOKEN` env stub" approach -- is what lets features that gate on a **local full-scope credential** work under injection. `/remote-control` (`/rc`) is the motivating case: it checks the on-disk OAuth `scopes` before connecting (so the redacted-but-scoped file is essential), then mints an **ephemeral per-session `worker_jwt`** via an OAuth-authed call to `api.anthropic.com` (the stub is injected on that call), and runs its live transport (an SSE event stream + POSTs to `/v1/code/sessions/<id>/worker`) authenticated with that `worker_jwt`. Those transport requests also hit `api.anthropic.com`, but they carry the `worker_jwt` -- not the stub -- so the stub-scoped injection forwards them untouched; the earlier always-replace behavior clobbered the `worker_jwt` with the OAuth token, which the worker endpoint rejected (`401` -> `worker_register_failed` -> `Transport closed (code 403)`). A second terminate-tier subtlety surfaces in the same transport: its **inbound** leg (controller -> guest) is a long-lived **SSE event stream** (`GET .../worker/events/stream`), and mitmproxy **buffers response bodies by default** -- which stalls an open-ended stream, so the session connects and the **outbound** POSTs work but inbound events never flush (a one-way session). The addon's `responseheaders` hook sets `flow.response.stream = True` for `text/event-stream` responses so they pass through chunk-by-chunk (this also makes ordinary streaming inference truly stream rather than arrive all-at-once on close). The guest's `.credentials.json` is therefore **always present** -- a real redacted-scoped file on the happy path, or a minimal placeholder-scoped stub if staging fails -- so claude-code reads it, `/rc`'s on-disk scope gate is satisfied, and (crucially) an in-guest `/login` can write its OWN token over the placeholder. There is deliberately **no `ANTHROPIC_AUTH_TOKEN` env stub**: an injected auth-token env var would shadow the file, break `/rc`, and silently defeat in-guest login. Net: the **host's** access and refresh tokens never enter the sandbox; if a user logs in inside the VM with their own account, that token stays in that instance (see [In-VM login](#in-vm-login-per-instance-isolated) below).
 
-**Keeping the injected token fresh (host-side refresh).** Scrubbing the token has a consequence: since the guest holds only a static placeholder and no refresh token, it can **never refresh on its own** -- so a long-running session would start getting `401`s the moment the host's access token lapsed (access tokens are short-lived; on this host claude-code's OAuth token is ~8h). With nothing refreshing the host file -- the host's own CLI only keeps it warm while *it* is running -- the injected token eventually goes stale. To close this, an inject-conf spec may carry a `refresh` block (`{refresh_token_path, expires_at_path, token_url, client_id, expires_at_unit}`); cogbox emits one for the scrubbed **claude-code** host. When present, the addon does the OAuth refresh-token grant **host-side** as the access token nears expiry (default window 10 min; `COGBOX_L7_REFRESH_WINDOW_SEC`) and writes the rotated tokens back to the **same canonical credential file** the host's own CLI uses -- a single refresh-token lineage (a separate copy would fork the lineage and the provider's rotation would invalidate one side). It is serialized with `flock` in a host-only lock dir (never beside the cred file -- the mirror redacts the cred file but copies the rest of the dir, so a sibling token copy beside it would leak into the guest; no backup file is written for the same reason) and re-checks expiry under the lock, so it coexists with the host CLI refreshing the same file. The write is atomic (temp + `rename`, mode `0600`), and the whole path is **fail-safe**: any error -- unreadable file, network failure, malformed response, missing refresh token -- leaves the file untouched and the request proceeds with the current (still-valid, since the refresh fires before expiry) token. The refresh runs over the host's own egress and trust store, never through this proxy, and no token is ever logged. (Harnesses that still carry their token in-guest refresh there and carry no `refresh` block.)
+**Keeping the injected token fresh (host-side refresh).** Scrubbing the token has a consequence: since the guest holds only a static placeholder and no refresh token, it can **never refresh on its own** -- so a long-running session would start getting `401`s the moment the host's short-lived access token lapsed. With nothing refreshing the host file -- the host's own CLI only keeps it warm while *it* is running -- the injected token eventually goes stale. To close this, an inject-conf spec may carry a `refresh` block (`{refresh_token_path, expires_at_path, token_url, client_id, expires_at_unit}`); cogbox emits one for the scrubbed **claude-code** host. When present, the addon does the OAuth refresh-token grant **host-side** as the access token nears expiry (default window 10 min; `COGBOX_L7_REFRESH_WINDOW_SEC`) and writes the rotated tokens back to the **same canonical credential file** the host's own CLI uses -- a single refresh-token lineage (a separate copy would fork the lineage and the provider's rotation would invalidate one side). It is serialized with `flock` in a host-only lock dir (never beside the cred file -- the mirror redacts the cred file but copies the rest of the dir, so a sibling token copy beside it would leak into the guest; no backup file is written for the same reason) and re-checks expiry under the lock, so it coexists with the host CLI refreshing the same file. The write is atomic (temp + `rename`, mode `0600`), and the whole path is **fail-safe**: any error -- unreadable file, network failure, malformed response, missing refresh token -- leaves the file untouched and the request proceeds with the current (still-valid, since the refresh fires before expiry) token. The refresh runs over the host's own egress and trust store, never through this proxy, and no token is ever logged. (Harnesses that still carry their token in-guest refresh there and carry no `refresh` block.)
 
 This redaction currently covers **claude-code**. `codex` and `opencode` keep mounting their token for now (codex's non-secret account id lives in the same file; opencode is multi-provider with API-key providers that aren't injected) -- they still benefit from host-side injection but their cred files are not yet redacted.
 
@@ -386,6 +511,29 @@ At boot (and on the hot-reload path), the renderer resolves each spec's named se
 - **audience mismatch** -- a spec is emitted only when the bound secret's `audience` equals the spec host. This is the gate that stops a hostile plugin from later requesting that your bound `api-bearer` be injected to `attacker.example`: you bound it for `api.example.com`, so it is injectable **only** there. A secret with no audience set is treated as not-injectable.
 
 Inject hosts are automatically unioned into the **terminate-allow** set (a header or cookie can only be added on a MITM-terminated flow), so an inject-only plugin still activates the funnel and terminates its host -- whether injection actually fires is decided separately by the bound/audience gates above. The plugin/operator specs and the harness specs are merged into the single conf the addon reads (harness specs win a host collision). The trust an operator grants by binding a secret is surfaced at `cogbox plugin add` (the injection requests render in their own section, and a bind-checklist prints the exact `cogbox secret add` commands); the secret value itself, like the harness credentials, is host-only and never crosses into the guest.
+
+**Reserved control-plane binds are auto-seeded.** Two secret shapes are bound by a control plane rather than declared by a plugin, so the renderer seeds their spec itself -- no `config.json` entry is needed, and none is written (the seed is a render-time overlay, so revoking is just unbinding):
+
+- `claude-oauth` with `--kind anthropic-oauth` -- seeds `{host: api.anthropic.com, style: anthropic-oauth, secret: claude-oauth}`. The seed's ONLY gate is that **a value file exists** for the secret, so a sandbox whose owner never connected gets no spec, hence no terminate-allow for the provider host and no funnel. That gate is *presence*, not validity: a zero-byte value with no `.meta` also seeds the terminate-allow. It is safe because the injection itself is gated a layer down by the two fail-closed checks above -- such a secret has no audience, so the inject conf stays empty and nothing is ever stamped; the host is merely funnelled and terminated.
+- any secret with a value file and `--kind gitlab-oauth` -- seeds a spec for its `--audience` host, but only when an l7 rule already names that host (a grant-scoped bind must never render as a whole-host allow).
+
+The seed runs on **every** render path -- the boot render, `cogbox secret reload -n <inst>`, and the rule/plugin-mutation reload -- because both the terminate-allow and the funnel are derived from the specs, so a path that re-rendered without seeding would strip them off a running instance. (It was originally gated on a "am I an enforcing container" env signal, which made the bind inert on the VM path: the credential was bound host-side and the guest stub staged, but nothing named the secret, so the placeholder was never replaced and the harness reported *not logged in*.)
+
+Because the funnel remaps live in `netfilter-rules` -- the file the in-`passt` LD_PRELOAD shim owns -- every one of those paths must signal **both** consumers after re-rendering: `SIGHUP` the L7 proxy (`l7-rules` + the inject conf) *and* `SIGUSR1` passt (the shim reloads its ruleset only on that signal). Signalling only the proxy leaves a connect-later bind inert on a running instance: the funnel is on disk, but the guest's `:443` keeps egressing directly, so the placeholder credential reaches the upstream and the harness stays logged out until a restart.
+
+### Credential access under a dropped proxy uid
+
+The store's value files are written `0600` by the uid that runs `cogbox secret add` (the control uid). Where the proxy runs as that same uid -- the container enforcer, which also owns the enforcer-private store -- reader and owner coincide and there is nothing to arrange. Where `COGBOX_PROXY_RUNAS` puts the proxy on a **dedicated uid** (so a host packet filter can select guest-originated traffic by `meta skuid`), they do not: the addon's `open()` on `cred_file` gets `EACCES`, `token_for` returns `None`, and every request on the injected host is denied with `cogbox-l7: credential unavailable` -- with the bind, the seed, the spec, the terminate-allow and the funnel all correct.
+
+So the inject render also reconciles the store's permissions (`rules/credgrant.zig`):
+
+- **Scope.** Exactly the value files the conf being written *names*, and nothing else in the store -- the store holds credentials for unrelated audiences the proxy has no business reading. The grant is recorded at the same statement that emits `cred_file`, so the readable set is derived from the spec set and cannot drift from it. Only a resolved store path (`<store>/<secret name>`) can ever be granted; a `cred_file` supplied by a config, a plugin manifest or an operator override never is.
+- **Mechanism.** `chgrp` to the proxy's **group** plus mode `0640`. `--regid` sets the proxy's *primary* gid and `--clear-groups` drops only *supplementary* groups, so a primary-group grant survives the drop (a supplementary-group scheme would not). Group-read also keeps the grant read-only and leaves the file owned by the control uid, which still has to rewrite it when a rotated token is re-bound. The store directory gains group **search** (`+x`, never `+r`) so a granted path can be opened by name without the store becoming enumerable. The `.meta` sidecar is never granted.
+- **When.** On every inject render, because binds are runtime events (`cogbox secret add -n <inst>` then `secret reload`), not boot events -- and because a re-bind is an atomic rename that resets the file's group anyway. A boot-time `chown` would cover only the sandboxes whose owner had already connected. `COGBOX_PROXY_RUNAS` therefore has to be in the environment of **control-channel execs**, not just the launcher's.
+- **Revocation.** The pass first clears the group bits off every bound value file in the store, then re-grants only the named ones. Unbinding a secret, dropping a spec, an audience mismatch, or a git bind losing its grant rules all withdraw the access on the next render; there is no separate state to keep in sync.
+- **Cache invalidation.** The addon caches each credential's value keyed on the value file's **mtime**, and `chmod` moves only `ctime` -- so a grant is, by itself, invisible to it. That matters because a re-bind is an atomic rename (back to `0600`) followed by a *separate* `secret reload` exec that re-renders: in between, the previous conf still names a file the proxy can no longer read, so a guest request landing there caches "unreadable" -- and with the cache key untouched by the re-grant, that host would 403 `credential unavailable` until the proxy restarted. Two things close it: the grant bumps the value file's mtime, but only on a real `0600 -> 0640` transition (a steady-state render must not, because the mtime is also the *rotation* signal the host-side refresh path reads); and the addon drops its credential caches whenever the inject conf reloads, which happens in the same render pass and so also covers a grant that failed once and succeeded on a later render.
+
+Unset `COGBOX_PROXY_RUNAS` (container, k8s, local) means no uid split, and the whole reconciliation is skipped -- store permissions come out of a render byte-for-byte as `secret add` left them.
 
 ### What it does and does not protect
 

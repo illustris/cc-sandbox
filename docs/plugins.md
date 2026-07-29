@@ -67,6 +67,8 @@ data-druid-es/
 
 `FLAKE_URL` can be anything nix accepts: `github:owner/repo`, `git+https://...`, `path:/abs/dir`, with `?dir=` for flakes in a subdirectory. The `#attr` fragment is restricted to `[a-zA-Z0-9_-]`. Plugin names follow the instance-name grammar; `user` is reserved.
 
+A `git+http(s)://` or `git+ssh://` URL is fetched by nix EXEC'ING THE `git` CLI, so whatever host half runs `cogbox plugin` must have `git` on PATH (and, for the https form, a CA bundle) or every such URL fails at resolve time with `executing "git": No such file or directory` — a missing-binary error that reads like a network problem. Every backend image is responsible for carrying it: the pod image via its `contents`, the GCE host image via `environment.systemPackages` (both in `flake.nix` / `gce/cogbox-host.nix`, each with a build-time check).
+
 ## The kit: `cogbox.*`
 
 The base declares one option tree; each plugin module fills in its slice, and the module system merges across all imported plugins:
@@ -92,7 +94,7 @@ The base declares one option tree; each plugin module fills in its slice, and th
 
 ## The workdir: `~/work`
 
-`~/work` is a base-created symlink into the persisted 9p share (`/var/lib/cogbox/work`); HOME stays `/root`. It is the standardized project dir: agents and users land there (`loginShellInit` and the `c`/`oc`/`cx` launchers `cd ~/work`), it survives restarts, and it is host-visible under `~/.local/share/cogbox/instances/<name>/data/work/`.
+`~/work` is a base-created symlink into the persisted 9p share (`/var/lib/cogbox/work`); HOME stays `/root`. It is the standardized project dir: agents and users land there (`loginShellInit` and the `c`/`oc`/`cx`/`h`/`p` launchers `cd ~/work`), it survives restarts, and it is host-visible under `~/.local/share/cogbox/instances/<name>/data/work/`.
 
 At build, the base folds every plugin's merged `config.cogbox` into **one derivation** (`cogbox-brain`) laying out each enabled harness's native tree + merged config + a cogbox-authored capability **index** skill. At boot, one base-owned oneshot (modeled on `load-ssh-keys`) materializes it:
 
@@ -112,7 +114,7 @@ One neutral unit → each enabled harness's native layout (gated on which harnes
 
 | Neutral | claude-code | opencode | codex | pi | hermes-agent |
 |---|---|---|---|---|---|
-| **skill** `<s>` | `.claude/skills/<s>/SKILL.md` | `.opencode/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` (native project discovery) | `~/.hermes/skills/<s>/SKILL.md` (overlay upper; no project discovery) |
+| **skill** `<s>` | `.claude/skills/<s>/SKILL.md` | `.opencode/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` (native project discovery) | `~/.hermes/skills/<s>/SKILL.md` (VM overlay upper or container state PVC; no project discovery) |
 | **rule** `<r>` | `.claude/rules/<r>.md` (`paths:`; empty ⇒ always-on) | `instructions` glob in `opencode.json` | `AGENTS.md` digest (always-on) | `AGENTS.md` digest (always-on) | `AGENTS.md` digest (always-on) |
 | **agent** `<a>` | `.claude/agents/<a>.md` | `.opencode/agents/<a>.md` | (best-effort) | -- | -- |
 | **command** `<c>` | `.claude/commands/<c>.md` | `.opencode/commands/<c>.md` | skill `.agents/skills/<c>` | -- | -- |
@@ -121,7 +123,7 @@ One neutral unit → each enabled harness's native layout (gated on which harnes
 | **env** | launcher env | launcher env | launcher env | launcher env | launcher env |
 | **index** | `.claude/skills/cogbox-plugins/` | `.opencode/skills/cogbox-plugins/` | `.agents/skills/cogbox-plugins/` | `.agents/skills/cogbox-plugins/` | `~/.hermes/skills/cogbox-plugins/` |
 
-The same store copy is symlinked into each layout (no duplication). codex agent/command fidelity is best-effort (claude-only frontmatter is dropped; read-only relies on prompt + egress lockdown). codex, pi, and hermes have no native per-file rules dir, so the merged rules are concatenated into one `AGENTS.md` digest linked at `~/work/AGENTS.md` (only-if-absent, never clobbering a user file); `paths:`-scoped rules become always-on there. pi and codex share the same `.agents/skills/` tree (agentskills.io layout); hermes only loads `$HERMES_HOME/skills`, so its links go into the per-instance overlay upper of `~/.hermes` (the host dir is untouched). pi/hermes have no plugin MCP, settings, agent, or command mapping yet.
+The same store copy is symlinked into each layout (no duplication). codex agent/command fidelity is best-effort (claude-only frontmatter is dropped; read-only relies on prompt + egress lockdown). codex, pi, and hermes have no native per-file rules dir, so the merged rules are concatenated into one `AGENTS.md` digest linked at `~/work/AGENTS.md` (only-if-absent, never clobbering a user file); `paths:`-scoped rules become always-on there. pi and codex share the same `.agents/skills/` tree (agentskills.io layout); hermes only loads `$HERMES_HOME/skills`, so its links go into the VM's per-instance overlay upper or the container's per-instance PVC-backed home (the host dir is untouched). pi/hermes have no plugin MCP, settings, agent, or command mapping yet.
 
 ## Network rules and credential injection
 

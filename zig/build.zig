@@ -248,6 +248,9 @@ pub fn build(b: *std.Build) void {
 	// The __claude-stub verb stages the shared stub credential, single-sourced from
 	// the secret module's claude_stub_token, so its tests need that import too.
 	cli_verbs_test_mod.addImport("secret_module", secret_mod);
+	// The `secret` verb re-renders + signals through the rules module (its live
+	// hot-reload path), so its tests need that import as well.
+	cli_verbs_test_mod.addImport("rules_module", rules_mod);
 	const cli_verbs_tests = b.addTest(.{
 		.root_module = cli_verbs_test_mod,
 	});

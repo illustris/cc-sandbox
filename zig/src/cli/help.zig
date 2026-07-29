@@ -257,6 +257,24 @@ pub const INIT =
 	\\  --vcpu N              vCPU count to bake into the new config
 	\\  --mem N               RAM in megabytes to bake into the new config
 	\\  --network MODE        Network mode: full, none, or rules
+	\\  --bind-addr ADDR      Address the guest's port forwards are advertised
+	\\                        at (default: 127.0.0.1)
+	\\  --no-implicit-dns     Stop port 53 escaping the L4 rule walk, so the
+	\\                        seeded link-local/private denies apply to DNS as
+	\\                        well. Needs a resolver those rules allow: one
+	\\                        inside a denied range breaks DNS silently, unless
+	\\                        --dns-host names a forwarder the host provides.
+	\\                        Rules mode only.
+	\\  --dns-host ADDR       The loopback address the ENCLOSING host runs its
+	\\                        own DNS forwarder on. Re-admits exactly that one
+	\\                        address on port 53, so a guest whose resolver
+	\\                        passt forwards there keeps resolving what the host
+	\\                        resolves under --no-implicit-dns. One bare
+	\\                        address: no prefix, no port. Rules mode only.
+	\\  --self-addr CIDR      An address of the ENCLOSING host, added to the L7
+	\\                        proxy's non-overridable floor so an allowed vhost
+	\\                        that resolves to it is refused. Repeatable.
+	\\                        Rules mode only.
 	\\  --no-auto-keys        Leave authorized_keys empty instead of seeding it
 	\\  -y, --yes             Skip the harness-selection prompt
 	\\  -h, --help            Show this help and exit
@@ -304,11 +322,21 @@ pub const SSH =
 	\\input. When output is piped or redirected, no PTY is forced and bytes stream
 	\\through untouched (e.g. `cogbox ssh -- cat f | sha256sum`).
 	\\
+	\\ssh joins the words after the target into ONE string and the guest runs it
+	\\through `sh -c`, so a command of TWO OR MORE words is quoted word by word:
+	\\`#`, spaces, quotes, `$`, backticks and newlines reach the remote command
+	\\literally instead of being re-parsed by the guest shell. A command passed as
+	\\ONE argument is left alone -- that is the shell-string form -- so pass one
+	\\string, or `-- sh -c '<script>'`, when you want guest-side shell syntax.
+	\\
 	\\Examples:
 	\\  cogbox ssh                          Open an interactive shell
 	\\  cogbox ssh -- htop                  Run htop on the default instance
 	\\  cogbox ssh --name work -- uname -a  Run on the "work" instance
 	\\  cogbox ssh --wait-for-ssh -- c      Wait for sshd, then run c (cold boot)
+	\\  cogbox ssh -- tmux ls -F '#{session_name}'
+	\\                                      Words stay literal (argv form)
+	\\  cogbox ssh -- sh -c 'ls /root/*'    Guest-side shell syntax
 	\\
 ;
 

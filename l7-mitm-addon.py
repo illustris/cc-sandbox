@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import sys
 import tempfile
 import time
@@ -52,11 +53,30 @@ RULES_PATH = os.environ.get("COGBOX_L7_RULES", "")
 INJECT_CONF_PATH = os.environ.get("COGBOX_L7_INJECT_CONF", "")
 
 
+def _is_methods_token(tk):
+    """A METHODS token is all uppercase ASCII letters and commas with at least
+    one letter (GET / GET,POST) -- mirrors filter.zig's isMethodsToken. The
+    keyword tokens (terminate/passthrough/insecure/exact) and `service=` are all
+    lowercase, so an all-uppercase token is unambiguously the method list."""
+    if not tk:
+        return False
+    saw_letter = False
+    for c in tk:
+        if "A" <= c <= "Z":
+            saw_letter = True
+        elif c != ",":
+            return False
+    return saw_letter
+
+
 class Rules:
     def __init__(self):
         self.mtime = None
         self.mode_terminate = False
-        self.rules = []  # list of (action, host_pattern, path_or_None, insecure_bool)
+        # list of (action, host_pattern, path_or_None, insecure_bool,
+        #          methods_frozenset_or_None, exact_bool, service_or_None,
+        #          tag_or_None)
+        self.rules = []
 
     def maybe_reload(self):
         try:
@@ -80,13 +100,45 @@ class Rules:
                         continue
                     if toks[0] not in ("allow", "deny") or len(toks) < 2:
                         continue
-                    action, host, path, insecure = toks[0], toks[1], None, False
+                    action, host = toks[0], toks[1]
+                    path, insecure, methods, exact, service, tag, bad = \
+                        None, False, None, False, None, None, False
                     for tk in toks[2:]:
                         if tk.startswith("/"):
                             path = tk
                         elif tk == "insecure":
                             insecure = True
-                    rules.append((action, host, path, insecure))
+                        elif tk == "exact":
+                            exact = True
+                        elif tk in ("terminate", "passthrough"):
+                            # Tier tokens: the Zig proxy owns tier selection; the
+                            # addon only enforces allow/deny, so these are ignored
+                            # here (but must NOT trip the unknown-token guard).
+                            pass
+                        elif tk.startswith("service="):
+                            service = tk[len("service="):]
+                            if not service:
+                                bad = True
+                                break
+                        elif tk.startswith("tag="):
+                            # Injection-gating tag (renderL7 emits tag=git-grants).
+                            # No `bad` and no empty-value reject: an empty tag can
+                            # never equal a non-empty spec rules_tag, and the
+                            # enforcer never emits one. A genuinely-unknown token
+                            # still trips the else guard; `tagx=...` (not matching
+                            # `tag=`) is unknown -> line dropped (parity w/ Zig).
+                            tag = tk[len("tag="):]
+                        elif _is_methods_token(tk):
+                            methods = frozenset(m for m in tk.split(",") if m)
+                        else:
+                            # Fail closed, matching the Zig parser: an unknown
+                            # token rejects the whole line rather than silently
+                            # widening it (the rolling-upgrade parity guard).
+                            bad = True
+                            break
+                    if bad:
+                        continue
+                    rules.append((action, host, path, insecure, methods, exact, service, tag))
         except OSError:
             pass
         self.rules, self.mode_terminate = rules, mode_t
@@ -140,13 +192,64 @@ def normalize_path(p):
     return out
 
 
-def evaluate(rules, host, path):
+_GIT_SERVICES = ("git-upload-pack", "git-receive-pack")
+
+
+def effective_git_service(path, query_service=None):
+    """The request's effective git smart-HTTP service.
+
+    PATH WINS: derive from the path's final segment first -- a POST to a
+    `git-upload-pack` / `git-receive-pack` pack endpoint IS that service,
+    regardless of any client-supplied `?service=` query. This mirrors
+    filter.effectiveGitService (path-only) and is what keeps read/write
+    separation intact: a `service=git-upload-pack` (read) allow rule must NOT
+    match `POST .../git-receive-pack?service=git-upload-pack` -- the query
+    cannot launder a push into the clone service.
+
+    Only when the path is NOT itself a pack endpoint do we consult the query,
+    and then only on the `info/refs` advertisement -- the sole request in the
+    smart-HTTP protocol where the service lives in the query string. Trusting
+    the query on any other path would let a wildcard read grant (a `/group/`
+    prefix rule) authorize the owner's token onto arbitrary non-repo group
+    resources (archives, artifacts, raw files) simply by appending
+    `?service=git-upload-pack`. Constraining it to `.../info/refs` closes that.
+    Returns None otherwise."""
+    seg = path.rstrip("/").rsplit("/", 1)[-1]
+    if seg in _GIT_SERVICES:
+        return seg
+    if path.rstrip("/").endswith("/info/refs") and query_service in _GIT_SERVICES:
+        return query_service
+    return None
+
+
+def is_pack_endpoint(path):
+    """True when the path's final segment is a git POST pack endpoint (the
+    large-body clone/push requests we stream instead of buffering)."""
+    return path.rstrip("/").rsplit("/", 1)[-1] in _GIT_SERVICES
+
+
+def evaluate(rules, host, path, method=None, query_service=None, require_tag=None):
     h = host.rstrip(".")
-    for action, pattern, rpath, _insecure in rules.rules:
+    for action, pattern, rpath, _insecure, methods, exact, service, tag in rules.rules:
+        # Tag gate: when require_tag is set (credential-injection's second,
+        # restricted pass), consider ONLY rules bearing that tag. require_tag
+        # None (the default) reproduces the unrestricted allow/deny decision.
+        if require_tag is not None and tag != require_tag:
+            continue
         if not host_match(pattern, h):
             continue
-        if rpath is not None and not path_match(rpath, path):
-            continue
+        if methods is not None:
+            if method is None or method.upper() not in methods:
+                continue
+        if rpath is not None:
+            if exact:
+                if path != rpath:
+                    continue
+            elif not path_match(rpath, path):
+                continue
+        if service is not None:
+            if effective_git_service(path, query_service) != service:
+                continue
         return action
     return "deny"
 
@@ -159,7 +262,7 @@ def host_insecure(rules, host):
     the host pattern only -- the `request` hook already enforced allow + path.
     """
     h = host.rstrip(".")
-    for action, pattern, rpath, insecure in rules.rules:
+    for action, pattern, rpath, insecure, methods, exact, service, _tag in rules.rules:
         if action == "allow" and insecure and host_match(pattern, h):
             return True
     return False
@@ -453,6 +556,25 @@ class CredStore:
                     specs[host] = spec
         except (OSError, ValueError):
             specs = {}
+        # A conf reload invalidates the cached credential READS too, not just the
+        # specs. Those caches are keyed on the cred file's mtime, and the change
+        # that makes a bound credential readable does NOT move it: the host grants
+        # the proxy gid group-read with a chmod (rules/credgrant.zig), and chmod
+        # moves ctime only. An atomic-rename rebind resets the file to 0600 and the
+        # re-render that re-grants it is a separate exec, so a request landing in
+        # that window caches (mtime, None) -- which without this flush stays
+        # cache-valid forever and makes every later request on that host 403 with
+        # "credential unavailable", with no self-heal. writeL7Inject applies the
+        # grant and rewrites this conf in the same pass, so the conf's mtime is a
+        # trigger that covers every grant transition -- including one that FAILED
+        # and only succeeded on a later render, which the host-side mtime bump
+        # cannot cover. Cheap: this costs at most one small re-read per cred file
+        # the conf names, on the next request that needs it, and the conf changes
+        # only when a render runs (a bind, a reload, an `l7 add/del`) -- never per
+        # request, so there is no re-read storm. `_last_attempt` is deliberately NOT
+        # cleared: it throttles refresh POSTs, and a render must not reset that.
+        self._file_cache.clear()
+        self._raw_cache.clear()
         self.specs = specs
 
     def _read_json(self, cred_file):
@@ -772,7 +894,30 @@ def _deny(flow, msg):
     )
 
 
-def request(flow):
+# git smart-HTTP endpoints that take basic auth (`git_user:<token>`); every other
+# path on a gitlab-oauth host (the REST API) takes a Bearer. Mirrors the docstring
+# used by the compiled git-grant rules.
+GIT_SMART_HTTP_RE = re.compile(r"\.git/(info/refs|git-upload-pack|git-receive-pack)$")
+
+
+def resolve_gitlab_style(spec, path):
+    """For a `gitlab-oauth` spec, resolve the per-request effective injection:
+    (style, token_prefix). git smart-HTTP paths -> ("basic", "<git_user>:") so the
+    injected token becomes `git_user:<token>`; every other path (REST API) ->
+    ("bearer", ""). Returns (spec_style, "") unchanged for non-gitlab specs."""
+    if spec.get("style") != "gitlab-oauth":
+        return spec.get("style", "bearer"), ""
+    if GIT_SMART_HTTP_RE.search(path):
+        return "basic", (spec.get("git_user") or "oauth2") + ":"
+    return "bearer", ""
+
+
+def _enforce_and_inject(flow, path, query_service=None):
+    """Shared enforcement + injection for a decrypted (or plain-HTTP) request:
+    force the upstream SNI, enforce Host==SNI + allow/deny, then inject the
+    host-side credential LAST (only on an allowed, non-fronted request). Sets
+    `flow.response` (403) on any denial. Header-only, so it is safe to run from
+    either `requestheaders` (pack endpoints, before the body) or `request`."""
     RULES.maybe_reload()
 
     sni = flow.client_conn.sni
@@ -786,8 +931,8 @@ def request(flow):
         _deny(flow, "host/sni mismatch")
         return
 
-    path = normalize_path(flow.request.path)
-    if evaluate(RULES, host, path) != "allow":
+    method = getattr(flow.request, "method", None)
+    if evaluate(RULES, host, path, method, query_service) != "allow":
         _deny(flow, "denied")
         return
 
@@ -795,7 +940,9 @@ def request(flow):
     # so a denied/fronted request never gets a real token stamped on it.
     spec = CREDS.spec_for(host)
     if spec is not None:
-        style = spec.get("style", "bearer")
+        # gitlab-oauth resolves basic-vs-bearer per request path; other styles
+        # pass straight through.
+        style, token_prefix = resolve_gitlab_style(spec, path)
         do_inject = should_inject(flow.request.headers, style,
                                   spec.get("stub_token"), spec.get("cookie_name"))
         if os.environ.get("COGBOX_L7_DEBUG_INJECT"):
@@ -804,6 +951,18 @@ def request(flow):
                             or flow.request.headers.get("x-api-key"))
             _cred_log("inject host=%s path=%s inject=%s had_auth=%s"
                       % (host, path, do_inject, has_auth))
+        rules_tag = spec.get("rules_tag")
+        if do_inject and rules_tag and \
+                evaluate(RULES, host, path, method, query_service, require_tag=rules_tag) != "allow":
+            # Reachability was allowed by the full rule set, but no git-grant-tagged
+            # rule covers THIS request -- inject NOTHING (the owner's token stays out
+            # of a path only a generic whole-host allow reached). The request still
+            # proceeds upstream with whatever the guest presented (stub / none); the
+            # git host rejects it. Specs without rules_tag (anthropic-oauth) are
+            # unaffected -- they keep replacing on every allowed request.
+            do_inject = False
+            if os.environ.get("COGBOX_L7_DEBUG_INJECT"):
+                _cred_log("inject gated-out host=%s path=%s tag=%s" % (host, path, rules_tag))
         if do_inject:
             # Refresh the host token first if it's near expiry (no-op unless the
             # spec opts in). Keeps a long-running guest -- which can't refresh, by
@@ -818,11 +977,51 @@ def request(flow):
                 _deny(flow, "credential unavailable")
                 return
             account_id = CREDS.value_for(spec, "account_id_path")
-            apply_injection(flow.request.headers, style, token, account_id,
-                            spec.get("cookie_name"))
+            apply_injection(flow.request.headers, style, token_prefix + token,
+                            account_id, spec.get("cookie_name"))
         # else: the guest is presenting a SECONDARY credential it legitimately
         # obtained through an injected call (e.g. Remote Control per-session
         # bridge creds) -- forward it to the upstream untouched.
+
+
+def requestheaders(flow):
+    """Decide + inject for git pack endpoints BEFORE the (possibly huge)
+    clone/push body is read, and stream the body through instead of buffering it
+    in the proxy. The decision inputs (host, path, method) are all header-only,
+    and injection only touches headers, so doing it here is safe. Non-pack flows
+    are left to the `request` hook (unchanged); we mark handled flows so `request`
+    skips them (and so a streamed request -- where `request` may not fire -- is
+    still enforced)."""
+    path = normalize_path(flow.request.path)
+    if not is_pack_endpoint(path):
+        return
+    flow.cogbox_handled = True
+    _enforce_and_inject(flow, path, query_service=_query_service(flow))
+    if flow.response is None:  # allowed (not denied) -> stream the body
+        try:
+            flow.request.stream = True
+        except Exception:
+            pass
+
+
+def request(flow):
+    # Pack endpoints are already fully handled (enforced + injected + streamed)
+    # in requestheaders; skip them here to avoid double-processing.
+    if getattr(flow, "cogbox_handled", False):
+        return
+    path = normalize_path(flow.request.path)
+    _enforce_and_inject(flow, path, query_service=_query_service(flow))
+
+
+def _query_service(flow):
+    """The `service` query parameter of the request (the git info/refs
+    advertisement), or None. Read defensively so the pure-helper tests -- whose
+    fake request carries no query multidict -- work too."""
+    try:
+        q = flow.request.query
+        return q.get("service") if q is not None else None
+    except Exception:
+        return None
 
 
 def responseheaders(flow):
@@ -847,7 +1046,10 @@ def responseheaders(flow):
     # Stream when the response IS an event stream, or the client ASKED for one
     # (covers a content-type the server labels differently). Streaming a non-SSE
     # body that slips through is harmless -- we never read response bodies.
-    if resp_ct == "text/event-stream" or "text/event-stream" in req_accept:
+    # Also stream git pack-endpoint responses: a clone's git-upload-pack response
+    # body can be gigabytes and must not buffer in the proxy.
+    if (resp_ct == "text/event-stream" or "text/event-stream" in req_accept
+            or is_pack_endpoint(normalize_path(flow.request.path))):
         flow.response.stream = True
 
 

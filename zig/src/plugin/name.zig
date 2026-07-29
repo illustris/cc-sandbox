@@ -3,7 +3,10 @@
 // The grammar matches instance names (cli/parse.zig isValidName): starts
 // with a letter, then [A-Za-z0-9-], max 64 chars. "user" is additionally
 // reserved -- it is the composition flake's input name for the per-instance
-// user flake.
+// user flake. "git-grants" is reserved too: it is the backend-owned L7 rule
+// tag (cogworx gitgrants.go gitGrantsTag) that gates credential injection, so
+// a plugin must never be able to claim it and thereby stamp `plugin:git-grants`
+// on its own rules (see docs/network-filtering.md).
 
 const std = @import("std");
 
@@ -57,6 +60,7 @@ pub fn isValidPluginName(s: []const u8) bool {
 		if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
 	}
 	if (std.mem.eql(u8, s, "user")) return false;
+	if (std.mem.eql(u8, s, "git-grants")) return false;
 	return true;
 }
 

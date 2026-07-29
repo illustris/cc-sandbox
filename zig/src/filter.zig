@@ -42,6 +42,9 @@ pub const max_rules = 256;
 pub const max_remap_rules = 64;
 pub const max_dns_rules = 256;
 pub const max_dns_pattern_len: u8 = 253; // RFC 1035 FQDN length cap
+// Per-instance additions to the L7 proxy's hard floor (`hard-deny <cidr>`).
+// A VM has one or two of its own addresses, so this is deliberately small.
+pub const max_hard_rules = 16;
 
 pub const DnsPatternKind = enum { exact, left_wildcard, any };
 
@@ -60,6 +63,13 @@ pub const DnsRule = struct {
 	action: Action,
 };
 
+/// One `hard-deny <cidr>` line: a per-instance addition to the L7 proxy's
+/// non-overridable hard floor (see `isHardBlocked` / `RuleSet.hardBlocked`).
+pub const HardRule = struct {
+	network: IpAddr,
+	prefix_len: u8,
+};
+
 pub const RuleSet = struct {
 	rules: [max_rules]Rule = undefined,
 	len: usize = 0,
@@ -76,13 +86,59 @@ pub const RuleSet = struct {
 	dns_len: usize = 0,
 	dns_default: Action = .allow,
 
+	// Per-instance extension of the L7 proxy's hard floor, from `hard-deny`
+	// lines. Empty by default: an instance that renders no `hard-deny` line
+	// gets exactly `isHardBlocked`'s floor, as before.
+	hard_rules: [max_hard_rules]HardRule = undefined,
+	hard_len: usize = 0,
+
+	// The implicit port-53 allow below. TRUE preserves the historical
+	// behavior (DNS to any destination escapes the rule walk, which is what
+	// makes a loopback resolver like 127.0.0.53 usable); a `no-implicit-dns`
+	// line turns it off so the seeded link-local/RFC1918 denies apply to DNS
+	// too. Hosts whose resolver IS the cloud metadata address (GCE, where the
+	// VPC resolver is 169.254.169.254) must turn it off or port 53 is an
+	// unfiltered egress path.
+	implicit_dns_allow: bool = true,
+
+	// The enclosing host's own DNS forwarder, from a `dns-host <addr>` line.
+	// null by default, so an instance that renders no such line evaluates
+	// exactly as it did before this field existed.
+	//
+	// It exists because `no-implicit-dns` and passt's `--dns-forward` are only
+	// usable TOGETHER. `--dns-forward <X>` makes passt intercept the guest's
+	// queries to X and re-emit them host-side to its `--dns-host` address --
+	// which is the whole point on a host whose real resolver is an address the
+	// guest must not reach: the guest's DNS then terminates at a LOOPBACK
+	// forwarder on the trusted half, and resolves exactly what the host
+	// resolves. But that re-emitted socket is an ordinary loopback connect made
+	// by passt, so with the implicit port-53 allow off it hits the loopback deny
+	// below and guest DNS dies silently.
+	//
+	// The exception is therefore address- AND port-scoped to that one socket: it
+	// is NOT a port-53 pass (that is what `no-implicit-dns` removed, and what
+	// would restore an arbitrary-destination DNS tunnel past every seeded deny),
+	// and it is not a loopback pass (127.0.0.1:<l7base+2>, the mitmproxy SOCKS5
+	// hop, stays denied like the rest of loopback). One address, port 53.
+	dns_host: ?IpAddr = null,
+
 	/// Evaluate a destination (proto, addr, port) against the CIDR rules.
 	/// Callers that don't know the protocol may pass `.any`; rules with an
 	/// explicit proto qualifier won't match a `.any` query.
 	pub fn evaluate(self: *const RuleSet, proto: Proto, addr: IpAddr, port: u16) Action {
 		// Implicit: allow DNS (port 53) -- checked first so DNS to
 		// loopback resolvers (e.g. 127.0.0.53 systemd-resolved) works.
-		if (port == 53) return .allow;
+		// Parameterized: `no-implicit-dns` removes the short-circuit so DNS
+		// walks the ordered rules like every other port.
+		if (port == 53 and self.implicit_dns_allow) return .allow;
+
+		// The one exception to the loopback deny below: the host's own DNS
+		// forwarder, on port 53 and at that exact address. See `dns_host`.
+		if (port == 53) {
+			if (self.dns_host) |h| {
+				if (addrEquals(h, addr)) return .allow;
+			}
+		}
 
 		// Implicit: deny loopback -- passt maps its gateway and the
 		// host's IP to 127.0.0.1, so allowing loopback would expose
@@ -113,6 +169,25 @@ pub const RuleSet = struct {
 			if (remapMatches(r, proto, check_addr, port)) return r.target;
 		}
 		return null;
+	}
+
+	/// The L7 proxy's hard floor for THIS instance: the built-in
+	/// `isHardBlocked` set plus every `hard-deny` CIDR. The built-in set is
+	/// topology-independent (loopback / this-net / link-local), but the
+	/// enclosing host's OWN addresses are not knowable at build time -- and an
+	/// explicit L7 `allow` supersedes the L4 CIDR re-check, so without this a
+	/// sandbox owner could point an A record they control at the machine
+	/// running the proxy and get a guest-triggered connection back into it
+	/// under the proxy's uid. Prefer this over `isHardBlocked` on every
+	/// production dial path; the bare function survives for callers with no
+	/// ruleset in hand.
+	pub fn hardBlocked(self: *const RuleSet, addr: IpAddr) bool {
+		if (isHardBlocked(addr)) return true;
+		const a = normalizeMapped(addr);
+		for (self.hard_rules[0..self.hard_len]) |h| {
+			if (cidrContains(h.network, h.prefix_len, a)) return true;
+		}
+		return false;
 	}
 
 	/// Evaluate a hostname against the DNS rule table. The host may carry a
@@ -246,6 +321,22 @@ fn normalizeMapped(addr: IpAddr) IpAddr {
 	};
 }
 
+/// Exact address equality, v4-mapped-v6 normalized on both sides. Used only by
+/// the `dns_host` exception, which must match ONE address rather than a prefix:
+/// a prefix there would be a loopback carve-out, not a socket carve-out.
+fn addrEquals(a: IpAddr, b: IpAddr) bool {
+	return switch (normalizeMapped(a)) {
+		.ipv4 => |x| switch (normalizeMapped(b)) {
+			.ipv4 => |y| std.mem.eql(u8, &x, &y),
+			.ipv6 => false,
+		},
+		.ipv6 => |x| switch (normalizeMapped(b)) {
+			.ipv6 => |y| std.mem.eql(u8, &x, &y),
+			.ipv4 => false,
+		},
+	};
+}
+
 /// True for loopback destinations (127.0.0.0/8, ::1, and the IPv4-mapped
 /// form of 127/8). Lifted out of `evaluate()` so the shim's connect()
 /// reorder can reuse it: a remap rule's broad LHS (e.g. 0.0.0.0/0:443)
@@ -281,6 +372,11 @@ const hard_blocked_v4 = [_]struct { net: [4]u8, prefix: u8 }{
 /// of instance rules. Folds IPv4-mapped IPv6 into IPv4 first so
 /// `::ffff:169.254.169.254` is caught. Private ranges are intentionally NOT
 /// hard-blocked -- they are governed by the instance CIDR policy (see above).
+///
+/// This is the TOPOLOGY-INDEPENDENT half of the floor. The enclosing host's own
+/// addresses are not knowable at build time and are carried per instance as
+/// `hard-deny` lines; production dial paths call `RuleSet.hardBlocked`, which is
+/// this set plus those. Callers with no ruleset in hand may still use this.
 pub fn isHardBlocked(addr: IpAddr) bool {
 	switch (normalizeMapped(addr)) {
 		.ipv4 => |ip| {
@@ -572,6 +668,36 @@ pub fn parseIpv4(s: []const u8) ?[4]u8 {
 	return result;
 }
 
+/// Parse the body of a `hard-deny <cidr>` line. A bare address is accepted and
+/// means the single host (/32 or /128) -- the renderer emits the instance's own
+/// addresses, which are naturally written without a prefix. No proto and no
+/// port: the floor is address-scoped by construction, so anything narrower
+/// would be a rule that pretends to be a floor. Pure: it returns the rule and
+/// touches no shared state, so the shim (which parses the same file but never
+/// consults this table) is unaffected.
+fn parseHardDenyBody(body: []const u8) ?HardRule {
+	const pcp = parseProtoCidrPort(body, .{}) orelse return null;
+	if (pcp.proto != .any or pcp.port != 0) return null;
+	return .{ .network = pcp.network, .prefix_len = pcp.prefix_len };
+}
+
+/// Parse the body of a `dns-host <addr>` line: the ONE loopback address the
+/// enclosing host runs its DNS forwarder on (`RuleSet.dns_host`).
+///
+/// A BARE ADDRESS only. A prefix is refused rather than accepted-and-narrowed,
+/// and that is the whole safety property of this parser: `dns-host 127.0.0.0/8`
+/// would turn a one-socket exception into a port-53 pass to every loopback
+/// listener. A proto or port qualifier is refused for the same reason -- the
+/// port is fixed at 53 by `evaluate`, so accepting one here would only create a
+/// second, disagreeing statement of it.
+fn parseDnsHostBody(body: []const u8) ?IpAddr {
+	const trimmed = std.mem.trim(u8, body, " \t");
+	if (std.mem.indexOfScalar(u8, trimmed, '/') != null) return null;
+	const pcp = parseProtoCidrPort(trimmed, .{}) orelse return null;
+	if (pcp.proto != .any or pcp.port != 0) return null;
+	return pcp.network;
+}
+
 /// Parse a multi-line rules string into a RuleSet.
 pub fn parseRules(content: []const u8) RuleSet {
 	var ruleset = RuleSet{};
@@ -580,6 +706,40 @@ pub fn parseRules(content: []const u8) RuleSet {
 	while (lines.next()) |line| {
 		const trimmed = std.mem.trim(u8, line, " \t\r\n");
 		if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+		// Both of the following are matched BEFORE the `dns ` branch: an
+		// unparseable `dns ...` body is silently dropped there, so a
+		// `dns`-prefixed spelling of either keyword would fail closed-mouthed
+		// instead of loudly. They are distinct keywords for that reason.
+		if (std.mem.eql(u8, trimmed, "no-implicit-dns")) {
+			ruleset.implicit_dns_allow = false;
+			continue;
+		}
+
+		// Also ahead of the `dns ` branch, and it does NOT collide with it:
+		// "dns-host " has no space after "dns", so `startsWith("dns ")` is
+		// false for it either way. Kept here beside the other two keywords so
+		// the ordering argument above holds for all three by inspection.
+		// FIRST line wins: passt carries one --dns-host per family, so a second
+		// line is a config that means two things and must not silently pick one.
+		if (std.mem.startsWith(u8, trimmed, "dns-host ")) {
+			if (ruleset.dns_host == null) {
+				if (parseDnsHostBody(trimmed["dns-host ".len..])) |a| {
+					ruleset.dns_host = a;
+				}
+			}
+			continue;
+		}
+
+		if (std.mem.startsWith(u8, trimmed, "hard-deny ")) {
+			if (parseHardDenyBody(trimmed["hard-deny ".len..])) |h| {
+				if (ruleset.hard_len < max_hard_rules) {
+					ruleset.hard_rules[ruleset.hard_len] = h;
+					ruleset.hard_len += 1;
+				}
+			}
+			continue;
+		}
 
 		if (std.mem.startsWith(u8, trimmed, "dns ")) {
 			const body = trimmed[4..];
@@ -625,6 +785,12 @@ pub fn parseRules(content: []const u8) RuleSet {
 
 pub const max_l7_rules = 128;
 pub const max_l7_path_len = 256;
+// A rule's optional HTTP-method constraint is stored as the raw uppercase
+// comma-separated token (e.g. `GET,POST`); 0 length == "any method".
+pub const max_l7_methods_len = 64;
+// A rule's optional `service=<svc>` git-service constraint (e.g.
+// `git-upload-pack`); 0 length == "no service constraint".
+pub const max_l7_service_len = 32;
 // Upper bound on hosts the terminate-tier addon injects a credential into (the
 // `l7-inject-hosts` set the proxy reads to route their plain-HTTP egress
 // through the addon too). Generous: harness specs are HTTPS-only and don't need
@@ -674,12 +840,61 @@ pub const L7Rule = struct {
 	// this is the escape hatch for cert-pinned clients. Mutually exclusive with
 	// path/terminate/insecure_upstream.
 	passthrough: bool = false,
+	// Optional HTTP-method constraint: the raw uppercase comma-separated token
+	// (`GET` or `GET,POST`). 0 length == any method. Used to distinguish read
+	// vs write git smart-HTTP verbs (GET info/refs vs POST git-*-pack).
+	methods_buf: [max_l7_methods_len]u8 = undefined,
+	methods_len: u8 = 0,
+	// When true, `path` is matched by full normalized-path EQUALITY instead of
+	// the default boundary-aware prefix (`exact` rule token).
+	exact: bool = false,
+	// Optional git-service constraint (`service=<svc>`). Matched against the
+	// request's effective git service (endpoint-derived here; the addon also
+	// consults the `?service=` query on the terminated leg). 0 length == none.
+	service_buf: [max_l7_service_len]u8 = undefined,
+	service_len: u8 = 0,
 
 	pub fn pathSlice(self: *const L7Rule) ?[]const u8 {
 		if (!self.has_path) return null;
 		return self.path_buf[0..self.path_len];
 	}
+
+	pub fn methodsSlice(self: *const L7Rule) ?[]const u8 {
+		if (self.methods_len == 0) return null;
+		return self.methods_buf[0..self.methods_len];
+	}
+
+	pub fn serviceSlice(self: *const L7Rule) ?[]const u8 {
+		if (self.service_len == 0) return null;
+		return self.service_buf[0..self.service_len];
+	}
 };
+
+/// The effective git smart-HTTP service of a request, DERIVED FROM THE PATH's
+/// final segment: `git-upload-pack` (fetch/clone) or `git-receive-pack` (push).
+/// The `info/refs` advertisement carries the service in the `?service=` query
+/// instead -- that lives in the stripped query, so this endpoint-derivation
+/// returns null for it (the terminate-tier addon, which sees the query, is
+/// authoritative there; this is the cleartext defense-in-depth). Returns null
+/// when the final segment is neither pack endpoint.
+pub fn effectiveGitService(path: []const u8) ?[]const u8 {
+	var p = path;
+	while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+	const seg = if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| p[i + 1 ..] else p;
+	if (std.mem.eql(u8, seg, "git-upload-pack")) return "git-upload-pack";
+	if (std.mem.eql(u8, seg, "git-receive-pack")) return "git-receive-pack";
+	return null;
+}
+
+/// True iff `method` is one of the uppercase comma-separated methods in
+/// `methods_csv` (case-insensitive). Empty entries are ignored.
+pub fn methodInList(methods_csv: []const u8, method: []const u8) bool {
+	var it = std.mem.tokenizeScalar(u8, methods_csv, ',');
+	while (it.next()) |m| {
+		if (std.ascii.eqlIgnoreCase(m, method)) return true;
+	}
+	return false;
+}
 
 /// Result of evaluating a vhost against the L7 rules. Distinct from a bare
 /// allow/deny so the proxy can compose with the L4 layer: an explicit `allow`
@@ -713,14 +928,39 @@ pub const L7RuleSet = struct {
 	/// fail-closed trigger -- `deny api.x /admin/` blocks only /admin/ and
 	/// leaves every other path to the L4 policy.
 	pub fn evaluate(self: *const L7RuleSet, host: []const u8, path: ?[]const u8) L7Verdict {
+		return self.evaluateFull(host, path, null);
+	}
+
+	/// As `evaluate`, but also enforces a rule's optional method / `exact` /
+	/// `service=` constraints against the request's `method` (null when the
+	/// caller doesn't know it -- e.g. TLS passthrough -- in which case a
+	/// method-constrained rule simply doesn't match). `exact` compares the
+	/// normalized path for equality; `service=` compares the endpoint-derived
+	/// git service (query-based service is stripped before we get here, so the
+	/// addon is authoritative for it on the terminated leg).
+	pub fn evaluateFull(self: *const L7RuleSet, host: []const u8, path: ?[]const u8, method: ?[]const u8) L7Verdict {
 		const h = stripRootDot(host);
 		var allow_host_matched = false;
 		for (self.rules[0..self.len]) |r| {
 			if (!matchDnsPattern(r.host, h)) continue;
 			if (r.action == .allow) allow_host_matched = true;
+			if (r.methodsSlice()) |m| {
+				const req_m = method orelse continue; // unknown method -> can't confirm
+				if (!methodInList(m, req_m)) continue;
+			}
 			if (r.has_path) {
 				const p = path orelse continue;
-				if (!pathPrefixMatches(r.pathSlice().?, p)) continue;
+				const rp = r.pathSlice().?;
+				if (r.exact) {
+					if (!std.mem.eql(u8, rp, p)) continue;
+				} else {
+					if (!pathPrefixMatches(rp, p)) continue;
+				}
+			}
+			if (r.serviceSlice()) |svc| {
+				const p = path orelse continue;
+				const eff = effectiveGitService(p) orelse continue;
+				if (!std.mem.eql(u8, eff, svc)) continue;
 			}
 			return switch (r.action) {
 				.allow => .allow,
@@ -745,7 +985,8 @@ pub const L7RuleSet = struct {
 		for (self.rules[0..self.len]) |r| {
 			if (!matchDnsPattern(r.host, h)) continue;
 			if (r.passthrough) return false;
-			if (r.has_path or r.terminate or r.insecure_upstream) return true;
+			if (r.has_path or r.terminate or r.insecure_upstream or r.exact or
+				r.methodsSlice() != null or r.serviceSlice() != null) return true;
 			if (r.action == .allow) matched_allow = true;
 		}
 		if (matched_allow and isHarnessPassthroughHost(h)) return false;
@@ -851,6 +1092,21 @@ pub const L7Line = union(enum) {
 	none, // blank / comment / malformed
 };
 
+/// A METHODS token is all uppercase ASCII letters and commas, with at least one
+/// letter (e.g. `GET` or `GET,POST`). The keyword tokens (`terminate`,
+/// `passthrough`, `insecure`, `exact`) and `service=` are all lowercase, so an
+/// all-uppercase token is unambiguously the optional method list.
+fn isMethodsToken(tok: []const u8) bool {
+	if (tok.len == 0) return false;
+	var saw_letter = false;
+	for (tok) |c| switch (c) {
+		'A'...'Z' => saw_letter = true,
+		',' => {},
+		else => return false,
+	};
+	return saw_letter;
+}
+
 /// Parse a single `l7-rules` line:
 ///   mode passthrough|terminate
 ///   allow|deny  <host-pattern>  [<path>]  [terminate|passthrough]  [insecure]
@@ -893,12 +1149,33 @@ pub fn parseL7Line(line: []const u8) L7Line {
 			rule.passthrough = true;
 		} else if (std.mem.eql(u8, tok, "insecure")) {
 			rule.insecure_upstream = true;
+		} else if (std.mem.eql(u8, tok, "exact")) {
+			rule.exact = true;
+		} else if (std.mem.startsWith(u8, tok, "service=")) {
+			if (rule.service_len != 0) return .none; // duplicate
+			const svc = tok["service=".len..];
+			if (svc.len == 0 or svc.len > max_l7_service_len) return .none;
+			@memcpy(rule.service_buf[0..svc.len], svc);
+			rule.service_len = @intCast(svc.len);
 		} else if (tok.len > 0 and tok[0] == '/') {
 			if (rule.has_path) return .none; // duplicate path
 			if (tok.len > max_l7_path_len) return .none;
 			@memcpy(rule.path_buf[0..tok.len], tok);
 			rule.path_len = @intCast(tok.len);
 			rule.has_path = true;
+		} else if (isMethodsToken(tok)) {
+			if (rule.methods_len != 0) return .none; // duplicate
+			if (tok.len > max_l7_methods_len) return .none;
+			@memcpy(rule.methods_buf[0..tok.len], tok);
+			rule.methods_len = @intCast(tok.len);
+		} else if (std.mem.startsWith(u8, tok, "tag=")) {
+			// Injection-gating tag (renderL7 emits `tag=git-grants`). The proxy
+			// does not gate injection (the mitmproxy addon does); it only
+			// enforces allow/deny + tier, so this token is accepted and IGNORED
+			// here. Accepting it is the rolling-upgrade parity guard: a new
+			// rules file's tagged lines must not be fail-closed dropped by the
+			// proxy. `tagx=foo` does NOT match (char 3 is `x` not `=`), so a
+			// genuinely-unknown token still hits the reject below.
 		} else {
 			return .none; // unknown token -> reject the whole line
 		}
@@ -974,6 +1251,155 @@ test "evaluate honors v6 deny-all but keeps DNS" {
 	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, v6, 443));
 	// DNS (port 53) stays implicitly allowed
 	try std.testing.expectEqual(Action.allow, rs.evaluate(.udp, v6, 53));
+}
+
+// The implicit port-53 allow sits ABOVE every rule, including the L7-mode
+// fail-closed v6 prologue, so today port 53 escapes the v6 fail-close, the
+// seeded 169.254.0.0/16 deny and every RFC1918 deny, in both families and both
+// protocols -- a DNS tunnel no filter sees. `no-implicit-dns` is the
+// parameterization the GCE backend requires, where
+// the VPC resolver IS the metadata address; the mirrored cases below are the
+// same inputs with the flag off.
+test "no-implicit-dns subjects port 53 to the v6 fail-close" {
+	const rs = parseRules(
+		\\no-implicit-dns
+		\\deny tcp ::/0
+		\\deny udp ::/0
+	);
+	try std.testing.expect(!rs.implicit_dns_allow);
+	const v6 = IpAddr{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, v6, 53));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, v6, 53));
+}
+
+test "no-implicit-dns subjects port 53 to the seeded link-local deny" {
+	const rs = parseRules(
+		\\no-implicit-dns
+		\\deny 169.254.0.0/16
+		\\allow 0.0.0.0/0
+	);
+	const metadata = IpAddr{ .ipv4 = .{ 169, 254, 169, 254 } };
+	const public = IpAddr{ .ipv4 = .{ 8, 8, 8, 8 } };
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, metadata, 53));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, metadata, 53));
+	// An operator-configured public resolver still resolves: the guest's DNS
+	// now walks the ordered rules and hits the seeded public allow.
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.udp, public, 53));
+}
+
+test "no-implicit-dns restores the loopback deny for port 53" {
+	// The implicit allow sits ABOVE the loopback deny deliberately (for
+	// 127.0.0.53/systemd-resolved). Turning it off puts loopback DNS back
+	// under the deny -- correct where the host resolver is not the guest's,
+	// and exactly why the default must stay on for a local dev box.
+	const rs = parseRules("no-implicit-dns");
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, .{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
+}
+
+test "parseRules keeps the implicit DNS allow when no-implicit-dns is absent" {
+	// The default-preserving guarantee: every instance that does not ask for
+	// the parameterization behaves byte-for-byte as before (local + k8s).
+	const rs = parseRules(
+		\\deny 169.254.0.0/16
+		\\allow 0.0.0.0/0
+	);
+	try std.testing.expect(rs.implicit_dns_allow);
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.udp, .{ .ipv4 = .{ 169, 254, 169, 254 } }, 53));
+}
+
+test "no-implicit-dns is matched as a whole keyword, not a dns-prefixed spelling" {
+	// `dns <body>` bodies that fail to parse are silently dropped, so a
+	// `dns no-implicit` spelling would fail silently. Guard the distinct
+	// keyword: a near-miss must NOT flip the flag.
+	try std.testing.expect(parseRules("dns no-implicit-dns").implicit_dns_allow);
+	try std.testing.expect(parseRules("no-implicit-dns-please").implicit_dns_allow);
+	try std.testing.expect(parseRules("# no-implicit-dns").implicit_dns_allow);
+}
+
+// --- dns-host: the host-side forwarder's ONE loopback socket ---------------
+//
+// THE REGRESSION THESE PIN. `no-implicit-dns` (which this backend passes
+// unconditionally) puts loopback DNS back under the loopback deny, and passt's
+// `--dns-forward` re-emits the guest's queries as an ordinary loopback connect
+// under the passt uid. Without `dns-host` the shim drops that connect and every
+// rules-mode guest has NO DNS -- silently, since a dropped packet surfaces
+// nothing. The counterpart hazard is the fix that over-corrects: anything
+// broader than one address + port 53 hands the guest either an
+// arbitrary-destination DNS tunnel or the trusted half's other loopback
+// listeners, both of which the rule set exists to deny.
+
+test "dns-host admits exactly the host forwarder's port-53 socket under no-implicit-dns" {
+	const rs = parseRules(
+		\\no-implicit-dns
+		\\dns-host 127.0.0.53
+		\\deny 169.254.0.0/16
+		\\allow 0.0.0.0/0
+	);
+	const fwd = IpAddr{ .ipv4 = .{ 127, 0, 0, 53 } };
+	// The one socket passt re-emits the guest's queries on, both protocols.
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.udp, fwd, 53));
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.tcp, fwd, 53));
+	// ... and nothing else about it. Another port on the SAME address is the
+	// sharpest case: it proves the exception is a socket, not an address.
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, fwd, 22));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, fwd, 853));
+	// Port 53 to any OTHER loopback listener stays denied -- 127.0.0.1:18445 is
+	// the mitmproxy SOCKS5 hop, the target rule 3 of the GCE floor names.
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, .{ .ipv4 = .{ 127, 0, 0, 1 } }, 53));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.tcp, .{ .ipv4 = .{ 127, 0, 0, 1 } }, 18445));
+	// And it is NOT a port-53 pass: the seeded link-local deny still applies,
+	// which is the tunnel `no-implicit-dns` was added to close.
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, .{ .ipv4 = .{ 169, 254, 169, 254 } }, 53));
+}
+
+test "dns-host normalizes the v4-mapped form" {
+	const rs = parseRules(
+		\\no-implicit-dns
+		\\dns-host 127.0.0.53
+	);
+	var mapped = IpAddr{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 53 } };
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.udp, mapped, 53));
+	mapped.ipv6[15] = 1;
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, mapped, 53));
+}
+
+test "dns-host refuses a prefix, a port and a proto" {
+	// Each of these is the tempting widening. A prefix is the dangerous one:
+	// `dns-host 127.0.0.0/8` would be a port-53 pass to every loopback listener
+	// while still reading like a one-host exception.
+	try std.testing.expect(parseRules("dns-host 127.0.0.0/8").dns_host == null);
+	try std.testing.expect(parseRules("dns-host 127.0.0.53/32").dns_host == null);
+	try std.testing.expect(parseRules("dns-host 127.0.0.53:53").dns_host == null);
+	try std.testing.expect(parseRules("dns-host udp 127.0.0.53").dns_host == null);
+	try std.testing.expect(parseRules("dns-host").dns_host == null);
+	try std.testing.expect(parseRules("dns-host ").dns_host == null);
+}
+
+test "dns-host takes the FIRST line, so a second cannot move the exception" {
+	const rs = parseRules(
+		\\dns-host 127.0.0.53
+		\\dns-host 127.0.0.1
+	);
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.udp, .{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
+	const rs2 = parseRules(
+		\\no-implicit-dns
+		\\dns-host 127.0.0.53
+		\\dns-host 127.0.0.1
+	);
+	try std.testing.expectEqual(Action.deny, rs2.evaluate(.udp, .{ .ipv4 = .{ 127, 0, 0, 1 } }, 53));
+}
+
+test "parseRules leaves dns_host null when no line asks for it" {
+	// The default-preserving guarantee at the ruleset layer: local, k8s and
+	// container instances render no `dns-host` line, so the loopback deny is
+	// exactly what it was before this field existed.
+	const rs = parseRules(
+		\\no-implicit-dns
+		\\deny 169.254.0.0/16
+		\\allow 0.0.0.0/0
+	);
+	try std.testing.expect(rs.dns_host == null);
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.udp, .{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
 }
 
 test "parseLine allow" {
@@ -1053,6 +1479,15 @@ test "RuleSet evaluate loopback DNS allowed" {
 test "RuleSet evaluate DNS" {
 	const rs = RuleSet{};
 	try std.testing.expectEqual(Action.allow, rs.evaluate(.any, .{ .ipv4 = .{ 8, 8, 8, 8 } }, 53));
+}
+
+test "RuleSet evaluate DNS with implicit_dns_allow off falls through to default deny" {
+	// Mirror of the two tests above, driven through the struct field rather
+	// than the parser: with the short-circuit off an empty ruleset denies
+	// port 53 like any other port.
+	const rs = RuleSet{ .implicit_dns_allow = false };
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.any, .{ .ipv4 = .{ 8, 8, 8, 8 } }, 53));
+	try std.testing.expectEqual(Action.deny, rs.evaluate(.any, .{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
 }
 
 test "RuleSet evaluate default deny" {
@@ -1319,6 +1754,108 @@ test "isHardBlocked: loopback/this-net/link-local only; private ranges deferred 
 	try std.testing.expect(!isHardBlocked(.{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }));
 }
 
+// --- hard-deny: the per-instance extension of that floor ---
+//
+// The built-in floor cannot know the enclosing host's own address, and an
+// explicit L7 `allow` supersedes the L4 CIDR re-check -- so a sandbox owner who
+// controls a DNS zone can point a name at the machine running the proxy, allow
+// that name, and obtain a guest-triggered connection into the host half under
+// the PROXY's uid. `hard-deny` closes that without depending on nftables
+// so the property does not rest on nftables alone.
+
+test "parseRules parses hard-deny into the per-instance floor" {
+	const rs = parseRules(
+		\\hard-deny 10.0.0.7/32
+		\\hard-deny 10.0.4.0/24
+		\\allow 0.0.0.0/0
+	);
+	try std.testing.expectEqual(@as(usize, 2), rs.hard_len);
+	// hard-deny is a floor, not a rule: it does not enter the ordered walk.
+	try std.testing.expectEqual(@as(usize, 1), rs.len);
+	try std.testing.expectEqual(Action.allow, rs.evaluate(.tcp, .{ .ipv4 = .{ 10, 0, 0, 7 } }, 443));
+}
+
+test "hard-deny accepts a bare address and means that single host" {
+	const rs = parseRules("hard-deny 10.0.0.7");
+	try std.testing.expectEqual(@as(usize, 1), rs.hard_len);
+	try std.testing.expect(rs.hardBlocked(.{ .ipv4 = .{ 10, 0, 0, 7 } }));
+	try std.testing.expect(!rs.hardBlocked(.{ .ipv4 = .{ 10, 0, 0, 8 } }));
+}
+
+test "hardBlocked matches an in-range address and its v4-mapped form" {
+	const rs = parseRules("hard-deny 10.0.4.0/24");
+	try std.testing.expect(rs.hardBlocked(.{ .ipv4 = .{ 10, 0, 4, 21 } }));
+	try std.testing.expect(rs.hardBlocked(.{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 4, 21 } }));
+	// A neighbouring address outside the rendered set stays reachable: the
+	// floor is the VM's OWN addresses, not its whole subnet.
+	try std.testing.expect(!rs.hardBlocked(.{ .ipv4 = .{ 10, 0, 5, 21 } }));
+}
+
+test "hardBlocked over IPv6 hard-deny" {
+	const rs = parseRules("hard-deny 2001:db8::/32");
+	try std.testing.expect(rs.hardBlocked(.{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7 } }));
+	try std.testing.expect(!rs.hardBlocked(.{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7 } }));
+}
+
+test "hardBlocked with no hard-deny lines is exactly isHardBlocked" {
+	// The default-preserving guarantee for the local and k8s backends, which
+	// render no hard-deny line: the ruleset-aware floor must not block one
+	// address more than the built-in one.
+	const rs = parseRules("allow 0.0.0.0/0");
+	try std.testing.expectEqual(@as(usize, 0), rs.hard_len);
+	const probes = [_]IpAddr{
+		.{ .ipv4 = .{ 127, 0, 0, 1 } },
+		.{ .ipv4 = .{ 169, 254, 169, 254 } },
+		.{ .ipv4 = .{ 10, 1, 2, 3 } },
+		.{ .ipv4 = .{ 1, 1, 1, 1 } },
+		.{ .ipv6 = ipv6_loopback },
+		.{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
+	};
+	for (probes) |p| try std.testing.expectEqual(isHardBlocked(p), rs.hardBlocked(p));
+}
+
+test "hard-deny leaves the loopback remap funnel alone" {
+	// The L7 funnel is a shim-side connect() rewrite to 127.0.0.1:<l7base>,
+	// and the proxy's own backend hop is loopback too. Those never pass
+	// through hardBlocked (the proxy dials them directly), but assert the
+	// intent anyway: rendering the VM's own address must not change how
+	// loopback is treated relative to the built-in floor.
+	const rs = parseRules("hard-deny 10.0.0.7/32");
+	try std.testing.expect(rs.hardBlocked(.{ .ipv4 = .{ 127, 0, 0, 1 } })); // built-in, unchanged
+	try std.testing.expect(isHardBlocked(.{ .ipv4 = .{ 127, 0, 0, 1 } }));
+	try std.testing.expect(!isHardBlocked(.{ .ipv4 = .{ 10, 0, 0, 7 } })); // ONLY the ruleset-aware form catches it
+}
+
+test "hard-deny rejects malformed bodies and never partially applies" {
+	try std.testing.expectEqual(@as(usize, 0), parseRules("hard-deny").hard_len);
+	try std.testing.expectEqual(@as(usize, 0), parseRules("hard-deny ").hard_len);
+	try std.testing.expectEqual(@as(usize, 0), parseRules("hard-deny not-an-ip").hard_len);
+	try std.testing.expectEqual(@as(usize, 0), parseRules("hard-deny 10.0.0.7/33").hard_len);
+	// A floor entry must not be narrowable to a proto or a port -- a
+	// port-scoped "floor" is a rule wearing a floor's name.
+	try std.testing.expectEqual(@as(usize, 0), parseRules("hard-deny tcp 10.0.0.7/32").hard_len);
+	try std.testing.expectEqual(@as(usize, 0), parseRules("hard-deny 10.0.0.7:443").hard_len);
+	// An unparseable line is dropped like any other, leaving the rest intact.
+	const rs = parseRules(
+		\\hard-deny nonsense
+		\\hard-deny 10.0.0.7/32
+	);
+	try std.testing.expectEqual(@as(usize, 1), rs.hard_len);
+}
+
+test "hard-deny is capped at max_hard_rules without corrupting the set" {
+	var buf: [64 * (max_hard_rules + 4)]u8 = undefined;
+	var n: usize = 0;
+	var i: usize = 0;
+	while (i < max_hard_rules + 4) : (i += 1) {
+		const line = try std.fmt.bufPrint(buf[n..], "hard-deny 10.0.0.{d}/32\n", .{i});
+		n += line.len;
+	}
+	const rs = parseRules(buf[0..n]);
+	try std.testing.expectEqual(max_hard_rules, rs.hard_len);
+	try std.testing.expect(rs.hardBlocked(.{ .ipv4 = .{ 10, 0, 0, 0 } }));
+}
+
 // --- L7 rules ---
 
 test "pathPrefixMatches boundary-aware" {
@@ -1512,6 +2049,121 @@ test "parseL7Line insecure token + needsTerminate" {
 	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("internal.svc", null));
 }
 
+test "parseL7Line: method / exact / service tokens parse, garbage still rejected" {
+	// A single method.
+	{
+		const r = parseL7Line("allow git.example.internal GET /g/p.git/info/refs exact service=git-upload-pack");
+		try std.testing.expect(r == .rule);
+		try std.testing.expectEqualStrings("GET", r.rule.methodsSlice().?);
+		try std.testing.expect(r.rule.exact);
+		try std.testing.expectEqualStrings("git-upload-pack", r.rule.serviceSlice().?);
+		try std.testing.expectEqualStrings("/g/p.git/info/refs", r.rule.pathSlice().?);
+	}
+	// A comma method list, order-independent tokens.
+	{
+		const r = parseL7Line("allow git.example.internal /g/ service=git-upload-pack GET,POST");
+		try std.testing.expect(r == .rule);
+		try std.testing.expectEqualStrings("GET,POST", r.rule.methodsSlice().?);
+		try std.testing.expectEqualStrings("git-upload-pack", r.rule.serviceSlice().?);
+		try std.testing.expect(!r.rule.exact);
+	}
+	// Back-compat: a bare allow parses with all new fields empty.
+	{
+		const r = parseL7Line("allow plain.test");
+		try std.testing.expect(r == .rule);
+		try std.testing.expect(r.rule.methodsSlice() == null);
+		try std.testing.expect(r.rule.serviceSlice() == null);
+		try std.testing.expect(!r.rule.exact);
+	}
+	// A genuinely-unknown (lowercase, non-keyword) token still rejects the line.
+	try std.testing.expect(parseL7Line("allow a.test bogustoken") == .none);
+	// A bare `service=` with no value rejects.
+	try std.testing.expect(parseL7Line("allow a.test service=") == .none);
+	// Duplicate method / service tokens reject.
+	try std.testing.expect(parseL7Line("allow a.test GET POST") == .none);
+	try std.testing.expect(parseL7Line("allow a.test service=x service=y") == .none);
+}
+
+test "parseL7Line: tag= token is tolerated + parse-identical; lookalike still rejects" {
+	// The proxy does not gate injection (the addon does); it accepts and IGNORES
+	// `tag=`, so a tagged line parses byte-for-byte like the same line without it.
+	const tagged = parseL7Line("allow git.example.internal GET /g/ tag=git-grants");
+	const plain = parseL7Line("allow git.example.internal GET /g/");
+	try std.testing.expect(tagged == .rule);
+	try std.testing.expect(plain == .rule);
+	try std.testing.expectEqual(plain.rule.action, tagged.rule.action);
+	try std.testing.expectEqual(plain.rule.has_path, tagged.rule.has_path);
+	try std.testing.expectEqualStrings(plain.rule.pathSlice().?, tagged.rule.pathSlice().?);
+	try std.testing.expectEqualStrings(plain.rule.methodsSlice().?, tagged.rule.methodsSlice().?);
+	try std.testing.expect(tagged.rule.serviceSlice() == null);
+	try std.testing.expect(!tagged.rule.exact);
+	// The `tag=` prefix guard is tight: a lookalike token (char 3 is `x`, not `=`)
+	// is genuinely-unknown and still fails closed.
+	try std.testing.expect(parseL7Line("allow a.test tagx=foo") == .none);
+	// A doc with one tagged + one bogus line keeps the tagged rule, drops the bogus.
+	var rs: L7RuleSet = undefined;
+	parseL7Rules("allow git.example.internal GET /g/ tag=git-grants\nallow bad.test bogustoken\n", &rs);
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluateFull("git.example.internal", "/g/x", "GET"));
+	// the bogus line was dropped -> its host has no rule at all (no_match).
+	try std.testing.expectEqual(L7Verdict.no_match, rs.evaluateFull("bad.test", "/", "GET"));
+}
+
+test "effectiveGitService: endpoint-derived from the final path segment" {
+	try std.testing.expectEqualStrings("git-upload-pack", effectiveGitService("/g/p.git/git-upload-pack").?);
+	try std.testing.expectEqualStrings("git-receive-pack", effectiveGitService("/g/p.git/git-receive-pack").?);
+	// info/refs carries the service in the (stripped) query -> not derivable here.
+	try std.testing.expect(effectiveGitService("/g/p.git/info/refs") == null);
+	try std.testing.expect(effectiveGitService("/g/p.git/") == null);
+}
+
+test "L7 evaluateFull: methods + exact + endpoint-derived service" {
+	var rs: L7RuleSet = undefined;
+	// git-read (exact) + git-write (exact) for one repo, compiled the way cogworx does.
+	parseL7Rules(
+		\\allow git.example.internal GET /g/p.git/info/refs exact service=git-upload-pack
+		\\allow git.example.internal POST /g/p.git/git-upload-pack exact
+		\\allow git.example.internal GET /g/p.git/info/refs exact service=git-receive-pack
+		\\allow git.example.internal POST /g/p.git/git-receive-pack exact
+	, &rs);
+	// Git host always terminates (it carries paths).
+	try std.testing.expect(rs.needsTerminate("git.example.internal"));
+	// Clone POST allowed; push POST allowed (separate grant here).
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluateFull("git.example.internal", "/g/p.git/git-upload-pack", "POST"));
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluateFull("git.example.internal", "/g/p.git/git-receive-pack", "POST"));
+	// Wrong method on the pack endpoint fails closed (host named -> deny).
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluateFull("git.example.internal", "/g/p.git/git-upload-pack", "GET"));
+	// exact path: a sibling/extension path under the same prefix is NOT allowed.
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluateFull("git.example.internal", "/g/p.git/git-upload-pack/extra", "POST"));
+	// info/refs over cleartext: the service is query-only (stripped) so endpoint
+	// derivation yields null and the service= rule can't match -> fail closed.
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluateFull("git.example.internal", "/g/p.git/info/refs", "GET"));
+}
+
+test "L7 wildcard git-read: prefix + service denies push (git-receive-pack) under the same prefix" {
+	var rs: L7RuleSet = undefined;
+	parseL7Rules(
+		\\allow git.example.internal GET /grp/ service=git-upload-pack
+		\\allow git.example.internal POST /grp/ service=git-upload-pack
+	, &rs);
+	// A clone POST anywhere under the group is allowed (upload-pack endpoint).
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluateFull("git.example.internal", "/grp/proj.git/git-upload-pack", "POST"));
+	// A push POST under the same prefix is DENIED: endpoint-derived service is
+	// git-receive-pack, which no rule allows -> fail closed.
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluateFull("git.example.internal", "/grp/proj.git/git-receive-pack", "POST"));
+}
+
+test "L7 evaluateFull: unknown method (null) skips a method-constrained rule" {
+	var rs: L7RuleSet = undefined;
+	parseL7Rules("allow a.test POST /p", &rs);
+	// method known + matching -> allow
+	try std.testing.expectEqual(L7Verdict.allow, rs.evaluateFull("a.test", "/p", "POST"));
+	// method unknown (e.g. TLS passthrough) -> can't confirm -> host named,
+	// rule skipped -> fail closed deny
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluateFull("a.test", "/p", null));
+	// plain 2-arg evaluate delegates with null method (back-compat)
+	try std.testing.expectEqual(L7Verdict.deny, rs.evaluate("a.test", "/p"));
+}
+
 test "parseInjectHosts: exact-only, drops wildcards, comments, fail-open" {
 	var ih: InjectHosts = undefined;
 	parseInjectHosts(
@@ -1521,7 +2173,7 @@ test "parseInjectHosts: exact-only, drops wildcards, comments, fail-open" {
 		\\  *.apps.example
 		\\*
 		\\*.foo.*
-		\\analytics.example
+		\\metrics.example
 	, &ih);
 	// blank line + comment skipped; the wildcard `*.apps.example`, the bare `*`,
 	// and the malformed `*.foo.*` are ALL dropped (exact-only) -- so only the 2
@@ -1535,7 +2187,7 @@ test "parseInjectHosts: exact-only, drops wildcards, comments, fail-open" {
 	try std.testing.expect(ih.contains("notes.internal.test"));
 	try std.testing.expect(ih.contains("NOTES.INTERNAL.test"));
 	try std.testing.expect(ih.contains("notes.internal.test."));
-	try std.testing.expect(ih.contains("analytics.example"));
+	try std.testing.expect(ih.contains("metrics.example"));
 	try std.testing.expect(!ih.contains("other.internal.test"));
 
 	// the dropped wildcard does NOT match a subdomain (it was never admitted),

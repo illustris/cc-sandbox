@@ -29,10 +29,6 @@
 			inputs.nixpkgs.follows = "nixpkgs";
 			inputs.illustris-lib.follows = "illustris-lib";
 		};
-		nixfs = {
-			url = "github:illustris/nixfs";
-			inputs.nixpkgs.follows = "nixpkgs";
-		};
 		# Intentionally not setting inputs.nixpkgs.follows: llm-agents.nix
 		# publishes its builds to cache.numtide.com against its own pinned
 		# nixpkgs, and overriding it would force local rebuilds of every
@@ -46,6 +42,11 @@
 		illustris-lib = import "${inputs.illustris-lib}/lib" { inherit lib; };
 		supportedSystems = [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
 		forAllSystems = f: lib.genAttrs supportedSystems f;
+		mkHermesHomeHelper = pkgs: pkgs.writeShellApplication {
+			name = "cogbox-hermes-home";
+			runtimeInputs = [ pkgs.coreutils pkgs.findutils ];
+			text = builtins.readFile ./cogbox-hermes-home.sh;
+		};
 
 		archSuffix = system: builtins.head (lib.splitString "-" system);
 		configName = system: "cogbox-${archSuffix system}";
@@ -83,7 +84,20 @@
 		# packages/mounts/services AND the launcher's HARNESSES list (baked in
 		# via the @harnesses@ sentinel) -- so this single switch covers both.
 		enableCodex = false;
-		mkHarnesses = system: pkgs: lib.filterAttrs (_: h: h.enable) {
+		# pi is OPT-IN. The per-instance full system toplevel is built inside a
+		# FAIL-CLOSED worker pod with no registry.npmjs.org egress. pi is the only
+		# harness cogbox patches via `.overrideAttrs` (the Bun->Node entrypoint fix
+		# below), which changes pi's derivation hash so numtide's published pi is a
+		# cache MISS -- forcing a source build that fetches the pi npm tarball from
+		# npmjs, which the worker cannot reach, hanging/timing out the toplevel build.
+		# Disabling by default keeps pi out of the
+		# per-instance toplevel so the worker never builds it. Flip to `true` to build
+		# it in. (Hermes stays enabled: used unmodified, so it's a cache hit and never
+		# builds in the worker.)
+		enablePi = false;
+		mkHarnesses = system: pkgs: let
+			llmPkgs = inputs.llm-agents.inputs.nixpkgs.legacyPackages.${system};
+		in lib.filterAttrs (_: h: h.enable) {
 			claude-code = {
 				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
 				package = inputs.llm-agents.packages.${system}.claude-code;
@@ -211,8 +225,18 @@
 			};
 
 			pi = {
-				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
-				package = inputs.llm-agents.packages.${system}.pi;
+				# Opt-in (fail-closed worker can't fetch the overridden pi from npmjs): gated on `enablePi` above.
+				enable = enablePi && builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				package = inputs.llm-agents.packages.${system}.pi.overrideAttrs (_: {
+					# Retain npm's Node entrypoint for runtime compatibility.
+					preInstall = "";
+					postInstall = ''
+						wrapProgram $out/bin/pi \
+							--prefix PATH : ${llmPkgs.lib.makeBinPath [ llmPkgs.fd llmPkgs.ripgrep ]} \
+							--set PI_SKIP_VERSION_CHECK 1 \
+							--set PI_TELEMETRY 0
+					'';
+				});
 				launcher = {
 					name = "p";
 					# pi has no permission system at all (documented upstream:
@@ -256,7 +280,13 @@
 					# during early boot. Anchored on `systemd.hostname=`
 					# rather than the raw token to avoid collisions if
 					# the placeholder ever appears verbatim elsewhere.
-					boot.kernelParams = [ "systemd.hostname=cogbox-@cogbox-instance@" ];
+					# `nokaslr` is VM-only: it lives here in mkMicrovm (the QEMU
+					# guest builder), never in the container's mkContainer, so the
+					# container toplevel closure stays byte-identical. The guest
+					# kernel otherwise hangs at early-boot KASLR relocation on an
+					# RDRAND entropy draw that stalls under nested KVM (when the
+					# host nodes are themselves VMs); disabling KASLR skips that draw.
+					boot.kernelParams = [ "systemd.hostname=cogbox-@cogbox-instance@" "nokaslr" ];
 					users.users.root.password = "";
 					services.getty.autologinUser = "root";
 					# Land interactive login shells in the persisted data
@@ -382,6 +412,30 @@
 			] ++ extraModules;
 		};
 
+		# GCE backend host: the cogbox HOST half as a full NixOS system that
+		# boots on Google Compute Engine under nested virtualization, running
+		# the same microVM guest it runs locally and in a k8s pod. Unlike
+		# mkMicrovm/mkContainer this is not another shape of the GUEST -- it is
+		# the machine the guest runs inside, so it imports nixpkgs' GCE image
+		# format and then spends most of ./gce/cogbox-host.nix undoing that
+		# profile's metadata-driven defaults.
+		#
+		# x86_64 only, and the nixosConfigurations entry below is guarded to
+		# match: GCE nested virtualization is Intel-series only (S1).
+		#
+		# `self` and `inputs` reach the modules through specialArgs because the
+		# host module needs BOTH the built cogbox package and the flake INPUT
+		# SOURCE TREES -- the second is what keeps the launcher's re-exec
+		# evaluable with no egress (see system.extraDependencies there).
+		mkGceHost = system: { extraModules ? [ ] }: nixpkgs.lib.nixosSystem {
+			inherit system;
+			specialArgs = { inherit self inputs system; };
+			modules = [
+				"${nixpkgs}/nixos/modules/virtualisation/google-compute-image.nix"
+				./gce/cogbox-host.nix
+			] ++ extraModules;
+		};
+
 		# `userExt` defaults to the no-op userExtensions input but can be
 		# overridden by tests to inject a known module in the same list
 		# position the runtime override-input would, so the resulting
@@ -390,7 +444,6 @@
 		cogboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default, target ? "vm" }: let
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
-			inputs.nixfs.nixosModules.nixfs
 			# Declare the cogbox.* plugin-contribution option tree (the "brain"
 			# contract). Every plugin module fills in its slice; the base module
 			# below reads the merged config.cogbox and materializes it into each
@@ -449,6 +502,7 @@
 			userExt
 			({ config, pkgs, lib, utils, ... }: let
 				harnesses = mkHarnesses system pkgs;
+				hermesHomeHelper = mkHermesHomeHelper pkgs;
 				cfg = config.cogbox;
 
 				# Build target: "vm" (the QEMU microvm, default) or "container"
@@ -735,7 +789,8 @@
 					# Hermes has no project-level skill discovery -- it only loads
 					# $HERMES_HOME/skills (same agentskills.io SKILL.md format). The
 					# materialize oneshot links these into /root/.hermes/skills; the
-					# writes land in the per-instance overlay upper, never the host.
+					# writes land in the VM overlay upper or container state PVC,
+					# never the host.
 					mkdir -p $out/hermes/skills
 					${linkInto "$out/hermes/skills" "" skills}
 					ln -s ${indexSkill} $out/hermes/skills/cogbox-plugins
@@ -794,23 +849,48 @@
 						# (require-sigs false: a local content-addressed cache is unsigned).
 						subst=()
 						[ -d "$icd/plugin-cache" ] && subst=(--option extra-substituters "file://$icd/plugin-cache" --option require-sigs false)
+						# Narinfo count is the seed-health signal on fallback: 0 means the
+						# worker-side prebuild never populated the plugin-cache, so the
+						# egress-less rebuild below had nothing to substitute from.
+						nnar=$(ls "$icd/plugin-cache"/*.narinfo 2>/dev/null | wc -l || echo 0)
 						echo "cogbox-brain: rebuilding per-instance brain ($pcount plugin(s)) for instance '$inst'" >&2
+						# Evaluate the `-container` config, NOT the VM `${configName system}`.
+						# cogboxBrain is target-INDEPENDENT (same runCommandLocal in both), but
+						# the VM config imports microvm.nixosModules.microvm, which forces the
+						# `microvm` flake input's SOURCE tree -- unfetchable offline in a
+						# fail-closed sandbox, aborting the eval and silently dropping the whole
+						# guest half. The `-container` (mkContainer) config omits microvm.
+						# OFFLINE-CLEAN: the `-container`
+						# brain eval now force-reads ZERO github flake input SOURCE trees.
+						# microvm/nix-mcp/llm-agents are not forced here, and the last
+						# holdout -- nixfs, previously imported unconditionally in
+						# cogboxModules -- has been fully dropped. Only nixpkgs and
+						# illustris-lib (both seeded in the baked agent image) are touched,
+						# so a cold fail-closed pod can rebuild the brain without network.
 						if out=$(${pkgs.nix}/bin/nix build --no-link --print-out-paths \
 								--extra-experimental-features "nix-command flakes" \
 								"''${subst[@]}" \
 								--override-input userExtensions "path:$icd/plugins-flake" \
 								--override-input userExtensions/user/nixpkgs "path:${nixpkgs}" \
-								"path:${self}#nixosConfigurations.${configName system}.config.system.build.cogboxBrain"); then
+								"path:${self}#nixosConfigurations.${configName system}-container.config.system.build.cogboxBrain"); then
 							first=$(printf '%s\n' "$out" | grep -m1 '^/nix/store/' || true)
 							if [ -n "$first" ] && [ -e "$first" ]; then
 								brain="$first"
 								echo "cogbox-brain: using per-instance brain $brain" >&2
+								rm -f "$icd/brain.fallback" || true
 							else
-								echo "cogbox-brain: rebuild produced no out-path; using baked base brain" >&2
+								echo "cogbox-brain: rebuild produced no out-path; using baked base brain (plugin-cache narinfos: $nnar)" >&2
+								printf 'time=%s reason=%s narinfos=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" no-out-path "$nnar" > "$icd/brain.fallback" || true
 							fi
 						else
-							echo "cogbox-brain: rebuild failed; using baked base brain (see prior nix log)" >&2
+							echo "cogbox-brain: rebuild failed; using baked base brain (see prior nix log; plugin-cache narinfos: $nnar, 0 = worker seed never populated the cache)" >&2
+							printf 'time=%s reason=%s narinfos=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" rebuild-failed "$nnar" > "$icd/brain.fallback" || true
 						fi
+					else
+						# No plugin composition -> the baked base brain IS the correct
+						# brain; clear any stale fallback marker left by a prior
+						# plugin-era boot so it can't false-positive later.
+						rm -f "$icd/brain.fallback" 2>/dev/null || true
 					fi'';
 				brainMaterializeScript = pkgs.writeShellScript "cogbox-brain-materialize" ''
 					set -e
@@ -858,10 +938,12 @@
 						install -m600 "$brain/codex/config.toml" /root/.codex/config.toml || true
 					fi
 
-					# hermes-agent: skills only load from $HERMES_HOME/skills (no
-					# project-level discovery). Child symlinks land in the per-
-					# instance overlay upper, so the host's ~/.hermes is untouched
-					# and hermes's own (self-created) skills coexist alongside.
+					${lib.optionalString (harnesses ? "hermes-agent") ''
+						mkdir -p /root/.hermes/{cron,sessions,logs,memories}
+					''}
+					# hermes-agent: after its managed runtime skeleton exists, link skills
+					# into $HERMES_HOME/skills. These writes land in the VM overlay upper
+					# or container's per-instance state PVC, never the host home.
 					linkleaves "$brain/hermes/skills" /root/.hermes/skills
 
 					# Harness-neutral AGENTS.md (pi + hermes inject it from the cwd,
@@ -881,7 +963,9 @@
 				# Pre-accept Claude Code workspace trust for ~/work (both /root/work
 				# and the /var/lib/cogbox/work it resolves to, since Node's cwd
 				# resolves the symlink) and reconcile stale pre-migration project
-				# keys. Replaces the per-plugin cogbox-claude-trust units.
+				# keys. Replaces the per-plugin cogbox-claude-trust units. Also seeds
+				# bypassPermissionsModeAccepted -- see the block above claudeStubScript,
+				# which carries the full rationale for both backends.
 				brainTrustScript = pkgs.writeShellScript "cogbox-brain-trust" ''
 					set -eu
 					f=/root/.claude.json
@@ -890,7 +974,10 @@
 						.projects["/var/lib/cogbox/work"].hasTrustDialogAccepted = true
 						| .projects["/root/work"].hasTrustDialogAccepted = true
 						| del(.projects["/var/lib/cogbox"])
-						| del(.projects["/var/lib/cogbox/home"])
+						| del(.projects["/var/lib/cogbox/home"])${lib.optionalString isVm ''
+
+						| .hasCompletedOnboarding = true
+						| .bypassPermissionsModeAccepted = true''}
 					' "$f" > "$f.tmp"
 					# Write THROUGH $f rather than `mv` onto it: on the container backend
 					# the claude-stub oneshot symlinks /root/.claude.json at the state PVC
@@ -968,9 +1055,33 @@
 					# failure the file is left untouched (claude-code's own
 					# corrupt-config handling deals with real rot). brain-trust later
 					# enriches the same file (workspace trust).
-					seed='{"hasCompletedOnboarding":true,"theme":"dark"}'
+					#
+					# bypassPermissionsModeAccepted rides along for the same reason, and is
+					# forced the same way. It records that the harness's first-run consent
+					# dialog has been answered; unseeded, the `c` launcher stops on a fresh
+					# sandbox at an interactive "1. No, exit / 2. Yes, I accept" prompt and
+					# never reaches the REPL (bare `claude` is unaffected, which is how it
+					# stayed hidden). Note it is a TOP-LEVEL key read off the global config
+					# getter -- NOT a .projects[...] key like the trust dialog brain-trust
+					# seeds -- so it belongs here and not under a project path. It must be
+					# set on BOTH branches below: an existing config that only gets the
+					# merge would keep gating. The dialog is long-standing, not new to
+					# 2.1.220 (same occurrence counts in the 2.1.214 bundle).
+					#
+					# Posture note, since this pre-answers a warning dialog: it changes
+					# nothing about what the agent may do. The launcher already requests
+					# that mode unconditionally, and cogbox's containment is the sandbox
+					# boundary (nftables floor, l4/l7 enforcer, guest isolation), never the
+					# harness's own in-process prompts -- the sibling harnesses are set up
+					# the same way on purpose (see the codex launcher flags and opencode's
+					# OPENCODE_PERMISSION). The key also VANISHES after first run: the
+					# harness migrates the acceptance into
+					# userSettings.skipDangerousModePermissionPrompt and strips it, and
+					# either source satisfies the check, so re-forcing it each boot is a
+					# no-op and an absent key in a USED config is not a failed seed.
+					seed='{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"theme":"dark"}'
 					if [ -e "$cjson" ]; then
-						if merged=$(${pkgs.jq}/bin/jq -es 'if length == 1 and (.[0] | type == "object") then .[0] | .hasCompletedOnboarding = true | .theme //= "dark" else error("not a single object") end' "$cjson" 2>/dev/null); then
+						if merged=$(${pkgs.jq}/bin/jq -es 'if length == 1 and (.[0] | type == "object") then .[0] | .hasCompletedOnboarding = true | .bypassPermissionsModeAccepted = true | .theme //= "dark" else error("not a single object") end' "$cjson" 2>/dev/null); then
 							printf '%s\n' "$merged" > "$cjson.tmp" && mv "$cjson.tmp" "$cjson" || rm -f "$cjson.tmp"
 						fi
 					else
@@ -993,6 +1104,42 @@
 					# verb single-sources the stub sentinel from the secret module and
 					# never writes a real token.
 					${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub "$cdir" "$marker"
+				'';
+
+				# VM backend variant of the claude-stub reconcile. The container
+				# claudeStubScript above is NOT reusable verbatim on the VM: its
+				# ${stateRoot} marker/home paths are ephemeral on the VM (only
+				# /var/lib/cogbox, the 9p mount, persists) and ~/.claude is an OVERLAY
+				# mount the harness owns (the symlink dance would fight it). So this
+				# variant only reconciles the cred file, against the marker on the
+				# persistent mount, and -- crucially -- differs from the container in
+				# how it reads an ABSENT marker:
+				#
+				#   marker ABSENT  -> UNMANAGED: a standalone single-host-user VM whose
+				#     launcher staged its OWN redacted placeholder identity
+				#     launcher staged its own redacted placeholder identity. Leave it
+				#     untouched -- deleting it
+				#     would break that model's on-the-wire injection.
+				#   marker == "0"  -> cogworx MANAGED, owner DISCONNECTED: drop the stub
+				#     (overlay whiteout over the launcher placeholder) so claude-code
+				#     falls back to in-guest /login (fail-closed).
+				#   marker present, not "0" -> cogworx MANAGED, owner CONNECTED: stage the
+				#     redacted sentinel (the pod-side proxy stamps the real Bearer over
+				#     it); the real token never enters the guest.
+				#
+				# The sentinel is single-sourced through the verb (never hardcoded in
+				# this shell); only the removal is done inline. cogworx writes the
+				# marker host-side on the 9p SOURCE and restarts this oneshot (and it
+				# re-runs at every boot, so the persisted marker survives a restart).
+				claudeStubScriptVm = pkgs.writeShellScript "cogbox-claude-stub-vm" ''
+					set -eu
+					marker=/var/lib/cogbox/claude-oauth.bound
+					[ -e "$marker" ] || exit 0
+					if [ "$(cat "$marker" 2>/dev/null || true)" = "0" ]; then
+						rm -f /root/.claude/.credentials.json
+					else
+						${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub /root/.claude "$marker"
+					fi
 				'';
 			in {
 				nixpkgs.config.allowUnfree = true;
@@ -1048,6 +1195,40 @@
 				# guards against any other module flipping it back on; gated to the
 				# container so the VM runner is byte-identical.
 				networking.resolvconf.enable = lib.mkIf isContainer (lib.mkForce false);
+
+				# VM target DNS: NO PUBLIC FALLBACK RESOLVER, EVER.
+				#
+				# The guest's own resolver is always link-scope and always comes
+				# from the host: passt/SLIRP puts a nameserver in its DHCP offer
+				# (the host's resolver on a local/k8s launch, the intercepted
+				# `--dns-forward` handle where COGBOX_GUEST_RESOLVER is set), and
+				# what that answers is by construction what the HOST resolves --
+				# internal names included. The microvm target enables networkd,
+				# which default-enables systemd-resolved, which arrives carrying
+				# systemd's compiled-in FallbackDNS list (1.1.1.1, 8.8.8.8,
+				# 9.9.9.9, ...) at GLOBAL scope. That list is not a safety net
+				# here, it is a LEAK: any window where the link scope has no DNS
+				# yet or its server is marked bad sends the query NAME -- an
+				# internal name -- to a third-party resolver, and turns an
+				# internal-DNS outage into an ordinary-looking NXDOMAIN instead
+				# of a visible failure. An empty list means such a lookup fails,
+				# loudly, which is the correct answer for a sandbox whose entire
+				# egress story is mediated by the host.
+				#
+				# `""` (not `[]`): settings.Resolve is the freeform systemd-ini
+				# surface, and an empty LIST renders no line at all, which is
+				# indistinguishable from unset -- the defect itself. The empty
+				# STRING renders `FallbackDNS=`, which is what overrides the
+				# compiled-in list. Same reasoning, same spelling as the GCE
+				# host half in gce/cogbox-host.nix.
+				#
+				# Ungated by target although only the VM has resolved enabled
+				# (the container's /etc/resolv.conf is kubelet-managed and this
+				# module turns resolvconf off for it above): the resolved module
+				# emits nothing when disabled, so the container toplevel stays
+				# byte-identical, and if resolved were ever enabled there it
+				# would want this pin too.
+				services.resolved.settings.Resolve.FallbackDNS = "";
 
 				# Container web-terminal locale. The web terminal attaches via
 				# `kubectl exec -- env ... tmux ...` (cogworx's terminal attach),
@@ -1154,17 +1335,23 @@
 					# ~/.ssh keys and a busy agent could otherwise burn through the
 					# default 6 attempts before a working key is reached. This guest
 					# is a local, ephemeral, single-user sandbox (sshd bound to
-					# 127.0.0.1), so a generous cap is safe. The container gets a tight
-					# cap below.
-					MaxAuthTries = lib.mkIf isVm 50;
-				} // lib.optionalAttrs isContainer {
+					# 127.0.0.1), so a generous cap is safe. The k8s gateway path gets
+					# a tight cap below (MaxAuthTries keyed per target in the shared
+					# block), the local VM keeps 50.
+				} // lib.optionalAttrs (isContainer || isVm) {
 					# The gateway authenticates with a user certificate signed by a
 					# cogworx-held CA; trust that CA and require the cert's principal
 					# to match this instance (AuthorizedPrincipalsFile lists exactly
-					# the instance name, written by cogbox-sshd-ca). The VM path keeps
-					# plain authorized_keys and gets NEITHER of these keys.
-					TrustedUserCAKeys = "/etc/ssh/trusted_user_ca.pub";
-					AuthorizedPrincipalsFile = "/etc/ssh/principals/%u";
+					# the instance ID). BOTH cluster-launched targets get this: the
+					# container reads the CA/principal from pod env (cogbox-sshd-ca),
+					# the VM reads them from the 9p-persistent state that cogworx
+					# stages before boot (/var/lib/cogbox/.config, seeded by the k8s
+					# pod entrypoint). The paths differ per target; everything else is
+					# shared. (A purely-local `cogbox` VM leaves these files absent ->
+					# no trusted CA -> cert auth simply never succeeds, fail-closed,
+					# and plain authorized_keys still works via load-ssh-keys.)
+					TrustedUserCAKeys = if isContainer then "/etc/ssh/trusted_user_ca.pub" else "/var/lib/cogbox/.config/ssh-ca.pub";
+					AuthorizedPrincipalsFile = if isContainer then "/etc/ssh/principals/%u" else "/var/lib/cogbox/.config/ssh-principals/%u";
 					# The gateway only needs local (client-initiated) port forwards to
 					# reach in-sandbox services; deny everything else.
 					AllowTcpForwarding = "local";
@@ -1178,7 +1365,11 @@
 					# (default on) -- with that off the sshd allowance is simply unused.
 					AllowAgentForwarding = true;
 					PermitTunnel = "no";
-					MaxAuthTries = 3;
+					# The cluster gateway/`cogbox ssh` hop makes exactly one
+					# cert/key attempt, so a tight cap is correct there; a purely-
+					# local VM keeps the generous cap for the --no-auto-keys agent
+					# fallback (see the base comment above).
+					MaxAuthTries = if isContainer then 3 else 50;
 					LoginGraceTime = 20;
 					ClientAliveInterval = 30;
 					ClientAliveCountMax = 4;
@@ -1190,12 +1381,16 @@
 				services.openssh.listenAddresses = lib.mkIf isContainer [
 					{ addr = "0.0.0.0"; port = 22; }
 				];
-				# Persist the container host key on the per-instance state PVC so the
-				# gateway's host-key pin survives restarts (cogbox-container-state /
-				# cogbox-sshd-ca create the dir 0700 before sshd's keygen runs). The
-				# VM keeps ephemeral keys in /etc/ssh (module default).
-				services.openssh.hostKeys = lib.mkIf isContainer [
-					{ type = "ed25519"; path = "${stateRoot}/ssh/ssh_host_ed25519_key"; }
+				# Persist the sandbox host key so the gateway's TOFU host-key pin
+				# survives restarts (a rotating key would break the pin on every
+				# boot). The container persists on the state PVC (cogbox-container-
+				# state creates the 0700 dir); the VM persists on the 9p-backed
+				# /var/lib/cogbox mount (cogbox-vm-sshd-prep creates the 0700 dir and
+				# pre-generates the key BEFORE sshd, ordered after var-lib-cogbox.mount,
+				# so sshd never races the late 9p mount). A purely-local `cogbox` VM
+				# gets the same persistent key under its host data dir.
+				services.openssh.hostKeys = lib.mkIf (isContainer || isVm) [
+					{ type = "ed25519"; path = if isContainer then "${stateRoot}/ssh/ssh_host_ed25519_key" else "/var/lib/cogbox/ssh/ssh_host_ed25519_key"; }
 				];
 
 				environment.systemPackages = with pkgs; [
@@ -1276,6 +1471,21 @@
 					# ${runtimeDir} sentinel is sed-rewritten to the live $RUNTIME
 					# by cogbox-launch.sh, same as the fw_cfg paths below.
 					qemu.extraArgs = [
+						# Re-emit `-cpu` to mask RDRAND/RDSEED off the guest CPU while
+						# KEEPING KVM accel. microvm.nix's own runner emits
+						# `-enable-kvm -cpu host,+x2apic,-sgx`; setting the microvm.cpu
+						# option would override that string BUT the module then also
+						# drops `-enable-kvm` (qemu.nix gates it on `cpu == null`), so we
+						# cannot use it. Instead we append a second `-cpu` here: qemu
+						# honors the LAST `-cpu` (verified: no warning, last wins) and
+						# `-enable-kvm` stays. Without this the guest kernel wedges at
+						# early boot ("Poking KASLR using RDRAND RDTSC...") because
+						# executing RDRAND can stall the vcpu under nested KVM;
+						# masking it forces the RDTSC entropy
+						# fallback. Mirrors microvm's own base string so only rdrand/rdseed
+						# differ. VM-only (isVm); the container has no qemu args.
+						"-cpu"
+						"host,+x2apic,-sgx,-rdrand,-rdseed"
 						"-monitor"
 						"unix:${runtimeDir}/monitor.sock,server,nowait"
 					] ++ lib.concatMap (p: [
@@ -1335,10 +1545,11 @@
 						after = [ stateUnit ]
 							++ lib.optional isContainer "cogbox-init.service"
 							++ lib.optional (isVm && harnesses ? "codex") "${utils.escapeSystemdPath "/root/.codex"}.mount"
-							# hermes skills are linked INTO /root/.hermes (overlay upper);
-							# linking before the mount would land them on the covered rootfs.
+							# In the VM, Hermes skills are linked into the overlay upper;
+							# linking before the mount would write to the covered rootfs.
 							++ lib.optional (isVm && harnesses ? "hermes-agent") "${utils.escapeSystemdPath "/root/.hermes"}.mount";
-						requires = [ stateUnit ];
+						requires = [ stateUnit ]
+							++ lib.optional (isVm && harnesses ? "hermes-agent") "${utils.escapeSystemdPath "/root/.hermes"}.mount";
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
@@ -1532,6 +1743,61 @@
 							'';
 						};
 					};
+					# VM backend: prepare the persistent sshd host key + the gateway
+					# CA/principal files on the 9p-backed /var/lib/cogbox BEFORE sshd
+					# starts. The container backend does the equivalent from pod env
+					# (cogbox-sshd-ca); the VM cannot read pod env, so cogworx's k8s
+					# pod entrypoint stages the real CA/principal into this same 9p
+					# source before boot and sshd reads them directly (TrustedUserCAKeys
+					# /AuthorizedPrincipalsFile point here). Ordered after the 9p mount
+					# so the (late) mount is up, and before sshd so the key + dirs exist.
+					cogbox-vm-sshd-prep = lib.mkIf isVm {
+						description = "Prepare the VM's persistent sshd host key + gateway CA/principal dirs";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "sshd.service" ];
+						after = [ "var-lib-cogbox.mount" ];
+						requires = [ "var-lib-cogbox.mount" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = pkgs.writeShellScript "cogbox-vm-sshd-prep" ''
+								set -eu
+								# Persistent host-key dir (0700 so the private key is not
+								# group/world readable) + the gateway CA/principal dir.
+								mkdir -p /var/lib/cogbox/ssh /var/lib/cogbox/.config/ssh-principals
+								chmod 700 /var/lib/cogbox/ssh
+								# Pre-generate the persistent host key here rather than leaving
+								# it to sshd's own keygen, so it exists on the (late) 9p mount
+								# before sshd regardless of the module's keygen timing. A
+								# stable key is what keeps the gateway's TOFU pin valid across
+								# restarts.
+								key=/var/lib/cogbox/ssh/ssh_host_ed25519_key
+								[ -s "$key" ] || ${pkgs.openssh}/bin/ssh-keygen -t ed25519 -N "" -C cogbox-vm -f "$key"
+								# Fail-closed CA/principal: cogworx stages the REAL files into
+								# this dir (host-side, before boot) when the gateway is enabled.
+								# When it is not (a purely-local VM, or the gateway is off),
+								# seed EMPTY files so sshd never reads a missing
+								# TrustedUserCAKeys/AuthorizedPrincipalsFile -- empty CA -> no
+								# cert validates; empty principals -> no principal matches. A
+								# real file already staged by cogworx is left untouched.
+								[ -e /var/lib/cogbox/.config/ssh-ca.pub ] || : > /var/lib/cogbox/.config/ssh-ca.pub
+								[ -e /var/lib/cogbox/.config/ssh-principals/root ] || : > /var/lib/cogbox/.config/ssh-principals/root
+							'';
+						};
+					};
+					# The VM host key lives on the late 9p mount; order sshd after
+					# it (and after the prep unit that creates the dir + key) so sshd
+					# never starts before the key it must read is present.
+					sshd = lib.mkIf isVm {
+						after = [ "var-lib-cogbox.mount" "cogbox-vm-sshd-prep.service" ];
+						requires = [ "cogbox-vm-sshd-prep.service" ];
+					};
+					# The module's separate host-key generator must also wait for
+					# the 9p mount + prep, or it races the late mount; with the key
+					# already generated it finds it present and does nothing.
+					sshd-keygen = lib.mkIf isVm {
+						after = [ "var-lib-cogbox.mount" "cogbox-vm-sshd-prep.service" ];
+					};
 					harness-overlay-img = lib.mkIf isVm {
 						description = "Create ext4 image for harness overlay";
 						wantedBy = [ "var-lib-harness\\x2drw.mount" ];
@@ -1553,14 +1819,26 @@
 								if [ ! -f "$img" ] && [ -f "$old_img" ]; then
 									mv "$old_img" "$img"
 								fi
-								if [ ! -f "$img" ]; then
+								# (Re)format when the image is MISSING or does not hold a
+								# valid ext4 filesystem. A first-boot mkfs interrupted by a
+								# pod recreate (the ~4min boot can outrun the ~5.2min k8s
+								# startup-probe deadline) leaves the file present but with a
+								# zeroed/garbage superblock; the old `[ ! -f ]`-only guard
+								# then skipped reformatting on every later boot, wedging the
+								# guest in emergency mode (VFS: Can't find ext4 filesystem ->
+								# /var/lib/harness-rw never mounts -> no sshd -> recreate
+								# loop, no self-heal). `dumpe2fs -h` reads ONLY the
+								# superblock, so a valid (even fully populated) overlay is
+								# preserved -- no data loss -- while a missing or corrupt one
+								# is rebuilt.
+								if [ ! -f "$img" ] || ! ${pkgs.e2fsprogs}/bin/dumpe2fs -h "$img" >/dev/null 2>&1; then
 									size="128M"
 									sizefile=/var/lib/cogbox/.config/overlay-size
 									if [ -f "$sizefile" ]; then
 										size=$(cat "$sizefile")
 									fi
 									${pkgs.coreutils}/bin/truncate -s "$size" "$img"
-									${pkgs.e2fsprogs}/bin/mkfs.ext4 -q "$img"
+									${pkgs.e2fsprogs}/bin/mkfs.ext4 -q -F "$img"
 								fi
 							'';
 						};
@@ -1618,13 +1896,13 @@
 					};
 
 					# Container backend: prepare the mounted state volume and make
-					# ~/work resolve like it does in the VM. The brain/trust oneshots
-					# (reused verbatim) hardcode /var/lib/cogbox as the data dir, so
-					# symlink it into the mounted state before they run.
+					# ~/work and enabled harness state resolve into it before brain
+					# materialization. The brain/trust oneshots hardcode /var/lib/cogbox
+					# as the data dir, so symlink it into the mounted state too.
 					cogbox-container-state = lib.mkIf isContainer {
 						description = "Prepare mounted state + ~/work resolution (container backend)";
 						wantedBy = [ "multi-user.target" ];
-						before = [ "multi-user.target" ];
+						before = [ "multi-user.target" "cogbox-brain-materialize.service" ];
 						unitConfig.DefaultDependencies = false;
 						serviceConfig = {
 							Type = "oneshot";
@@ -1636,6 +1914,9 @@
 								# private key is not group/world readable).
 								chmod 700 ${stateRoot}/ssh
 								ln -sfn ${cogboxData} /var/lib/cogbox
+								${lib.optionalString (harnesses ? "hermes-agent") ''
+									${hermesHomeHelper}/bin/cogbox-hermes-home ${stateRoot}/hermes-home /root/.hermes
+								''}
 							'';
 						};
 					};
@@ -1672,24 +1953,33 @@
 					# brain-trust writes ~/.claude.json and before a terminal opens.
 					# Re-run on connect/disconnect by cogworx (systemctl restart) and at
 					# every boot (restart persistence from the PVC marker).
-					cogbox-claude-stub = lib.mkIf isContainer {
-						description = "Stage/remove the redacted Claude stub credential (container backend)";
+					cogbox-claude-stub = lib.mkIf (isContainer || isVm) {
+						description = "Stage/remove the redacted Claude stub credential"
+							+ lib.optionalString isContainer " (container backend)";
 						wantedBy = [ "multi-user.target" ];
 						before = [ "multi-user.target" "sshd.service" "cogbox-brain-materialize.service" "cogbox-brain-trust.service" ];
-						after = [ "cogbox-container-state.service" ];
-						requires = [ "cogbox-container-state.service" ];
+						# stateUnit resolves per target (cogbox-container-state.service /
+						# var-lib-cogbox.mount). On the VM the verb writes
+						# .credentials.json into the /root/.claude OVERLAY, so that mount
+						# must be up first (a write before it lands on the covered rootfs).
+						after = [ stateUnit ]
+							++ lib.optional (isVm && harnesses ? "claude-code") "${utils.escapeSystemdPath "/root/.claude"}.mount";
+						requires = [ stateUnit ]
+							++ lib.optional (isVm && harnesses ? "claude-code") "${utils.escapeSystemdPath "/root/.claude"}.mount";
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
-							# cogbox resolves XDG/HOME before any verb dispatch; mirror
-							# cogbox-init so the boot run has them (the verb itself takes
-							# explicit path args and holds no secret).
-							Environment = [
+							# The container verb resolves XDG/HOME/COGBOX_DATA to locate
+							# the state root; the VM variant takes explicit path args and
+							# needs only HOME.
+							Environment = if isContainer then [
 								"HOME=/root"
 								"XDG_CONFIG_HOME=${stateRoot}/config"
 								"COGBOX_DATA=${cogboxData}"
+							] else [
+								"HOME=/root"
 							];
-							ExecStart = claudeStubScript;
+							ExecStart = if isContainer then claudeStubScript else claudeStubScriptVm;
 						};
 					};
 
@@ -1771,6 +2061,21 @@
 			})
 		];
 	in {
+		# The GCE bake seam. `packages.gce-image` builds the DEFAULT host config,
+		# whose cogworx.gce.controlCAPublicKey is empty -- fail-closed, and
+		# therefore NOT publishable: sshd would trust no control CA and every
+		# certificate cogworxd mints would be refused, so every instance created
+		# from it wedges in Booting. Baking a real image means overriding that
+		# option, and these two outputs are the supported ways to do it (there is
+		# no other: the default config is constructed inside this flake and takes
+		# no arguments).
+		#
+		#   nix build --impure --expr '((builtins.getFlake "/path/to/cc-sandbox").lib.mkGceHost
+		#     "x86_64-linux" { extraModules = [ { cogworx.gce.controlCAPublicKey = "ssh-ed25519 AAAA... control-ca"; } ]; }
+		#   ).config.system.build.googleComputeImage'
+		lib.mkGceHost = mkGceHost;
+		nixosModules.gce-host = ./gce/cogbox-host.nix;
+
 		packages = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
@@ -2193,6 +2498,17 @@
 			# runner (see cogbox-x86_64-test-plugin).
 			cogbox-test-plugin = mkCogbox
 				self.nixosConfigurations.cogbox-x86_64-test-plugin.config.microvm.declaredRunner;
+
+			# The GCE backend image: a raw disk.raw wrapped in the sparse
+			# gzipped tar `gcloud compute images create` imports. Building it
+			# is an OPERATOR step (it boots a builder VM and produces a
+			# multi-GB artifact), which is why nothing in `checks` depends on
+			# it -- the checks assert the CLOSURE and the UNIT GRAPH of the
+			# system this image contains, which is where the image invariants live.
+			#
+			# PHASE-0: nixpkgs' postVM tars with the default GNU format. Confirm `gcloud compute
+			# images create` accepts it before the bake is called done.
+			gce-image = self.nixosConfigurations.cogbox-x86_64-gce.config.system.build.googleComputeImage;
 		});
 
 		# `nix run .#push-pod-image [-- <registry-ref>]` streams the sandbox-pod
@@ -2273,11 +2589,338 @@
 					'';
 				}}/bin/push-nft-init-image";
 			};
+		} // lib.optionalAttrs (system == "x86_64-linux") {
+			# `nix run .#push-gce-image [-- <gs://bucket/prefix>]` stages the
+			# GCE image tarball in GCS and registers it as a Compute image in a
+			# family.
+			#
+			# This is the OPERATOR image-pipeline identity's job, never the
+			# lifecycle credential's: the least-privilege model excludes
+			# `images.create` plus GCS staging from the role cogworxd holds, so
+			# a compromised lifecycle credential cannot substitute the trusted
+			# half's own code. Run it with the pipeline identity's gcloud
+			# credentials, not cogworxd's service-account key.
+			#
+			# IT TAKES THE IMAGE PATH AS INPUT and refuses to default to
+			# `packages.gce-image`. That default was the whole hazard: the
+			# packaged image is built from the flake's DEFAULT host config,
+			# whose cogworx.gce.controlCAPublicKey is empty. Publishing is the one
+			# step where that mistake becomes expensive, so this is where it
+			# fails closed. See README ("Two things the image cannot supply").
+			push-gce-image = {
+				type = "app";
+				program = "${pkgs.writeShellApplication {
+					name = "push-gce-image";
+					runtimeInputs = [ pkgs.google-cloud-sdk pkgs.coreutils ];
+					text = ''
+						bucket="''${1:-''${COGWORX_GCE_IMAGE_BUCKET:-gs://example-bucket/cogbox-gce}}"
+						family="''${COGWORX_GCE_IMAGE_FAMILY:-cogbox-gce}"
+						name="''${COGWORX_GCE_IMAGE_NAME:-$family-$(date -u +%Y%m%d%H%M%S)}"
+						src="''${COGWORX_GCE_IMAGE_SRC:-}"
+						if [ -z "$src" ]; then
+							echo "push-gce-image: set COGWORX_GCE_IMAGE_SRC to the build output of a CA-BAKED image." >&2
+							echo "  nix build --impure --expr '((builtins.getFlake \"/path/to/cogbox\").lib.mkGceHost \"x86_64-linux\" { extraModules = [ { cogworx.gce.controlCAPublicKey = \"ssh-ed25519 AAAA... cogworx-control-ca\"; } ]; }).config.system.build.googleComputeImage'" >&2
+							echo "  COGWORX_GCE_IMAGE_SRC=./result nix run .#push-gce-image" >&2
+							echo "This does NOT default to packages.gce-image: that one bakes no control CA, so sshd would trust nothing and every instance would wedge in Booting." >&2
+							exit 1
+						fi
+						if [ -d "$src" ]; then
+							src=$(echo "$src"/*.raw.tar.gz)
+						fi
+						[ -f "$src" ] || { echo "push-gce-image: no image tarball at $src" >&2; exit 1; }
+						obj="$bucket/$(basename "$src")"
+						echo "Staging $src -> $obj" >&2
+						gcloud storage cp "$src" "$obj"
+						echo "Creating image $name (family $family) from $obj" >&2
+						gcloud compute images create "$name" \
+							--source-uri="$obj" \
+							--family="$family"
+						# The control plane pins the IMMUTABLE NUMERIC ID, never
+						# the name: deleting an image frees its name, so a
+						# name pin would let the whole trusted half be replaced
+						# while the recorded pin still matched. Print the id so
+						# the operator records the right thing.
+						gcloud compute images describe "$name" --format='value(id,name,selfLink)'
+					'';
+				}}/bin/push-gce-image";
+			};
 		});
 
 		checks = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
-		in {
+			hermesHomeHelper = mkHermesHomeHelper pkgs;
+			containerStateScript = self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-container-state.serviceConfig.ExecStart;
+			# The two realized harness-config reconcile scripts, one per backend, for
+			# harness-firstrun-flags below. Forcing the two small scripts rather than
+			# a toplevel keeps that check cheap.
+			containerHarnessConfScript = self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-claude-stub.serviceConfig.ExecStart;
+			vmHarnessConfScript = self.nixosConfigurations.${configName system}.config.systemd.services.cogbox-brain-trust.serviceConfig.ExecStart;
+			# Every cogbox GUEST config that renders a resolved.conf, paired with
+			# its name, for guest-dns-no-public-fallback below. Forcing the small
+			# ini file rather than a toplevel keeps that check cheap. Today only
+			# the microVM guest contributes: the container has resolved disabled
+			# (kubelet owns its /etc/resolv.conf), so it renders no file.
+			guestResolvedConfs = lib.concatMap (name: let
+				etc = self.nixosConfigurations.${name}.config.environment.etc;
+			in lib.optional (etc ? "systemd/resolved.conf") {
+				inherit name;
+				path = etc."systemd/resolved.conf".source;
+			}) [ (configName system) "${configName system}-container" ];
+			enabledHarnesses = mkHarnesses system pkgs;
+			releaseHarnesses = {
+				claude-code = enabledHarnesses.claude-code.package;
+				opencode = enabledHarnesses.opencode.package;
+				codex = inputs.llm-agents.packages.${system}.codex;
+				hermes-agent = enabledHarnesses.hermes-agent.package;
+				# pi is opt-out of the default image (enablePi above), so it is no longer
+				# in enabledHarnesses. Reference the BASE numtide pi (not the overridden
+				# one we've stopped shipping) so the release version gate stays a cache
+				# hit and needs no npmjs egress -- mirrors how codex is handled above.
+				pi = inputs.llm-agents.packages.${system}.pi;
+			};
+			# GCE backend image assertions (x86_64 only; nested virt is Intel
+			# only). These are lazy let-bindings, forced only by the
+			# x86_64-guarded checks at the bottom of this block.
+			gceCfg = self.nixosConfigurations.cogbox-x86_64-gce.config;
+			gceToplevel = gceCfg.system.build.toplevel;
+			gceUnits = "${gceToplevel}/etc/systemd/system";
+			# closureInfo over the toplevel is exactly what make-disk-image.nix
+			# loads into the image's store DB, so asserting against it asserts
+			# against what the booted VM can actually resolve offline.
+			gceClosure = pkgs.closureInfo { rootPaths = [ gceToplevel ]; };
+			gceFloorVerify = gceCfg.systemd.services.cogworx-floor.serviceConfig.ExecStartPost;
+			gceFloorInstall = gceCfg.systemd.services.cogworx-floor.serviceConfig.ExecStart;
+			gceSuperviseScript = gceCfg.systemd.services.cogworx-supervisor.serviceConfig.ExecStart;
+			gceStateDiskScript = gceCfg.systemd.services.cogworx-state-disk.serviceConfig.ExecStart;
+			gceResolverDeadlineScript = gceCfg.systemd.services.cogworx-resolver-deadline.serviceConfig.ExecStart;
+			gceCogboxWrapper = gceCfg.cogworx.gce.cogboxPackage;
+			# Stands in for the real cogbox binary so gce-cogbox-wrapper-env can
+			# observe what the wrapper actually exported, without running a verb.
+			gceWrapperEnvStub = pkgs.writeShellScript "cogbox-env-stub" ''
+				printf 'XDG_CONFIG_HOME=%s\n' "''${XDG_CONFIG_HOME-<unset>}"
+				printf 'COGBOX_DATA=%s\n' "''${COGBOX_DATA-<unset>}"
+				printf 'XDG_RUNTIME_DIR=%s\n' "''${XDG_RUNTIME_DIR-<unset>}"
+				printf 'COGBOX_PROXY_RUNAS=%s\n' "''${COGBOX_PROXY_RUNAS-<unset>}"
+			'';
+			# The bake seam of `lib.mkGceHost`, evaluated (not built) so the
+			# runbook's one supported way to inject a control CA is asserted
+			# rather than asserted-in-prose. A fictional key line: nothing parses
+			# it, the check only proves it reaches sshd's TrustedUserCAKeys file.
+			gceBakeCAKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEcontrolCAkeyFORtheFLAKEcheck control-ca";
+			gceBakedCAText = (mkGceHost "x86_64-linux" {
+				extraModules = [ { cogworx.gce.controlCAPublicKey = gceBakeCAKey; } ];
+			}).config.environment.etc."ssh/cogworx-control-ca.pub".text;
+			gceDefaultCAText = gceCfg.environment.etc."ssh/cogworx-control-ca.pub".text;
+			# The MERGE-ABLE seam, exercised through the same bake path: a composed
+			# profile's own user CA has to have somewhere to land, because
+			# TrustedUserCAKeys itself is forced and a definition there loses
+			# silently. Fictional key lines; nothing parses them.
+			gceBakeExtraCAKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEfleetCAkeyFORtheFLAKEcheck fleet-ca";
+			gceBakedExtraCAText = (mkGceHost "x86_64-linux" {
+				extraModules = [ {
+					cogworx.gce.controlCAPublicKey = gceBakeCAKey;
+					cogworx.gce.extraTrustedUserCAKeys = [ gceBakeExtraCAKey ];
+				} ];
+			}).config.environment.etc."ssh/cogworx-control-ca.pub".text;
+			# The realized sshd PAM stack, read as a string so gce-image-control-pam
+			# can assert the ORDER of the account rules rather than their presence.
+			gcePamSshd = gceCfg.security.pam.services.sshd.text;
+		in lib.optionalAttrs ((mkHarnesses system pkgs) ? "hermes-agent") {
+			# Exercise the same helper used by the container state unit. There is no
+			# container boot harness in this repository, so retain one invocation check.
+			container-state-unit = pkgs.runCommand "cogbox-container-state-unit" {} ''
+				helper=${hermesHomeHelper}/bin/cogbox-hermes-home
+				assert_fails() {
+					if "$@"; then
+						echo "expected failure: $*" >&2
+						exit 1
+					fi
+				}
+
+				mkdir fresh
+				"$helper" "$PWD/fresh/persistent" "$PWD/fresh/home"
+				test -d "$PWD/fresh/persistent"
+				test "$(stat -c %a "$PWD/fresh/persistent")" = 700
+				test -L "$PWD/fresh/home"
+				test "$(readlink "$PWD/fresh/home")" = "$PWD/fresh/persistent"
+				touch "$PWD/fresh/persistent/marker"
+				"$helper" "$PWD/fresh/persistent" "$PWD/fresh/home"
+				test -f "$PWD/fresh/persistent/marker"
+
+				mkdir -p empty/persistent empty/home
+				chmod 755 empty/persistent
+				"$helper" "$PWD/empty/persistent" "$PWD/empty/home"
+				test "$(stat -c %a "$PWD/empty/persistent")" = 700
+				test "$(readlink "$PWD/empty/home")" = "$PWD/empty/persistent"
+
+				mkdir -p nonempty/persistent nonempty/home
+				touch nonempty/persistent/target-marker nonempty/home/source-marker
+				assert_fails "$helper" "$PWD/nonempty/persistent" "$PWD/nonempty/home"
+				test -f nonempty/persistent/target-marker
+				test -f nonempty/home/source-marker
+				test ! -L nonempty/home
+
+				mkdir -p wrong-link/persistent wrong-link/elsewhere
+				touch wrong-link/persistent/target-marker wrong-link/elsewhere/source-marker
+				ln -s "$PWD/wrong-link/elsewhere" wrong-link/home
+				assert_fails "$helper" "$PWD/wrong-link/persistent" "$PWD/wrong-link/home"
+				test "$(readlink wrong-link/home)" = "$PWD/wrong-link/elsewhere"
+				test -f wrong-link/persistent/target-marker
+				test -f wrong-link/elsewhere/source-marker
+
+				mkdir bad-target
+				printf 'persistent marker\n' > bad-target/persistent
+				assert_fails "$helper" "$PWD/bad-target/persistent" "$PWD/bad-target/home"
+				grep -qFx 'persistent marker' bad-target/persistent
+				test ! -e bad-target/home
+
+				mkdir -p target-symlink/source
+				touch target-symlink/source/marker
+				ln -s "$PWD/target-symlink/source" target-symlink/persistent
+				assert_fails "$helper" "$PWD/target-symlink/persistent" "$PWD/target-symlink/home"
+				test "$(readlink target-symlink/persistent)" = "$PWD/target-symlink/source"
+				test -f target-symlink/source/marker
+				test ! -e target-symlink/home
+
+				mkdir -p link-file/persistent
+				touch link-file/persistent/target-marker
+				printf 'link marker\n' > link-file/home
+				assert_fails "$helper" "$PWD/link-file/persistent" "$PWD/link-file/home"
+				test -f link-file/persistent/target-marker
+				grep -qFx 'link marker' link-file/home
+
+				mkdir identical
+				assert_fails "$helper" "$PWD/identical/home" "$PWD/identical/home"
+				test ! -e identical/home
+
+				mkdir correct-missing
+				ln -s "$PWD/correct-missing/persistent" correct-missing/home
+				"$helper" "$PWD/correct-missing/persistent" "$PWD/correct-missing/home"
+				test -d correct-missing/persistent
+				test "$(readlink correct-missing/home)" = "$PWD/correct-missing/persistent"
+
+				mkdir -p wrong-missing/source
+				touch wrong-missing/source/marker
+				ln -s "$PWD/wrong-missing/source" wrong-missing/home
+				assert_fails "$helper" "$PWD/wrong-missing/persistent" "$PWD/wrong-missing/home"
+				test ! -e wrong-missing/persistent
+				test "$(readlink wrong-missing/home)" = "$PWD/wrong-missing/source"
+				test -f wrong-missing/source/marker
+
+				mkdir -p nonempty-missing/home
+				printf 'source marker\n' > nonempty-missing/home/marker
+				assert_fails "$helper" "$PWD/nonempty-missing/persistent" "$PWD/nonempty-missing/home"
+				test ! -e nonempty-missing/persistent
+				test -d nonempty-missing/home
+				grep -qFx 'source marker' nonempty-missing/home/marker
+
+				# Deterministically reproduce the post-validation race outcome: GNU ln
+				# -T must reject the destination directory without creating a child link.
+				mkdir -p raced/persistent raced/home
+				touch raced/home/directory-marker
+				assert_fails ln -sT -- "$PWD/raced/persistent" "$PWD/raced/home"
+				test -d raced/home
+				test -f raced/home/directory-marker
+				test ! -e raced/home/persistent
+				test "$(grep -c 'ln -sT --' "$helper")" = 2
+
+				grep -qF '${hermesHomeHelper}/bin/cogbox-hermes-home /var/lib/cogbox-state/hermes-home /root/.hermes' ${containerStateScript}
+				touch $out
+			'';
+		} // lib.optionalAttrs (builtins.hasAttr system inputs.llm-agents.packages) {
+			# The harness's first-run dialog state is reconciled in TWO places -- the
+			# container's claude-stub oneshot and the VM's brain-trust oneshot -- and,
+			# inside the container one, on TWO branches (fresh write vs merge onto an
+			# existing config). Nothing at eval time couples the three, so an edit can
+			# fix one and leave a fresh sandbox parked on an interactive first-run
+			# prompt instead of reaching the REPL. No unit or VM test in this repo
+			# reaches that: it needs an interactive terminal, and `claude -p` passes
+			# either way. Assert the realized scripts by grep: cheap,
+			# and it fails on the drift rather than on the symptom.
+			harness-firstrun-flags = pkgs.runCommand "cogbox-harness-firstrun-flags" { } ''
+				fails=0
+				container=${containerHarnessConfScript}
+				vm=${vmHarnessConfScript}
+
+				for flag in hasCompletedOnboarding bypassPermissionsModeAccepted; do
+					# Container, fresh-write branch: the literal used when no config exists.
+					if ! grep -qF "\"$flag\":true" "$container"; then
+						echo "FAIL: container fresh write does not set $flag" >&2
+						fails=$((fails + 1))
+					fi
+					# Container, merge branch: FORCED (=), not defaulted (//=), so a config
+					# the harness has already rewritten still ends up with it.
+					if ! grep -qF ".$flag = true" "$container"; then
+						echo "FAIL: container merge branch does not force $flag" >&2
+						fails=$((fails + 1))
+					fi
+					# VM: the same two, via brain-trust's isVm-guarded jq program.
+					if ! grep -qF ".$flag = true" "$vm"; then
+						echo "FAIL: VM brain-trust does not force $flag" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# bypassPermissionsModeAccepted is read off the GLOBAL config getter, so
+				# it has to be top-level. Written under .projects[...] -- where the
+				# neighbouring trust dialog legitimately lives -- it is never read, and
+				# the dialog still fires with the config looking correct to a grep.
+				if grep -qE 'projects\[[^]]*\]\.bypassPermissionsModeAccepted' "$container" "$vm"; then
+					echo "FAIL: bypassPermissionsModeAccepted written under .projects[...]; the global getter would never see it" >&2
+					fails=$((fails + 1))
+				fi
+
+				test "$fails" = 0
+				touch $out
+			'';
+
+			harness-versions = pkgs.runCommand "cogbox-harness-versions" {} ''
+				export HOME=$TMPDIR/home
+				export HERMES_HOME=$HOME/.hermes
+				mkdir -p "$HERMES_HOME"/{cron,sessions,logs,memories}
+				assert_version() {
+					expected=$1
+					shift
+					if ! output=$("$@" 2>&1); then
+						printf 'version command failed: %s\n%s\n' "$*" "$output" >&2
+						exit 1
+					fi
+					case "$output" in
+					*"$expected"*) ;;
+					*)
+						printf 'expected version %s from %s, got: %s\n' "$expected" "$*" "$output" >&2
+						exit 1
+						;;
+					esac
+				}
+
+				test '${releaseHarnesses.claude-code.version}' = '2.1.220'
+				test '${releaseHarnesses.opencode.version}' = '1.18.7'
+				test '${releaseHarnesses.codex.version}' = '0.145.0'
+				test '${releaseHarnesses.hermes-agent.version}' = '2026.7.20'
+				test '${releaseHarnesses.pi.version}' = '0.82.1'
+
+				assert_version '2.1.220' ${releaseHarnesses.claude-code}/bin/claude --version
+				assert_version '1.18.7' ${releaseHarnesses.opencode}/bin/opencode --version
+				assert_version '0.145.0' ${releaseHarnesses.codex}/bin/codex --version
+				assert_version '0.82.1' ${releaseHarnesses.pi}/bin/pi --version
+
+				if ! hermes_output=$(${releaseHarnesses.hermes-agent}/bin/hermes --version 2>&1); then
+					printf 'version command failed: hermes --version\n%s\n' "$hermes_output" >&2
+					exit 1
+				fi
+				for expected in 'v0.19.0' '(2026.7.20)'; do
+					case "$hermes_output" in
+					*"$expected"*) ;;
+					*)
+						printf 'expected Hermes version %s, got: %s\n' "$expected" "$hermes_output" >&2
+						exit 1
+						;;
+					esac
+				done
+				touch $out
+			'';
+		} // {
 			# Pure-helper parity + credential-injection unit tests for the
 			# mitmproxy L7 addon. Fast (no VM); keeps the addon's host
 			# pattern / path / cred-injection logic honest on every build.
@@ -2292,6 +2935,24 @@
 				mkdir tests
 				cp ${./tests/test_l7_addon.py} tests/test_l7_addon.py
 				python3 tests/test_l7_addon.py
+				touch $out
+			'';
+
+			# The launcher's `init` seeding and its failure-path hygiene, exercised
+			# by RUNNING the script (no VM: every case stops at --init-only or fails
+			# before the launch). Two invariants no unit test can reach: that
+			# --no-implicit-dns / --self-addr actually reach config.json -- without a
+			# producer the filter's parameterized port-53 allow and the l7proxy
+			# self-address floor are dead code -- and that an init WITHOUT them
+			# writes the pre-feature blob unchanged, which is what keeps the local
+			# and k8s backends untouched. Plus: no failure path echoes credential
+			# context, which matters wherever the launcher's stderr lands somewhere
+			# retained outside the machine.
+			launch-flag-tests = pkgs.runCommand "cogbox-launch-flag-tests" {
+				nativeBuildInputs = with pkgs; [ bash jq coreutils gnugrep ];
+			} ''
+				export HOME=$TMPDIR
+				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh}
 				touch $out
 			'';
 
@@ -2315,6 +2976,81 @@
 				'';
 			};
 		} // lib.optionalAttrs (system == "x86_64-linux") {
+			# On the container backend the guest half
+			# (plugin commands/skills/agents + cogbox.packages) is
+			# delivered by the cogbox-brain-materialize oneshot rebuilding the brain
+			# at boot. That rebuild MUST evaluate the `-container` config: the VM
+			# config imports microvm.nixosModules.microvm, whose input source cannot
+			# be fetched in the fail-closed offline sandbox, so evaluating it aborts
+			# and silently drops the whole guest half. This check (a) builds the
+			# container brain from a fixture that ships a plugin command + package
+			# and asserts both land in the brain, and (b) guards that the baked
+			# boot rebuild targets the `-container` config, not the VM one.
+			container-brain-command = pkgs.runCommand "cogbox-container-brain-command" { } ''
+				brain=${self.nixosConfigurations.cogbox-x86_64-brain-fixture-container.config.system.build.cogboxBrain}
+				# (a) a plugin-shipped command reaches the container brain's claude tree
+				if [ ! -f "$brain/claude/commands/demo-rca.md" ]; then
+					echo "FAIL: plugin command not in container brain: $brain/claude/commands/demo-rca.md" >&2
+					ls -R "$brain/claude" >&2 || true
+					exit 1
+				fi
+				# cogbox.packages reach the brain's $out/bin (the container PATH surface)
+				if [ ! -e "$brain/bin/hello" ]; then
+					echo "FAIL: cogbox.packages tool not in container brain: $brain/bin/hello" >&2
+					exit 1
+				fi
+				# (b) the boot rebuild must target the `-container` config (no microvm)
+				mat=${self.nixosConfigurations.cogbox-x86_64-container.config.systemd.services.cogbox-brain-materialize.serviceConfig.ExecStart}
+				if ! grep -q 'cogbox-x86_64-container.config.system.build.cogboxBrain' "$mat"; then
+					echo "FAIL: brain-materialize does not rebuild via the -container config" >&2
+					exit 1
+				fi
+				if grep -qF 'cogbox-x86_64.config.system.build.cogboxBrain' "$mat"; then
+					echo "FAIL: brain-materialize rebuilds via the VM config (microvm force-fetch regression)" >&2
+					exit 1
+				fi
+				touch $out
+			'';
+			# GUEST-HALF DNS: no public fallback resolver, asserted against the
+			# rendered resolved.conf rather than against prose.
+			#
+			# WHY THIS NEEDS A CHECK. The leak is invisible from inside the
+			# guest's normal behaviour: resolution keeps working through the
+			# link-scope server passt advertises, and only the GLOBAL scope
+			# carries systemd's compiled-in 1.1.1.1/8.8.8.8/9.9.9.9 list -- so it
+			# reads as `resolvectl status` trivia right up until a link-scope
+			# failure ships an INTERNAL query name to a third-party resolver and
+			# an internal-DNS outage comes back as an ordinary NXDOMAIN. It also
+			# has a near-miss spelling: an empty LIST renders no line at all,
+			# which is byte-identical to the defect, and only the empty STRING
+			# renders the `FallbackDNS=` that overrides the compiled-in list.
+			#
+			# Written over "every guest config that renders the file" rather than
+			# over the VM by name so that enabling resolved in the container later
+			# is covered automatically instead of silently unasserted.
+			guest-dns-no-public-fallback = pkgs.runCommand "cogbox-guest-dns-no-public-fallback" { } ''
+				fails=0
+				${lib.concatMapStrings ({ name, path }: ''
+					conf=${path}
+					if [ "$(grep -c '^FallbackDNS=' "$conf")" != 1 ]; then
+						echo "FAIL: ${name}: resolved.conf carries $(grep -c '^FallbackDNS=' "$conf") FallbackDNS lines, expected exactly 1; with none, systemd's compiled-in PUBLIC resolver list stands at global scope and an internal query name leaks the moment link-scope DNS is unset or fails" >&2
+						fails=$((fails + 1))
+					elif ! grep -qx 'FallbackDNS=' "$conf"; then
+						echo "FAIL: ${name}: FallbackDNS names a resolver ($(grep '^FallbackDNS=' "$conf")); the guest must resolve exactly what the host resolves, or fail visibly" >&2
+						fails=$((fails + 1))
+					fi
+				'') guestResolvedConfs}
+				# Non-vacuity. The microVM guest enables networkd, which
+				# default-enables resolved, so that config MUST have contributed a
+				# file to the loop above; if the attribute path ever moves, this
+				# check would otherwise pass by asserting nothing.
+				${lib.optionalString (!(lib.any (c: c.name == configName system) guestResolvedConfs)) ''
+					echo "FAIL: ${configName system} renders no /etc/systemd/resolved.conf, so this check asserted nothing about the guest's resolver" >&2
+					fails=$((fails + 1))
+				''}
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
 			cogbox-vm = pkgs.testers.runNixOSTest (import ./tests/cogbox.nix {
 				inherit self pkgs system;
 			});
@@ -2325,6 +3061,940 @@
 			nft-floor-bypass = pkgs.testers.runNixOSTest (import ./tests/nft-floor-bypass.nix {
 				inherit self pkgs;
 			});
+		} // lib.optionalAttrs (system == "x86_64-linux") {
+			# --- GCE backend image checks -------------------------------------
+			#
+			# The image itself is an operator bake. What the gce-image-* checks
+			# assert is the thing the bake cannot change: the CLOSURE and the UNIT
+			# GRAPH of the system inside it. Every one of them stands in for a
+			# failure that is invisible until a real instance is already broken in
+			# the field.
+
+			# THE offline-boot regression, caught at build time. cogbox-launch.sh's
+			# custom-flake re-exec EVALUATES the VM config, which forces every
+			# flake input SOURCE TREE. A non-resident input aborts the eval and
+			# silently drops the whole guest half.
+			# google-compute-image.nix does not thread `additionalPaths` through to
+			# make-disk-image.nix, so system.extraDependencies is the only route
+			# into the registered store, and this check is what proves it took.
+			gce-image-offline-closure = pkgs.runCommand "gce-image-offline-closure" { } ''
+				fails=0
+				for src in \
+					'${inputs.microvm}' \
+					'${inputs.llm-agents}' \
+					'${inputs.nix-mcp}' \
+					'${inputs.illustris-lib}'; do
+					if ! grep -qxF "$src" ${gceClosure}/store-paths; then
+						echo "FAIL: flake input source $src is NOT in the GCE image's registered closure;" >&2
+						echo "      the launcher's re-exec will abort offline and drop the guest half" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				# The cogbox package itself, and with it the microvm runner and the
+				# guest kernel/initrd/toplevel, must be resident too.
+				if ! grep -q 'cogbox' ${gceClosure}/store-paths; then
+					echo "FAIL: no cogbox path in the GCE image closure" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# What a flake FETCH needs from the image's userland, which is not the
+			# same question as what its closure contains. nix's git+http(s)/ssh
+			# fetcher execs the `git` CLI off PATH. Without git, every curated
+			# catalog entry fails at resolve time, including entries handled by
+			# an ephemeral resolver VM.
+			#
+			# Neither half is REFERENCED by anything in the image -- the caller is
+			# nix, at runtime, by name -- so nothing but this check stands between
+			# a boot-disk closure trim and a backend that cannot install a plugin.
+			gce-image-flake-fetch = pkgs.runCommand "gce-image-flake-fetch" { } ''
+				fails=0
+				# On the system path, not merely in the closure: nix resolves the
+				# fetcher off PATH, and /run/current-system/sw/bin (= sw/bin of the
+				# toplevel) is what a control-channel exec, the supervisor unit and
+				# a serial break-glass session all share. Do NOT weaken this to a
+				# closureInfo store-paths grep the way the offline-closure check
+				# above does -- git was ALREADY in the broken image's closure (the
+				# guest half pulls it in), so a closure grep passed while the whole
+				# catalog was uninstallable. Adding it here costs ~68 KiB of
+				# system-path symlinks, not a git closure.
+				if [ ! -x ${gceToplevel}/sw/bin/git ]; then
+					echo "FAIL: no git on /run/current-system/sw/bin; nix's git+http(s)/ssh flake fetcher execs the git CLI, so every git+ plugin URL dies with 'executing git: No such file or directory' -- and every curated catalog entry is a git+ URL" >&2
+					fails=$((fails + 1))
+				fi
+				# TLS trust for the https variant. The pod image needs pkgs.cacert +
+				# SSL_CERT_FILE for this because it is a bare userland; on NixOS it
+				# comes from security.pki instead, i.e. from a file that can vanish
+				# by REMOVAL (an environment.etc mkForce, a stripped security.pki)
+				# with no missing package to notice. The failure mode is then a
+				# certificate error on git+https rather than a missing binary.
+				if [ ! -e ${gceToplevel}/etc/ssl/certs/ca-certificates.crt ]; then
+					echo "FAIL: the realized system has no /etc/ssl/certs/ca-certificates.crt; git's curl would have no CA bundle, so a git+https plugin fetch cannot verify TLS" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The lifecycle credential's setMetadata capability is inert rather
+			# than pretending the permission is narrow. Two of the three doors are
+			# closed here: startup/shutdown script execution and OS Login key
+			# management. A nixpkgs bump that re-enables either would silently hand
+			# `instances.setMetadata` root on the trusted half again.
+			gce-image-guest-agent-disabled = pkgs.runCommand "gce-image-guest-agent-disabled" { } ''
+				fails=0
+				for u in google-guest-agent google-startup-scripts google-shutdown-scripts; do
+					hits=$(find ${gceUnits} -name "$u.service" -path '*.wants/*' 2>/dev/null || true)
+					if [ -n "$hits" ]; then
+						echo "FAIL: $u is still wanted by a target:" >&2
+						echo "$hits" >&2
+						fails=$((fails + 1))
+					fi
+					# A .wants symlink is only one of the two routes in. A
+					# Wants=/Requires= inside some other unit would start it
+					# just as effectively and leaves no symlink to find.
+					pulls=$(grep -rlE "^(Wants|Requires|Requisite|BindsTo)=.*$u" ${gceUnits} 2>/dev/null || true)
+					if [ -n "$pulls" ]; then
+						echo "FAIL: a unit pulls in $u by dependency:" >&2
+						echo "$pulls" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				if [ '${lib.boolToString gceCfg.security.googleOsLogin.enable}' != false ]; then
+					echo "FAIL: security.googleOsLogin.enable is on; metadata ssh-keys would grant login" >&2
+					fails=$((fails + 1))
+				fi
+				# The OS Login PAM/NSS half leaves its own traces even when the
+				# service is not wanted, so assert the realized sshd config too.
+				if grep -qi 'oslogin' ${gceToplevel}/etc/ssh/sshd_config; then
+					echo "FAIL: sshd_config still references OS Login" >&2
+					fails=$((fails + 1))
+				fi
+				# Certificate-only control auth: a bare public key must be
+				# refused, so there is no authorized_keys path at all.
+				if ! grep -qx 'AuthorizedKeysFile none' ${gceToplevel}/etc/ssh/sshd_config; then
+					echo "FAIL: sshd still has an AuthorizedKeysFile path; a bare public key would be accepted" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -q '^TrustedUserCAKeys ' ${gceToplevel}/etc/ssh/sshd_config; then
+					echo "FAIL: sshd has no TrustedUserCAKeys; the control CA is not baked in" >&2
+					fails=$((fails + 1))
+				fi
+				# The VM host key must live on the STATE disk, or Stop and a
+				# boot-disk swap regenerate it and force a silent re-TOFU.
+				if ! grep -q '^HostKey /var/lib/cogbox-state/' ${gceToplevel}/etc/ssh/sshd_config; then
+					echo "FAIL: sshd's HostKey is not on the state disk" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# Floor-before-sandbox and scrub-independence are both load-bearing
+			# orderings. Both are the kind of thing a later "tidy the
+			# dependency graph" commit breaks without any test noticing.
+			gce-image-unit-ordering = pkgs.runCommand "gce-image-unit-ordering" { } ''
+				fails=0
+				sup=${gceUnits}/cogworx-supervisor.service
+				scrub=${gceUnits}/cogworx-attr-scrub.service
+				floor=${gceUnits}/cogworx-floor.service
+
+				# Requires=, not merely After=. With After= alone a floor-failed boot
+				# still starts the sandbox, and a full-mode guest on a floorless VM
+				# can forge the very guest attributes the boot path trusts.
+				req=$(grep '^Requires=' "$sup" || true)
+				case "$req" in
+					*cogworx-attr-scrub.service*) ;;
+					*) echo "FAIL: supervisor does not Requires= the scrub unit ($req)" >&2; fails=$((fails + 1)) ;;
+				esac
+				case "$req" in
+					*cogworx-floor.service*) ;;
+					*) echo "FAIL: supervisor does not Requires= the floor unit ($req)" >&2; fails=$((fails + 1)) ;;
+				esac
+				aft=$(grep '^After=' "$sup" || true)
+				case "$aft" in
+					*'var-lib-cogbox\x2dstate.mount'*) ;;
+					*) echo "FAIL: supervisor is not After= the state-disk mount ($aft)" >&2; fails=$((fails + 1)) ;;
+				esac
+				if ! grep -q '^ExecStopPost=.' "$sup"; then
+					echo "FAIL: supervisor has no ExecStopPost; readiness would latch across the crash paths the poll loop cannot see" >&2
+					fails=$((fails + 1))
+				fi
+
+				# The scrub retries forever and is INDEPENDENT of the floor. A scrub
+				# sequenced after the floor check would never run on a floor-failed
+				# same-epoch reboot -- exactly the boot whose stale attribute still
+				# carries the current nonce.
+				if ! grep -qx 'StartLimitIntervalSec=0' "$scrub"; then
+					echo "FAIL: the scrub unit has a start limit; a failed scrub would become terminal" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -E '^(After|Requires|Wants|BindsTo|PartOf)=' "$scrub" | grep -q 'cogworx-floor'; then
+					echo "FAIL: the scrub unit is ordered on the floor unit; the same-epoch stale attribute would survive" >&2
+					fails=$((fails + 1))
+				fi
+
+				# RestartMode=direct, not a nicety. Under the default the unit
+				# transits through failed on its way into auto-restart, which
+				# CANCELS the supervisor's start job for the rest of the boot --
+				# so one transient scrub failure permanently strands the instance
+				# in Booting while the scrub itself succeeds on retry #2.
+				if ! grep -qx 'RestartMode=direct' "$scrub"; then
+					echo "FAIL: the scrub unit is not RestartMode=direct; its first transient failure would cancel the supervisor's start job for the whole boot" >&2
+					fails=$((fails + 1))
+				fi
+
+				# The floor's live probes, and the empty-set fail-closed that
+				# stops a VACUOUS rule 2 from passing a shape-only check.
+				if ! grep -q '^ExecStartPost=.' "$floor"; then
+					echo "FAIL: the floor unit has no ExecStartPost; the ruleset would be installed but never verified" >&2
+					fails=$((fails + 1))
+				fi
+
+				# THE FIRST-BOOT SOURCE. cogworx-self-addrs is stamped EMPTY into
+				# every insert body (no address exists yet), so a floor unit with
+				# only that source refuses the boot of every freshly created
+				# sandbox and of every resolver VM -- neither of which gets a
+				# second chance to be repaired by a later Start. The install leg
+				# must therefore fall back to the metadata server's own interface
+				# addresses, and only an empty set from BOTH may fail the boot.
+				install=${gceFloorInstall}
+				if ! grep -qF 'network-interfaces' "$install"; then
+					echo "FAIL: the floor installer has no metadata-server fallback for cogworx-self-addrs; a first boot (empty attribute) would fail closed forever" >&2
+					fails=$((fails + 1))
+				fi
+				# RULE 2 IS A skuid RANGE OVER EVERY UID, SCOPED TO THE ORIGINAL
+				# DIRECTION OF A FLOW, and all three of those are load-bearing.
+				#
+				# It must carry a skuid EXPRESSION: a drop written as a bare `ip
+				# daddr <self> drop` also matches the KERNEL-GENERATED return
+				# packets of a same-host flow (the RST when nothing is listening),
+				# which carry the VM's own address as their destination and no
+				# owning socket at all -- so they can never match the skuid-scoped
+				# control-uid accept above and get swallowed by the drop below it.
+				#
+				# It must NOT be narrowed to named uids to get that property. An
+				# enumeration (`skuid cogbox-passt`, `skuid cogbox-proxy`) has a
+				# skuid expression and would pass the first half while leaving
+				# root-run and `nixbld*` in-VM plugin builds -- and passt's own
+				# pre-drop, root-owned listening sockets -- outside rule 2. A range
+				# is a skuid expression AND covers every uid, so it satisfies both;
+				# 4294967295 is (uid_t)-1 and never a real account.
+				#
+				# And it must be scoped to `ct direction original`, because the
+				# skuid range does NOT cover the return path once something is
+				# actually LISTENING. passt creates its port-forward listener
+				# BEFORE its privilege drop, so a real SYN-ACK has a real owning
+				# socket (fsuid 0), no NFT_BREAK happens, and its destination port
+				# is the CLIENT's ephemeral port -- unmatchable by any dport accept.
+				# The range deny would take cogbox ssh, Terminal,
+				# Console-over-ssh and the user SSH gateway down. Direction rather
+				# than `ct state new`: a
+				# state-scoped deny would additionally let a flow that survived a
+				# floor reload keep running, which the stateless rule did not.
+				#
+				# tests/test_floor.sh proves all of it on the RENDERED ruleset and,
+				# in its live section, against a REAL listener in a throwaway netns;
+				# these lines stop the format string itself from regressing.
+				if ! grep -qF 'meta skuid 0-4294967294 ct direction original ip daddr %s counter drop comment "cogworx-floor-rule2-self"' "$install"; then
+					echo "FAIL: the floor installer's rule-2 deny is not the every-uid, original-direction range; it has either lost its skuid match, been narrowed to named uids, or lost the direction scoping that keeps a real listener's reply out of the drop" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -F 'cogworx-floor-rule2-self' "$install" | grep -qF 'meta skuid "'; then
+					echo "FAIL: the floor installer renders a named-uid rule-2 deny; root-run and nixbld* plugin builds and passt's pre-drop sockets would be outside rule 2" >&2
+					fails=$((fails + 1))
+				fi
+				# RULE 3 IS THE LOOPBACK LEG, AND IT IS THE OPPOSITE SHAPE TO RULE
+				# 2 ON PURPOSE.
+				#
+				# Rule 2 covers the VM's own non-loopback addresses from every uid.
+				# It cannot cover loopback: the L7 remap funnel is a shim-side
+				# connect() rewrite to 127.0.0.1:<l7base> made by passt itself, and
+				# the trusted half's own components talk to each other there
+				# (l7proxy -> the mitm hop, mitmproxy -> its upstreams, the nix
+				# daemon, sshd). So loopback was left out of the floor entirely,
+				# and the property "a guest cannot address the enclosing VM's
+				# services" rested on passt alone: it drops tap frames carrying a
+				# loopback address (tap.c), and --no-map-gw removes the
+				# gateway->127.0.0.1 mapping. Both are upstream behaviors, so an
+				# independent floor remains necessary.
+				#
+				# Rule 3 supplies the missing layer: the passt uid, and only the
+				# passt uid, may not OPEN a flow to loopback except to the funnel's
+				# own targets. A skuid RANGE here would cut the trusted half's own
+				# loopback traffic, so this is the one rule that must stay
+				# uid-scoped -- the exact opposite of rule 2, and worth stating so
+				# a later reader does not "fix" the asymmetry.
+				if ! grep -qF 'ip daddr 127.0.0.0/8 counter drop comment "cogworx-floor-rule3-loopback"' "$install"; then
+					echo "FAIL: the floor installer renders no rule-3 loopback deny; the guest-to-loopback path would rest on passt's tap filter alone, with nothing in the floor behind it" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -F 'cogworx-floor-rule3-loopback' "$install" | grep -qF 'ct direction original'; then
+					echo "FAIL: the floor installer's rule-3 deny is not scoped to the original direction; it would swallow the L7 funnel's own SYN-ACK (daddr 127.0.0.1, client ephemeral port) and take L7 down the way the stateless rule-2 deny took cogbox ssh down" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -F 'cogworx-floor-rule3-loopback' "$install" | grep -qF 'meta skuid 0-4294967294'; then
+					echo "FAIL: the floor installer's rule-3 deny covers every uid; l7proxy, mitmproxy, the nix daemon and sshd all talk over this machine's loopback" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'cogworx-floor-rule3-l7-funnel' "$install"; then
+					echo "FAIL: the floor installer renders no rule-3 funnel exception; the L7 remap funnel connects to 127.0.0.1:<l7base> under the passt uid and would be dropped by the rule above" >&2
+					fails=$((fails + 1))
+				fi
+				# RULE 3'S SECOND AND LAST EXCEPTION: the VM's own DNS forwarder.
+				# It is there because guest/host resolution parity has no shape
+				# that leaves rule 1 alone -- passt re-emits the guest's
+				# intercepted DNS queries under the PASST uid, so a forwarding
+				# target of 169.254.169.254 is indistinguishable at nftables from
+				# the guest dialling the metadata API and rule 1 drops it
+				# (measured). Sending them to a root-run loopback forwarder moves
+				# that hop to a uid rule 1 does not name.
+				#
+				# THE CAP is the assertion that matters, not the presence: rule 3's
+				# accept set must be the funnel ports plus THIS ONE SOCKET, and the
+				# widening that would pass every other check here is a second
+				# accept line. Two accepts (udp + tcp) and two denies (v4 + v6) on
+				# top of the funnel accept is five rule-3 lines, exactly.
+				if ! grep -qF 'cogworx-floor-rule3-dns-forwarder' "$install"; then
+					echo "FAIL: the floor installer renders no rule-3 DNS-forwarder exception; passt's re-emitted guest DNS query is a loopback connect under the passt uid, so every sandbox on the VM would resolve nothing" >&2
+					fails=$((fails + 1))
+				fi
+				if [ "$(grep -cF 'cogworx-floor-rule3' "$install")" != 5 ]; then
+					echo "FAIL: the floor installer renders $(grep -cF 'cogworx-floor-rule3' "$install") rule-3 lines, expected 5 (funnel accept, DNS-forwarder udp+tcp accepts, v4 and v6 loopback denies); an added accept widens the passt uid's loopback reach" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -F 'cogworx-floor-rule3-dns-forwarder' "$install" | grep -qE 'dport [^ ]*[-{]'; then
+					echo "FAIL: the rule-3 DNS-forwarder exception carries a port range or set; it must name exactly one port, or it re-admits neighbouring loopback listeners" >&2
+					fails=$((fails + 1))
+				fi
+				verify=${gceFloorVerify}
+				for token in cogbox-passt cogbox-proxy 169.254.169.254 \
+					'rule 1, metadata API' 'rule 2, passt leg' 'rule 2, proxy leg' \
+					'rule 2 control-uid exception' 'Refusing the boot' \
+					'expected blocked' 'expected connected or refused' \
+					'rule 2 exempt-port return path' 'systemd-socket-activate' \
+					'rule 3, loopback leg' 'rule 3 L7 funnel exception' \
+					'rule 3 host DNS forwarder exception'; do
+					if ! grep -qF "$token" "$verify"; then
+						echo "FAIL: the floor verifier does not mention '$token'" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# PROBE POLARITY, and the one probe that is exempt from it. The
+				# control-uid EXCEPTION probe is proven healthy by "connected OR
+				# refused" and broken only by a DROP, because this unit runs before
+				# the supervisor that starts passt, so nothing can be listening on
+				# the guest SSH forward when the probe runs and a correct VM answers
+				# RST. Demanding a completed connection there would fail every boot
+				# of a correct image -- and the obvious remedy for that is to widen
+				# rule 2, which is the pressure the probe exists to resist.
+				#
+				# The RETURN-PATH probe demands "open" and is allowed to, because it
+				# binds its own root-owned listener on an exempt port first. That
+				# distinction matters: an
+				# empty port answers with a socket-less RST that breaks past the
+				# deny, so the exception probe reads healthy under a deny that eats
+				# every real reply. Deleting the return-path probe puts the image
+				# back in the state where nothing on the VM can see that bug.
+				if grep -qF 'expected reachable' "$verify"; then
+					echo "FAIL: the floor verifier still demands a reachable control-uid connect; nothing can listen on the guest SSH forward before the supervisor starts passt" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'expected open' "$verify"; then
+					echo "FAIL: the floor verifier no longer asserts a COMPLETED connection against its own listener on an exempt port; the same-host return path would be unverifiable before a sandbox starts" >&2
+					fails=$((fails + 1))
+				fi
+
+				# The in-VM store GC. "NixGCReconciler is unsupported" is a
+				# statement about the control plane; the boot disk still fills.
+				for u in cogworx-nix-gc.service cogworx-nix-gc.timer; do
+					if [ ! -e ${gceUnits}/$u ]; then
+						echo "FAIL: $u is missing" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# The resolver VM's in-VM self-destruct belt.
+				if [ ! -e ${gceUnits}/cogworx-resolver-deadline.service ]; then
+					echo "FAIL: cogworx-resolver-deadline.service is missing" >&2
+					fails=$((fails + 1))
+				fi
+				# ... and the belt's own FAIL-OPEN, which presence cannot see. The
+				# arm script decides "not a resolver boot" from a failed metadata
+				# read, and that verdict is `exit 0` under RemainAfterExit=true --
+				# a LATCH: Restart=on-failure never fires and the deadline never
+				# arms for the rest of the boot. So an unreachable endpoint must be
+				# a RETRY, never a verdict, and the only way to tell the two apart
+				# is to probe reachability first (the shape cogworx-attr-scrub
+				# already uses) before reading the flag. This is a static shape
+				# assertion because the unit has no executable test home: it takes
+				# no COGWORX_MD_BASE override, so unlike the floor and supervisor
+				# scripts it cannot be run against a file:// metadata tree.
+				arm=${gceResolverDeadlineScript}
+				if ! grep -qF 'instance/id' "$arm"; then
+					echo "FAIL: the resolver-deadline arm script does not probe metadata reachability before reading the cogworx-resolver flag; an unreachable endpoint would read as 'not a resolver boot' and latch an UNARMED self-destruct on a VM that evaluates attacker-controlled flakes" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'will retry' "$arm"; then
+					echo "FAIL: the resolver-deadline arm script has no retry path; every metadata failure would exit 0 and latch an unarmed deadline" >&2
+					fails=$((fails + 1))
+				fi
+				# The retry path must come BEFORE the flag read, or it is not the
+				# thing standing between an unreachable endpoint and the latch.
+				if [ "$(grep -n 'instance/id' "$arm" | head -n1 | cut -d: -f1)" -ge "$(grep -n 'attributes/cogworx-resolver' "$arm" | head -n1 | cut -d: -f1)" ]; then
+					echo "FAIL: the resolver-deadline arm script reads the cogworx-resolver flag before probing reachability; the unreachable case would still latch" >&2
+					fails=$((fails + 1))
+				fi
+
+				# A non-interactive `ssh <vm> cogbox <verb>` sources no profile, so
+				# without these three baked into the program itself every control
+				# verb exits 66. NAME-presence only: it says nothing about whether the
+				# wrapper can win against a value PAM already set, which is a separate
+				# and equally fatal failure -- see gce-cogbox-wrapper-env.
+				for v in XDG_CONFIG_HOME COGBOX_DATA XDG_RUNTIME_DIR; do
+					if ! grep -qF "$v" ${gceCogboxWrapper}/bin/cogbox; then
+						echo "FAIL: the cogbox wrapper does not set $v; control-channel verbs would exit 66" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The filesystem every other path assumed and nothing created. The mkfs
+			# guard is the load-bearing half: an unconditional mkfs on a resumed
+			# instance destroys the L7 CA private key, the secret store and the VM
+			# host key on every Start.
+			gce-image-state-disk-ordering = pkgs.runCommand "gce-image-state-disk-ordering" { } ''
+				fails=0
+				fstab=${gceToplevel}/etc/fstab
+				line=$(grep ' /var/lib/cogbox-state ' "$fstab" || true)
+				if [ -z "$line" ]; then
+					echo "FAIL: no /var/lib/cogbox-state entry in the realized fstab" >&2
+					fails=$((fails + 1))
+				fi
+				case "$line" in
+					'/dev/disk/by-id/google-cogworx-state '*) ;;
+					*) echo "FAIL: the state disk is not resolved through its fixed by-id deviceName: $line" >&2; fails=$((fails + 1)) ;;
+				esac
+				# sshd-keygen is what actually writes the host key, so ordering only
+				# sshd would still lose the race that regenerates it on the boot disk.
+				for dep in sshd-keygen.service sshd.service cogworx-supervisor.service cogworx-attr-scrub.service; do
+					case "$line" in
+						*"x-systemd.before=$dep"*) ;;
+						*) echo "FAIL: the state mount is not ordered before $dep: $line" >&2; fails=$((fails + 1)) ;;
+					esac
+				done
+				mkfs=${gceStateDiskScript}
+				if ! grep -qF 'blkid' "$mkfs"; then
+					echo "FAIL: the mkfs leg has no blkid guard; a resume would reformat the state disk" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'mkfs.ext4' "$mkfs"; then
+					echo "FAIL: the state-disk unit never formats anything" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# Serial classification. On GCE `console` is ttyS0, the port
+			# Backend.Log reads: provider-retained state outside the VM boundary,
+			# readable under a coarser grant than the control channel. cogbox.log
+			# carries l7proxy's per-request decisions and the mitmproxy
+			# credential-injection addon's output, so it must never land there.
+			#
+			# Scoped to the cogworx-* units this repository ships. The upstream
+			# getty/emergency/rescue units legitimately own a tty and carry no
+			# cogbox state; asserting over them would pin unrelated nixpkgs
+			# internals and say nothing about this invariant.
+			gce-image-serial-classes = pkgs.runCommand "gce-image-serial-classes" { } ''
+				fails=0
+				for u in ${gceUnits}/cogworx-*.service ${gceUnits}/cogworx-*.timer; do
+					[ -f "$u" ] || continue
+					if grep -E '^Standard(Output|Error)=' "$u" | grep -Eq 'console|tty'; then
+						echo "FAIL: $(basename "$u") sends a standard stream to console/tty:" >&2
+						grep -E '^Standard(Output|Error)=' "$u" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				sup=${gceUnits}/cogworx-supervisor.service
+				if ! grep -qx 'StandardOutput=journal' "$sup"; then
+					echo "FAIL: the supervisor is not StandardOutput=journal (journal+console would export the whole runtime log to serial)" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qx 'StandardError=journal' "$sup"; then
+					echo "FAIL: the supervisor is not StandardError=journal" >&2
+					fails=$((fails + 1))
+				fi
+				# The tail leg exists, but in its own journal-only unit.
+				script=${gceSuperviseScript}
+				if grep -v '^[[:space:]]*#' "$script" | grep -q 'cogbox\.log'; then
+					echo "FAIL: the supervisor script touches cogbox.log; that leg belongs in cogworx-cogbox-log.service" >&2
+					fails=$((fails + 1))
+				fi
+				logunit=${gceUnits}/cogworx-cogbox-log.service
+				if [ ! -e "$logunit" ]; then
+					echo "FAIL: cogworx-cogbox-log.service is missing; the runtime log has nowhere to go" >&2
+					fails=$((fails + 1))
+				elif ! grep -qx 'StandardOutput=journal' "$logunit"; then
+					echo "FAIL: cogworx-cogbox-log.service is not journal-only" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The substituter posture, as an assertion rather than prose. In-VM
+			# plugin builds process attacker-controlled flakes, so an unsigned
+			# substituter here is a cross-instance code-injection path.
+			# GUEST/HOST RESOLUTION PARITY, asserted against the realized image.
+			#
+			# THE PROPERTY. A cogbox guest must resolve names the way the host
+			# does, so an internal name resolves to its internal address -- what
+			# the local, k8s and container backends get for free because the guest
+			# inherits the host's resolver. Here it cannot: at the default
+			# `vpcResolver` the host's upstream IS the metadata address, and floor
+			# rule 1 denies the passt uid the whole of 169.254.0.0/16 in every
+			# mode. The first shape of this backend therefore advertised a PUBLIC
+			# resolver to the guest, which answers internal names publicly or not
+			# at all.
+			#
+			# THE MECHANISM, and why every leg below is load-bearing. passt is told
+			# to INTERCEPT the guest's queries (`--dns-forward`) and re-emit them
+			# to a loopback forwarder on the host (`--dns-host`), which is
+			# systemd-resolved's stub. But passt substitutes the --dns-forward
+			# address into its DHCP offer only when the nameserver it reads from
+			# /etc/resolv.conf is a LOOPBACK one (conf.c add_dns_resolv4). So:
+			# resolved must be enabled, resolv.conf must point at its stub,
+			# resolved's upstream must be the one `vpcResolver` names, and the units
+			# that depend on it must be ordered after it. Miss any one and the guest is
+			# handed the host's real resolver, rule 1 drops every query, and the
+			# sandbox comes up healthy resolving NOTHING -- precisely the failure
+			# mode nothing else in this flake can see.
+			gce-image-guest-dns = pkgs.runCommand "gce-image-guest-dns" { } ''
+				fails=0
+				# 1. The forwarder exists and /etc/resolv.conf names it. This is
+				#    the leg that makes passt advertise the forward address at all.
+				rc=${gceToplevel}/etc/resolv.conf
+				if [ ! -L "$rc" ]; then
+					echo "FAIL: /etc/resolv.conf is not the systemd-resolved stub symlink; passt would read the host's real resolver and advertise IT to the guest" >&2
+					fails=$((fails + 1))
+				elif [ "$(readlink "$rc")" != /run/systemd/resolve/stub-resolv.conf ]; then
+					echo "FAIL: /etc/resolv.conf points at $(readlink "$rc"), not resolved's stub" >&2
+					fails=$((fails + 1))
+				fi
+				if [ ! -e ${gceUnits}/systemd-resolved.service ] && [ ! -e ${gceUnits}/sysinit.target.wants/systemd-resolved.service ]; then
+					echo "FAIL: systemd-resolved is not enabled; nothing binds the loopback socket passt forwards guest DNS to" >&2
+					fails=$((fails + 1))
+				fi
+				# 2. Its upstream is the one `vpcResolver` names -- the VPC resolver
+				#    by default, or another full recursive resolver -- and it is
+				#    authoritative for every name. A resolved
+				#    that fell back to a public resolver would reproduce the exact
+				#    defect this replaced, quietly.
+				conf=${gceToplevel}/etc/systemd/resolved.conf
+				if ! grep -qx 'DNS=${gceCfg.cogworx.gce.vpcResolver}' "$conf"; then
+					echo "FAIL: resolved's upstream is not cogworx.gce.vpcResolver (${gceCfg.cogworx.gce.vpcResolver}); the guest and host would not resolve the same names, and internal names would not resolve internally" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qx 'Domains=~.' "$conf"; then
+					echo "FAIL: resolved's pinned upstream is not authoritative for all names (no 'Domains=~.'); some lookups would take another route" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qx 'FallbackDNS=' "$conf"; then
+					echo "FAIL: FallbackDNS is not explicitly empty; systemd's compiled-in PUBLIC resolver list would stand behind the configured upstream" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qx 'DNSStubListener=true' "$conf"; then
+					echo "FAIL: resolved's stub listener is off; the address passt forwards to would bind nothing" >&2
+					fails=$((fails + 1))
+				fi
+				# 3. The supervisor hands cogbox BOTH halves and the dependent
+				#    units are ordered after the forwarder. Ordering is not
+				#    cosmetic: before resolved is up /etc/resolv.conf is a DANGLING
+				#    symlink and passt advertises no resolver at all, and the
+				#    floor's probe 8 connects to the stub.
+				sup=${gceUnits}/cogworx-supervisor.service
+				if ! grep -q 'COGBOX_HOST_RESOLVER=${gceCfg.cogworx.gce.hostResolver}' "$sup"; then
+					echo "FAIL: the supervisor unit does not carry COGBOX_HOST_RESOLVER=${gceCfg.cogworx.gce.hostResolver}; passt would have no pinned forwarding target and cogbox init no --dns-host seed" >&2
+					fails=$((fails + 1))
+				fi
+				for u in ${gceUnits}/cogworx-supervisor.service ${gceUnits}/cogworx-floor.service; do
+					if ! grep -q '^After=.*systemd-resolved.service' "$u"; then
+						echo "FAIL: $u is not ordered after systemd-resolved.service" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				# 4. The supervisor script's own two legs: the --dns-host seed that
+				#    keeps the L4 shim from dropping passt's re-emitted query, and
+				#    the refusal when resolv.conf does not name the forwarder.
+				sh=${gceSuperviseScript}
+				if ! grep -qF -- '--dns-host' "$sh"; then
+					echo "FAIL: the supervisor does not pass --dns-host to cogbox init; the L4 shim's loopback deny would eat passt's re-emitted guest DNS query and every rules-mode sandbox would resolve nothing" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'RESOLV_CONF' "$sh"; then
+					echo "FAIL: the supervisor never checks that resolv.conf names the forwarder; passt would silently advertise the host's real resolver to the guest" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# THE BOOT PATH MUST NOT DEPEND ON DNS, asserted because nothing else
+			# can see it. Every leg of the boot/control path names the metadata
+			# server by NAME -- the supervisor's readiness write and
+			# cogworx-instance read, the control-cert principal fetch, the floor's
+			# first-boot self-address fallback, the scrub, the resolver
+			# self-destruct belt, supervise.sh's MD base, and
+			# google-compute-config.nix's networking.timeServers -- while the only
+			# resolver any of them can reach is the SINGLE upstream `vpcResolver`
+			# names, which `Domains=~.` makes authoritative for every name with an
+			# empty FallbackDNS behind it.
+			#
+			# The /etc/hosts pin keeps metadata access independent of the
+			# configured resolver. This check asserts the realized file because
+			# several boot units depend on that property.
+			gce-image-metadata-pin = pkgs.runCommand "gce-image-metadata-pin" { } ''
+				fails=0
+				hosts=${gceToplevel}/etc/hosts
+				# The pin itself, asserted on the REALIZED file rather than on the
+				# option that wrote it: this image sets networking.hosts and
+				# google-compute-config.nix independently ships the same mapping
+				# through networking.extraHosts, so what matters is that at least
+				# one of them still lands in /etc/hosts.
+				if ! grep -E '^[[:space:]]*169\.254\.169\.254[[:space:]]' "$hosts" | grep -qE '(^|[[:space:]])metadata\.google\.internal([[:space:]]|$)'; then
+					echo "FAIL: /etc/hosts does not pin metadata.google.internal to 169.254.169.254; metadata access would depend on the configured resolver" >&2
+					fails=$((fails + 1))
+				fi
+				# `metadata` is the short alias google-compute-config.nix also
+				# ships; nothing here uses it, but a pin that names only one of the
+				# two would be a surprise for an operator debugging by hand.
+				if ! grep -E '^[[:space:]]*169\.254\.169\.254[[:space:]]' "$hosts" | grep -qE '(^|[[:space:]])metadata([[:space:]]|$)'; then
+					echo "FAIL: /etc/hosts pins metadata.google.internal but not the short 'metadata' alias" >&2
+					fails=$((fails + 1))
+				fi
+				# OUR OWN CONTRIBUTION, asserted separately, and the realized-file
+				# legs above are exactly why it has to be: they pass on either
+				# source, so deleting this module's `networking.hosts` line stays
+				# green on google-compute-config.nix's extraHosts alone. That is the
+				# invariant the duplication exists for -- inheriting a boot-critical
+				# mapping from another module's default is how it vanishes in a
+				# nixpkgs bump -- and it is invisible to a check that only reads the
+				# merged output. Same asymmetry gce-image-control-pam closes with an
+				# order comparison: the property that matters is not fully
+				# observable in the artifact, so assert the source too. Both legs
+				# stay: this one alone would pass an image whose /etc/hosts was
+				# emptied downstream.
+				pinned='${lib.concatStringsSep " " (gceCfg.networking.hosts."169.254.169.254" or [ ])}'
+				for name in metadata.google.internal metadata; do
+					case " $pinned " in
+						*" $name "*) ;;
+						*) echo "FAIL: this module's own networking.hosts no longer pins '$name' to 169.254.169.254 (it carries: $pinned); the realized /etc/hosts would then rest entirely on google-compute-config.nix's extraHosts default, which is not ours to rely on" >&2
+							fails=$((fails + 1)) ;;
+					esac
+				done
+				# THE OTHER HALF, and the one a reader of /etc/hosts alone would
+				# miss: nss reaches `files` only when resolved is UNAVAIL (this
+				# image's order is
+				# `hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns`),
+				# so on a HEALTHY VM the component that has to honour the pin is
+				# systemd-resolved, which does so by reading /etc/hosts itself
+				# (ReadEtcHosts, default yes). Turning that off would undo the pin
+				# while leaving /etc/hosts looking correct. systemd's
+				# parse_boolean() also takes `n` and `f`, so the spellings are
+				# matched, not just the words. NOT covered: a drop-in under
+				# resolved.conf.d/, which this image does not use.
+				rconf=${gceToplevel}/etc/systemd/resolved.conf
+				if grep -qiE '^[[:space:]]*ReadEtcHosts[[:space:]]*=[[:space:]]*(n|no|f|false|off|0)[[:space:]]*$' "$rconf"; then
+					echo "FAIL: resolved is configured with ReadEtcHosts off; the /etc/hosts metadata pin would be bypassed on every healthy boot, since nss consults 'files' only when resolved is unavailable" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			gce-image-nix-conf = pkgs.runCommand "gce-image-nix-conf" { } ''
+				fails=0
+				conf=${gceToplevel}/etc/nix/nix.conf
+				if grep -Eq '^require-sigs[[:space:]]*=[[:space:]]*false' "$conf"; then
+					echo "FAIL: require-sigs is disabled in the image's nix.conf" >&2
+					fails=$((fails + 1))
+				fi
+				subs=$(grep -E '^substituters[[:space:]]*=' "$conf" | cut -d= -f2- || true)
+				for s in $subs; do
+					case "$s" in
+						https://cache.nixos.org|https://cache.nixos.org/|https://cache.numtide.com|https://cache.numtide.com/) ;;
+						*) echo "FAIL: unexpected substituter '$s' in the image's nix.conf" >&2; fails=$((fails + 1)) ;;
+					esac
+				done
+				# A trusted-substituters entry lets an unprivileged caller opt into a
+				# cache the operator never vetted.
+				extra=$(grep -E '^trusted-substituters[[:space:]]*=' "$conf" | cut -d= -f2- || true)
+				if [ -n "$(echo "$extra" | tr -d '[:space:]')" ]; then
+					echo "FAIL: trusted-substituters is non-empty: $extra" >&2
+					fails=$((fails + 1))
+				fi
+				for key in 'cache.nixos.org-1:' 'niks3.numtide.com-1:'; do
+					if ! grep -E '^trusted-public-keys[[:space:]]*=' "$conf" | grep -qF "$key"; then
+						echo "FAIL: no trusted-public-key for $key; its substituter would fail closed or be unsigned" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The control CA is a BAKE-TIME input with no usable default, and the
+			# runbook has to have a supported way to supply it. Without one an
+			# operator builds `.#gce-image` literally, publishes an image whose
+			# sshd trusts no CA, and every certificate cogworxd mints is refused
+			# -- every instance wedges in Booting with a build-time warning as the
+			# only diagnostic. The existing sshd check cannot see this: it greps
+			# for `TrustedUserCAKeys`, which is set unconditionally regardless of
+			# whether the file it points at has any content.
+			gce-image-control-ca = pkgs.runCommand "gce-image-control-ca" {
+				bakedCA = gceBakedCAText;
+				defaultCA = gceDefaultCAText;
+				bakedExtraCA = gceBakedExtraCAText;
+			} ''
+				fails=0
+				# The DEFAULT config is fail-closed, deliberately: an empty file
+				# admits nothing. This is asserted so that "the bake step is
+				# optional" can never become true by accident.
+				if [ -n "$(printf '%s' "$defaultCA" | tr -d '[:space:]')" ]; then
+					echo "FAIL: the default gce host bakes a control CA; the fail-closed default is the only thing making the bake step mandatory" >&2
+					fails=$((fails + 1))
+				fi
+				# The documented seam actually reaches sshd's TrustedUserCAKeys.
+				case "$bakedCA" in
+					*"${gceBakeCAKey}"*) ;;
+					*) echo "FAIL: lib.mkGceHost's controlCAPublicKey override does not reach /etc/ssh/cogworx-control-ca.pub; the runbook's bake step would silently produce a CA-less image" >&2
+						fails=$((fails + 1)) ;;
+				esac
+				# AND THE MERGE-ABLE SEAM, which exists because the alternative
+				# regressed once: TrustedUserCAKeys is forced, so a composed
+				# profile's own definition there loses with no error and no log
+				# line. extraTrustedUserCAKeys is where such a CA is meant to land,
+				# and it is only useful if BOTH keys survive into the one file sshd
+				# reads -- the control CA it must never lose, plus the contributed
+				# one, on separate lines (`sshkey_in_file` reads line by line).
+				case "$bakedExtraCA" in
+					*"${gceBakeCAKey}"*) ;;
+					*) echo "FAIL: extraTrustedUserCAKeys displaced the baked control CA; the control channel would trust the wrong CA and every certificate cogworxd mints would be refused" >&2
+						fails=$((fails + 1)) ;;
+				esac
+				case "$bakedExtraCA" in
+					*"${gceBakeExtraCAKey}"*) ;;
+					*) echo "FAIL: cogworx.gce.extraTrustedUserCAKeys does not reach /etc/ssh/cogworx-control-ca.pub; a composed profile's user CA has nowhere to land and would be dropped silently by the mkForce on TrustedUserCAKeys" >&2
+						fails=$((fails + 1)) ;;
+				esac
+				if [ "$(printf '%s' "$bakedExtraCA" | grep -c .)" != 2 ]; then
+					echo "FAIL: the baked CA file holds $(printf '%s' "$bakedExtraCA" | grep -c .) key lines, expected 2 (control CA + one contributed); a joined or blank-padded file is not what sshd parses" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The control account's local PAM rule must precede any remote
+			# directory-backed account module added through extraModules.
+			#
+			# THE ORDER IS NOT ASSERTED HERE, on purpose. It is derived in the
+			# module from the minimum order of every other account rule, and the
+			# comparison lives in that module's `assertions` -- which is where it
+			# has to be, because the config that ships is an operator bake with a
+			# profile composed in and a flake check can only ever see the default
+			# host. An assertion travels into that build; this derivation cannot.
+			# What is left here is everything the assertion does NOT cover: the
+			# rendered SHAPE of the rule, which no option comparison can see.
+			gce-image-control-pam = pkgs.runCommand "gce-image-control-pam" {
+				pamSshd = gcePamSshd;
+			} ''
+				fails=0
+				printf '%s' "$pamSshd" > pam.sshd
+				acct=$(grep '^account ' pam.sshd || true)
+				first=$(printf '%s\n' "$acct" | head -n1)
+				# FIRST, or it is not an exemption: a `default=bad`/`die` module
+				# above it decides the phase before it is reached.
+				case "$first" in
+					*'pam_succeed_if.so quiet user = ${gceCfg.cogworx.gce.controlUser}'*) ;;
+					*) echo "FAIL: the first sshd account rule is not the control user's local short-circuit, it is: $first" >&2
+						echo "      a directory-backed account module above it refuses the control certificate whenever its daemon is down" >&2
+						fails=$((fails + 1)) ;;
+				esac
+				# `sufficient` is what ENDS the phase. `optional`/`required` here
+				# would let the stack carry on into the directory module and lose.
+				case "$first" in
+					'account sufficient '*) ;;
+					*) echo "FAIL: the control user's account rule is not 'sufficient', so the account phase does not end at it: $first" >&2
+						fails=$((fails + 1)) ;;
+				esac
+				# Matching on the PAM user NAME, not on uid: a uid comparison makes
+				# pam_succeed_if resolve the account through NSS, which is the same
+				# directory this rule exists to stay independent of.
+				case "$first" in
+					*' uid '*) echo "FAIL: the control user's account rule matches on uid, which sends pam_succeed_if through an NSS lookup -- the exemption must not depend on the directory it exempts" >&2
+						fails=$((fails + 1)) ;;
+				esac
+				# And pam_unix must still stand behind it, so a NON-control user is
+				# decided by a real module rather than by an empty stack.
+				if ! printf '%s\n' "$acct" | grep -q '^account required .*pam_unix.so'; then
+					echo "FAIL: the sshd account stack has no 'required pam_unix' behind the exemption" >&2
+					fails=$((fails + 1))
+				fi
+				# The ACCOUNT stack is the only one this rule may appear in. A copy
+				# that also landed in auth or session would be a second, unreviewed
+				# exemption on a phase whose semantics are not the one reasoned
+				# about here -- and it is the kind of thing a "make it symmetric"
+				# edit adds. The order relationship is asserted in the module (see
+				# above); this is the shape half.
+				if [ "$(grep -c 'pam_succeed_if.so quiet user = ${gceCfg.cogworx.gce.controlUser}' pam.sshd)" != 1 ]; then
+					echo "FAIL: the control user's pam_succeed_if rule appears $(grep -c 'pam_succeed_if.so quiet user = ${gceCfg.cogworx.gce.controlUser}' pam.sshd) times in the sshd PAM stack, expected exactly 1 (account only)" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The wrapper's --set / --set-default split, exercised rather than
+			# grepped. gce-image-unit-ordering above only proves the three NAMES
+			# appear in the wrapper, and that is exactly the check that passed while
+			# the entire control-verb surface would fail because NixOS sets
+			# `security.pam.services.sshd.startSession = true` whenever sshd uses PAM,
+			# so pam_systemd exports XDG_RUNTIME_DIR=/run/user/0 into every
+			# `ssh <vm> cogbox <verb>` BEFORE the wrapper runs, and --set-default
+			# cannot override an already-set variable. cogbox then looked for
+			# /run/user/0/cogbox-<name>/pid while the supervisor's runtime lives under
+			# /run/cogbox, so `cogbox status` answered 3 (stopped) on a HEALTHY
+			# sandbox and Terminal, Console, the liveness probe and every
+			# rule/secret/plugin mutation went down behind it.
+			#
+			# So this runs the REAL wrapper with the PAM value already in the
+			# environment, against a stub standing in for the cogbox binary, and pins
+			# BOTH directions: XDG_RUNTIME_DIR must be forced, and the other two must
+			# stay overridable (they are not set by anything in an ssh session, and a
+			# break-glass operator pointing cogbox at another state tree is the reason
+			# they are defaults). Flipping either is a decision, not a reflex -- if you
+			# mean it, update the per-variable reasoning in gce/cogbox-host.nix too.
+			gce-cogbox-wrapper-env = pkgs.runCommand "gce-cogbox-wrapper-env" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnused gnugrep ];
+			} ''
+				fails=0
+				sed 's|^exec .*|exec ${gceWrapperEnvStub} "$@"|' \
+					${gceCogboxWrapper}/bin/cogbox > wrapper
+				chmod +x wrapper
+				if ! grep -q '${gceWrapperEnvStub}' wrapper; then
+					echo "FAIL: could not retarget the wrapper's exec line at the stub; this check is vacuous" >&2
+					exit 1
+				fi
+				val() { grep "^$1=" | cut -d= -f2-; }
+
+				# 1. The PAM value must lose.
+				got=$(XDG_RUNTIME_DIR=/run/user/0 ./wrapper | val XDG_RUNTIME_DIR)
+				if [ "$got" != /run/cogbox ]; then
+					echo "FAIL: the wrapper did not force XDG_RUNTIME_DIR: with pam_systemd's /run/user/0 already set, cogbox saw '$got'" >&2
+					echo "      every control verb would address /run/user/0/cogbox-<name> while the supervisor runs under /run/cogbox" >&2
+					fails=$((fails + 1))
+				fi
+
+				# 2. With nothing set, all three still carry the baked paths -- the
+				#    original reason the wrapper exists (a bare `ssh host cmd` sources
+				#    no profile, and cogbox with no config/data path exits 66).
+				baked=$(env -u XDG_CONFIG_HOME -u COGBOX_DATA -u XDG_RUNTIME_DIR ./wrapper)
+				for pair in \
+					'XDG_CONFIG_HOME=${gceCfg.cogworx.gce.stateDir}/config' \
+					'COGBOX_DATA=${gceCfg.cogworx.gce.stateDir}/data/cogbox' \
+					'XDG_RUNTIME_DIR=/run/cogbox'; do
+					if ! printf '%s\n' "$baked" | grep -qxF "$pair"; then
+						echo "FAIL: an empty environment did not yield $pair; got: $(printf '%s' "$baked" | tr '\n' ' ')" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# 3. The two that PAM does not own stay overridable.
+				got=$(XDG_CONFIG_HOME=/var/empty/alt-config ./wrapper | val XDG_CONFIG_HOME)
+				if [ "$got" != /var/empty/alt-config ]; then
+					echo "FAIL: XDG_CONFIG_HOME is now forced ('$got'); nothing in an ssh session sets it, and forcing it removes the break-glass override" >&2
+					fails=$((fails + 1))
+				fi
+				got=$(COGBOX_DATA=/var/empty/alt-data ./wrapper | val COGBOX_DATA)
+				if [ "$got" != /var/empty/alt-data ]; then
+					echo "FAIL: COGBOX_DATA is now forced ('$got'); the name is cogbox-private, so no PAM module or unit can be setting it" >&2
+					fails=$((fails + 1))
+				fi
+
+				# 4. The forced value must be the SAME runtime dir the supervisor uses.
+				#    Neither side can detect a mismatch alone.
+				rt=$(env -u XDG_RUNTIME_DIR ./wrapper | val XDG_RUNTIME_DIR)
+				if ! grep -qF "XDG_RUNTIME_DIR=$rt" ${gceUnits}/cogworx-supervisor.service; then
+					echo "FAIL: the wrapper forces XDG_RUNTIME_DIR=$rt but the supervisor unit does not use it; the control channel and the supervisor would address different sandboxes" >&2
+					fails=$((fails + 1))
+				fi
+
+				# 5. A control-channel exec must learn the proxy uid split, and learn
+				#    the SAME one the supervisor exports. This image runs the L7 proxy
+				#    on its own uid, so the inject render has to grant that identity
+				#    read on the cred files it names (rules/credgrant.zig) -- and binds
+				#    arrive on THIS path (`cogbox secret add -n` + `secret reload`),
+				#    which carries no unit Environment=. Unset here means the boot
+				#    render grants and every later bind does not: a Claude connect on a
+				#    running sandbox stays dead until a restart. A DIFFERENT value here
+				#    means the two renders grant to two different groups, which is the
+				#    same failure with an extra step.
+				runas=$(env -u COGBOX_PROXY_RUNAS ./wrapper | val COGBOX_PROXY_RUNAS)
+				if [ "$runas" = "<unset>" ] || [ -z "$runas" ]; then
+					echo "FAIL: the wrapper exports no COGBOX_PROXY_RUNAS, so a control-channel bind cannot grant the dropped L7 proxy read access to the credential it just bound" >&2
+					fails=$((fails + 1))
+				elif ! grep -qF "COGBOX_PROXY_RUNAS=$runas" ${gceUnits}/cogworx-supervisor.service; then
+					echo "FAIL: the wrapper exports COGBOX_PROXY_RUNAS=$runas but the supervisor unit exports something else; the boot render and the bind render would grant to different groups" >&2
+					fails=$((fails + 1))
+				fi
+
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The supervisor's orderings and refusals, none of which are visible in
+			# the unit file. See tests/test_supervise.sh for what each case guards.
+			gce-supervise-tests = pkgs.runCommand "gce-supervise-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gawk gnugrep ];
+			} ''
+				export HOME=$TMPDIR
+				bash ${./tests/test_supervise.sh} ${./gce/supervise.sh}
+				touch $out
+			'';
+
+			# The floor's RENDERED ruleset, its probe POLARITIES, and its live
+			# PACKET behaviour. None of the three is visible in the unit file, and
+			# none is something a grep over a printf format string can really
+			# prove, so this runs the real install leg against a file:// metadata
+			# tree and asserts on the nft file it writes, runs the real verify leg
+			# on a machine with no floor loaded at all, and finally loads the
+			# rendered ruleset into a throwaway user+network namespace and probes
+			# it with a REAL LISTENER bound on an exempt port. The cases cover a
+			# rule-2 deny with no skuid match, an exception probe that needs a
+			# listener before the supervisor starts passt, narrowing to named
+			# uids, and a deny that eats a real listener's SYN-ACK.
+			# util-linux/nftables/iproute2
+			# are for that last section, which SKIPS where the kernel cannot host
+			# it. See tests/test_floor.sh.
+			# systemd is here for the same reason the verifier reaches for it:
+			# section 5's rule-3 cases need a REAL listener on loopback, and
+			# systemd-socket-activate is already in this image's closure, so
+			# testing the floor adds no network utility to it.
+			gce-floor-tests = pkgs.runCommand "gce-floor-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnugrep util-linux nftables iproute2 systemd ];
+			} ''
+				export HOME=$TMPDIR
+				bash ${./tests/test_floor.sh} ${gceFloorInstall} ${gceFloorVerify}
+				touch $out
+			'';
 		});
 
 		nixosConfigurations = lib.listToAttrs (map (system: {
@@ -2349,6 +4019,14 @@
 				extraModules = cogboxModules system { target = "container"; };
 			};
 		}) supportedSystems) // {
+			# The GCE backend HOST system (see mkGceHost). x86_64 only: GCE
+			# nested virtualization is offered on Intel machine series only
+			# so there is no aarch64/riscv64 twin to generate.
+			# `packages.gce-image` builds this config's googleComputeImage; the
+			# gce-image-* checks assert its closure, userland and unit graph
+			# without needing the image itself.
+			cogbox-x86_64-gce = mkGceHost "x86_64-linux" { };
+
 			# Test fixture used by tests/cogbox.nix Phase E. Pre-builds
 			# a runner whose closure includes pkgs.hello, so the offline
 			# NixOS test machine has the cached output of the
@@ -2409,6 +4087,28 @@
 							# Plugin tools -> cogbox-brain's $out/bin (prepended to the
 							# container PATH). hello is the smallest real package; the brain
 							# build below asserts $out/bin/hello resolves.
+							packages = [ pkgs.hello ];
+							settings.claude-code = { model = "claude-opus-4-8"; };
+							settings.opencode = { model = "anthropic/claude-opus-4-8"; };
+							hooks.SessionStart = "true";
+						};
+					};
+				};
+			};
+			# CONTAINER analogue of the brain fixture above. The brain output is
+			# target-INDEPENDENT (identical runCommandLocal drv in both configs),
+			# but the container brain-materialize oneshot rebuilds it by evaluating
+			# THIS `-container` config -- so the container-brain-command check builds
+			# it here to exercise exactly the guest-half delivery path (commands /
+			# packages) when the boot rebuild evaluates the container config.
+			cogbox-x86_64-brain-fixture-container = mkContainer "x86_64-linux" "cogbox" {
+				extraModules = cogboxModules "x86_64-linux" {
+					target = "container";
+					userExt = { pkgs, lib, ... }: {
+						cogbox = {
+							contents = ./tests/fixtures/brain-plugin/contents;
+							mcp.demo-mcp = { command = "demo-mcp-server"; args = [ "--stdio" ]; env = { DEMO_MODE = "ro"; }; };
+							env = { DEMO_URL = "http://demo.example.com"; };
 							packages = [ pkgs.hello ];
 							settings.claude-code = { model = "claude-opus-4-8"; };
 							settings.opencode = { model = "anthropic/claude-opus-4-8"; };

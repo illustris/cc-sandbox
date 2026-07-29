@@ -22,6 +22,25 @@ pub const LaunchOpts = struct {
 	network: ?[]const u8,
 	auto_keys: bool,
 	yes: bool,
+	/// Address the guest's port forwards are advertised at (`.bindAddr`).
+	/// Seeded into config.json on first init; null keeps the 127.0.0.1 default.
+	bind_addr: ?[]const u8 = null,
+	/// Drop the filter's implicit port-53 allow for this instance
+	/// (`.network.implicitDns = false`). Off by default: on a host whose
+	/// resolver is a loopback address, the implicit allow is what makes guest
+	/// DNS work at all.
+	no_implicit_dns: bool = false,
+	/// Addresses of the ENCLOSING host, added to the L7 proxy's non-overridable
+	/// floor (`.network.selfAddrs`). Empty by default. Borrowed from argv or
+	/// caller-owned; `buildLaunchArgs` only reads it.
+	self_addrs: []const []const u8 = &.{},
+	/// The loopback address the ENCLOSING host runs its own DNS forwarder on
+	/// (`.network.dnsHost`). null by default. Paired with `no_implicit_dns`:
+	/// that flag puts loopback DNS back under the shim's loopback deny, and this
+	/// one re-admits the ONE socket passt re-emits the guest's queries on
+	/// (`--dns-forward` -> `--dns-host`), so the guest resolves what the host
+	/// resolves without any other loopback listener becoming reachable.
+	dns_host: ?[]const u8 = null,
 	/// Zig-side only (never forwarded to the bash script): attach the serial
 	/// console after the VM comes up instead of returning immediately.
 	foreground: bool,
@@ -62,11 +81,98 @@ pub fn buildLaunchArgs(
 		try args.append(allocator, try allocator.dupe(u8, "--network"));
 		try args.append(allocator, try allocator.dupe(u8, n));
 	}
+	if (opts.bind_addr) |b| {
+		try args.append(allocator, try allocator.dupe(u8, "--bind-addr"));
+		try args.append(allocator, try allocator.dupe(u8, b));
+	}
+	if (opts.no_implicit_dns) try args.append(allocator, try allocator.dupe(u8, "--no-implicit-dns"));
+	if (opts.dns_host) |h| {
+		try args.append(allocator, try allocator.dupe(u8, "--dns-host"));
+		try args.append(allocator, try allocator.dupe(u8, h));
+	}
+	for (opts.self_addrs) |s| {
+		try args.append(allocator, try allocator.dupe(u8, "--self-addr"));
+		try args.append(allocator, try allocator.dupe(u8, s));
+	}
 	if (!opts.auto_keys) try args.append(allocator, try allocator.dupe(u8, "--no-auto-keys"));
 	if (opts.yes) try args.append(allocator, try allocator.dupe(u8, "--yes"));
 	if (init_only) try args.append(allocator, try allocator.dupe(u8, "--init-only"));
 
 	return try args.toOwnedSlice(allocator);
+}
+
+// The bash script rejects an argument it does not know (exit 70), so a flag
+// that exists on one side only is a broken boot, not a warning. These pin the
+// forwarding for the four host-integration seeds, including the empty case
+// that every local and k8s launch takes.
+
+test "buildLaunchArgs forwards the host-integration seeds" {
+	const gpa = std.testing.allocator;
+	const self_addrs = [_][]const u8{ "10.0.0.1/32", "10.0.0.2/32" };
+	const argv = try buildLaunchArgs(gpa, .{
+		.name = "demo",
+		.vcpu = null,
+		.mem = null,
+		.network = "rules",
+		.auto_keys = true,
+		.yes = true,
+		.bind_addr = "10.0.0.1",
+		.no_implicit_dns = true,
+		.self_addrs = &self_addrs,
+		.dns_host = "127.0.0.53",
+		.foreground = false,
+		.no_ssh = false,
+	}, "/libexec/cogbox-launch.sh", true);
+	defer {
+		for (argv) |a| gpa.free(a);
+		gpa.free(argv);
+	}
+
+	var joined: std.ArrayList(u8) = .empty;
+	defer joined.deinit(gpa);
+	for (argv) |a| {
+		try joined.appendSlice(gpa, a);
+		try joined.append(gpa, ' ');
+	}
+	const s = joined.items;
+	try std.testing.expect(std.mem.indexOf(u8, s, "--bind-addr 10.0.0.1 ") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "--no-implicit-dns ") != null);
+	// One flag per address: collapsing them would shrink a security floor.
+	try std.testing.expect(std.mem.indexOf(u8, s, "--self-addr 10.0.0.1/32 ") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "--self-addr 10.0.0.2/32 ") != null);
+	try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, s, "--self-addr "));
+	// The guest-DNS seed travels with --no-implicit-dns or the rules-mode guest
+	// loses DNS entirely: the flag above is what puts loopback DNS back under
+	// the shim's loopback deny, and this is the one socket re-admitted to it.
+	try std.testing.expect(std.mem.indexOf(u8, s, "--dns-host 127.0.0.53 ") != null);
+}
+
+test "buildLaunchArgs omits the seeds entirely when unset" {
+	// The default-preserving guarantee at the argv layer: a launch that asks
+	// for none of this must produce the argv it produced before the flags
+	// existed.
+	const gpa = std.testing.allocator;
+	const argv = try buildLaunchArgs(gpa, .{
+		.name = null,
+		.vcpu = 4,
+		.mem = 2048,
+		.network = null,
+		.auto_keys = true,
+		.yes = false,
+		.foreground = false,
+		.no_ssh = false,
+	}, "/libexec/cogbox-launch.sh", false);
+	defer {
+		for (argv) |a| gpa.free(a);
+		gpa.free(argv);
+	}
+
+	try std.testing.expectEqual(@as(usize, 5), argv.len);
+	try std.testing.expectEqualStrings("/libexec/cogbox-launch.sh", argv[0]);
+	try std.testing.expectEqualStrings("--vcpu", argv[1]);
+	try std.testing.expectEqualStrings("4", argv[2]);
+	try std.testing.expectEqualStrings("--mem", argv[3]);
+	try std.testing.expectEqualStrings("2048", argv[4]);
 }
 
 /// Resolve the absolute path to a sibling libexec script by reading

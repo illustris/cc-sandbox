@@ -10,6 +10,15 @@ const config = @import("config.zig");
 const filter = @import("filter");
 const secret_mod = @import("secret_module");
 const secret_store = secret_mod.store;
+pub const credgrant = @import("credgrant.zig");
+
+/// The plugin tag every compiled git-grant L7 rule carries (cogworx stamps it
+/// via `l7 add/clear --plugin git-grants`; see cogworx gitgrants.go). It is a
+/// CROSS-REPO CONTRACT string. renderL7 emits it as the wire token `tag=` and
+/// renderL7Inject emits it as the inject-spec field `rules_tag`, so the mitmproxy
+/// addon injects the owner's token ONLY on a request a git-grant-tagged rule
+/// allows -- a coexisting whole-host allow grants reachability, not the credential.
+pub const git_grants_tag = "git-grants";
 
 /// True when L7 vhost filtering is active for this instance: `.network.l7` is
 /// an object with a non-empty `rules` array OR a non-empty
@@ -76,6 +85,17 @@ fn injectPort(obj: std.json.ObjectMap) ?u16 {
 	}
 }
 
+/// `.network.l7.rules` array (by value; shares the items pointer), or null when
+/// absent / not an array. Shared by the seedGitInjectSpecs fail-closed gate.
+fn l7Rules(network: std.json.Value) ?std.json.Array {
+	if (network != .object) return null;
+	const l7 = network.object.getPtr("l7") orelse return null;
+	if (l7.* != .object) return null;
+	const r = l7.object.getPtr("rules") orelse return null;
+	if (r.* != .array) return null;
+	return r.array;
+}
+
 fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
 	const r = rules orelse return false;
 	for (r.items) |item| {
@@ -91,8 +111,14 @@ fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
 }
 
 /// Render `.network` to wire-format rule lines for the LD_PRELOAD shim. Pure
-/// -- no I/O. Ordering on disk: L7 fail-closed denies, user CIDR rules, user
-/// remaps, then the auto-injected L7 funnel remaps.
+/// -- no I/O. Ordering on disk: host-topology directives (`no-implicit-dns`,
+/// `hard-deny`), L7 fail-closed denies, user CIDR rules, user remaps, then the
+/// auto-injected L7 funnel remaps.
+///
+/// The host-topology directives are written by whoever provisions the instance
+/// (`cogbox init --no-implicit-dns --self-addr --dns-host`), not by a user rule
+/// verb, and all default to absent: an instance whose `.network` carries none of
+/// those keys renders exactly what it rendered before they existed.
 ///
 /// When L7 is active we funnel all guest 80/443 to the host-side proxy and
 /// force everything else on those ports to fail closed:
@@ -105,6 +131,40 @@ fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
 pub fn renderRules(allocator: std.mem.Allocator, network: std.json.Value, l7_base: u16, out: *std.ArrayList(u8)) !void {
 	if (network != .object) return;
 	const l7 = l7Active(network);
+
+	// Host-topology directives, emitted FIRST -- ahead of the L7 fail-closed
+	// prologue, because `no-implicit-dns` is what subjects port 53 to it.
+	// Both keys are absent from every config this feature did not write, so a
+	// local or k8s instance renders byte-for-byte what it rendered before.
+	if (network.object.getPtr("implicitDns")) |v| {
+		if (v.* == .bool and !v.bool) try out.appendSlice(allocator, "no-implicit-dns\n");
+	}
+	// The enclosing host's own DNS forwarder, emitted next because it and the
+	// directive above are ONE mechanism: `no-implicit-dns` puts loopback DNS
+	// back under the shim's loopback deny, and passt's `--dns-forward` then
+	// re-emits every guest query as a loopback connect that the deny would eat.
+	// Absent by default, like every key in this block.
+	if (network.object.getPtr("dnsHost")) |v| {
+		if (v.* == .string and v.string.len > 0) {
+			try out.appendSlice(allocator, "dns-host ");
+			try out.appendSlice(allocator, v.string);
+			try out.append(allocator, '\n');
+		}
+	}
+	// One `hard-deny` per `.network.selfAddrs` entry: the enclosing host's own
+	// addresses, which the proxy's built-in floor cannot know. Placement is
+	// immaterial (the hard table is a set, not a first-match walk); they sit
+	// here for readability next to the directive above.
+	if (network.object.getPtr("selfAddrs")) |v| {
+		if (v.* == .array) {
+			for (v.array.items) |a| {
+				if (a != .string or a.string.len == 0) continue;
+				try out.appendSlice(allocator, "hard-deny ");
+				try out.appendSlice(allocator, a.string);
+				try out.append(allocator, '\n');
+			}
+		}
+	}
 
 	if (l7) {
 		// IPv6 fail-closed (all v6 TCP/UDP; DNS:53 still implicitly allowed)
@@ -240,10 +300,29 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 			try out.appendSlice(allocator, action);
 			try out.append(allocator, ' ');
 			try out.appendSlice(allocator, host);
+			// Order (mirrors the zig parser's order-independent tokenizer, but we
+			// emit deterministically): methods, /path, exact, service=<svc>.
+			if (r.object.getPtr("methods")) |mv| {
+				if (mv.* == .string and mv.string.len > 0) {
+					try out.append(allocator, ' ');
+					try out.appendSlice(allocator, mv.string);
+				}
+			}
 			if (r.object.getPtr("path")) |p| {
 				if (p.* == .string and p.string.len > 0) {
 					try out.append(allocator, ' ');
 					try out.appendSlice(allocator, p.string);
+				}
+			}
+			if (r.object.getPtr("pathmode")) |pm| {
+				if (pm.* == .string and std.mem.eql(u8, pm.string, "exact")) {
+					try out.appendSlice(allocator, " exact");
+				}
+			}
+			if (r.object.getPtr("service")) |sv| {
+				if (sv.* == .string and sv.string.len > 0) {
+					try out.appendSlice(allocator, " service=");
+					try out.appendSlice(allocator, sv.string);
 				}
 			}
 			if (r.object.getPtr("terminate")) |tv| {
@@ -254,6 +333,17 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 			}
 			if (r.object.getPtr("insecure_upstream")) |iv| {
 				if (iv.* == .bool and iv.bool) try out.appendSlice(allocator, " insecure");
+			}
+			// Injection-gating tag: a rule compiled from a git-grant carries
+			// plugin=="git-grants" -> emit the wire token `tag=git-grants`. Any
+			// other plugin value (or absent) renders untagged. The addon injects
+			// the owner's token only on a tagged rule's allow, so a coexisting
+			// whole-host allow yields reachability, not the credential.
+			if (r.object.getPtr("plugin")) |pv| {
+				if (pv.* == .string and std.mem.eql(u8, pv.string, git_grants_tag)) {
+					try out.appendSlice(allocator, " tag=");
+					try out.appendSlice(allocator, git_grants_tag);
+				}
 			}
 			try out.append(allocator, '\n');
 		}
@@ -293,8 +383,14 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 /// "anthropic-oauth" + the shared host stub_token sentinel, overriding whatever
 /// the spec declared: the addon's anthropic-oauth branch then stamps the real
 /// Bearer ONLY over that placeholder. No `refresh` block is ever emitted here --
-/// a setup-token is long-lived and bound once (S4.4). Every other kind keeps its
+/// a setup-token is long-lived and bound once. Every other kind keeps its
 /// existing spec-driven style + optional spec `stub` rendering unchanged.
+///
+/// `grants`, when non-null, collects the cred file of every EMITTED spec so the
+/// caller can make exactly those readable by the L7 proxy uid (credgrant.zig).
+/// It is noted at the same statement that writes `cred_file`, so what the proxy
+/// may read and what the conf names it can never diverge. Pass null to render
+/// without touching any store permissions.
 pub fn renderL7Inject(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -303,6 +399,7 @@ pub fn renderL7Inject(
 	instance_secrets_dir: []const u8,
 	out: *std.ArrayList(u8),
 	hosts_out: *std.ArrayList(u8),
+	grants: ?*credgrant.Grants,
 ) !void {
 	var arena_inst = std.heap.ArenaAllocator.init(allocator);
 	defer arena_inst.deinit();
@@ -328,10 +425,22 @@ pub fn renderL7Inject(
 			const oauth_kind = std.mem.eql(u8, resolved.meta.kind, secret_mod.anthropic_oauth_kind);
 			if (oauth_kind) style = secret_mod.anthropic_oauth_kind;
 
+			// A kind=gitlab-oauth secret (the per-user GitLab access-token bind)
+			// forces the gitlab-oauth inject style: the addon then picks basic auth
+			// (`git_user:<token>`) on git smart-HTTP paths and Bearer elsewhere.
+			const git_kind = std.mem.eql(u8, resolved.meta.kind, secret_mod.gitlab_oauth_kind);
+			if (git_kind) style = secret_mod.gitlab_oauth_kind;
+
 			var el: std.json.ObjectMap = .empty;
 			try el.put(arena, "host", .{ .string = host });
 			try el.put(arena, "style", .{ .string = style });
 			try el.put(arena, "cred_file", .{ .string = resolved.value_path });
+			// The proxy that will open that file may not be the uid that owns it
+			// (COGBOX_PROXY_RUNAS). Note it HERE, not from a later pass over the
+			// rendered conf: the only paths that can ever be granted are then the
+			// store paths this resolver produced, never a cred_file a config,
+			// plugin manifest or operator override supplied.
+			if (grants) |g| try g.note(resolved.value_path);
 			try el.put(arena, "cred_format", .{ .string = "raw" });
 			if (strField(spec.object, "cookieName")) |cn| {
 				try el.put(arena, "cookie_name", .{ .string = cn });
@@ -340,6 +449,23 @@ pub fn renderL7Inject(
 				// A setup-token is long-lived/static -> NO refresh block, just the
 				// stub the host redacted into the guest's cred file.
 				try el.put(arena, "stub_token", .{ .string = secret_mod.claude_stub_token });
+			} else if (git_kind) {
+				// The git username the addon pairs with the token for basic auth
+				// (default `oauth2`; a per-provider override may set spec.git_user).
+				// The git stub sentinel is wired for future glab staging; a
+				// credential-less `git` presents no auth, which should_inject also
+				// treats as inject-eligible. NO refresh block: cogworx is the single
+				// refresher and re-binds fresh tokens (GitLab refresh tokens are
+				// single-use), so an enforcer-side refresh would fork the lineage.
+				try el.put(arena, "git_user", .{ .string = strField(spec.object, "git_user") orelse secret_mod.default_git_user });
+				try el.put(arena, "stub_token", .{ .string = secret_mod.gitlab_stub_token });
+				// Gate injection on the git-grant tag: the addon injects this
+				// bound owner token ONLY on a request a `tag=git-grants` rule
+				// allows. A coexisting whole-host allow (network tab / admin /
+				// template / curated) then grants anonymous reachability, not the
+				// credential. Only the gitlab-oauth (git_kind) spec carries this;
+				// anthropic-oauth's whole-host allow-on-bound stays ungated.
+				try el.put(arena, "rules_tag", .{ .string = git_grants_tag });
 			} else if (strField(spec.object, "stub")) |st| {
 				try el.put(arena, "stub_token", .{ .string = st });
 			}
@@ -357,22 +483,20 @@ pub fn renderL7Inject(
 	try config.writeJqTab(allocator, out, .{ .array = arr });
 }
 
-/// Whether THIS render should seed the harness Claude inject spec: true ONLY in
-/// the container-enforcer context. cogworx sets BOTH enforcer-private secret-store
-/// overrides (COGBOX_GLOBAL_SECRETS_DIR / COGBOX_INSTANCE_SECRETS_DIR) exclusively
-/// on the enforcer (and the stopped-instance worker) pods -- never on the VM boot
-/// render or the non-enforcing single-pod agent -- so their presence is the
-/// "enforcement on + container target" signal with no extra wiring. Pure, so the
-/// gate is unit-testable. (Both must be set: an enforcer always sets both together.)
-pub fn seedClaudeInject(global_override: ?[]const u8, instance_override: ?[]const u8) bool {
-	return global_override != null and instance_override != null;
-}
-
-/// Whether the reserved per-user `claude-oauth` secret is actually BOUND in this
-/// instance's store (instance store shadowing global -- the same precedence
-/// renderL7Inject uses). The container seed (seedClaudeInjectSpec) is additionally
-/// gated on this so renderL7 / renderRules terminate-allow + funnel
-/// api.anthropic.com ONLY for a connected owner's sandbox.
+/// Whether a VALUE FILE EXISTS for the reserved per-user `claude-oauth` secret in
+/// this instance's store (instance store shadowing global -- the same precedence
+/// renderL7Inject uses). This is the SOLE gate on the claude seed
+/// (seedClaudeInjectSpec) so renderL7 / renderRules terminate-allow + funnel
+/// api.anthropic.com ONLY for a sandbox that HAS that file -- which cogworx writes
+/// on connect and removes on disconnect, hence "connected owner" in the prose below.
+///
+/// PRESENCE, not validity -- store.lookup derives `bound` from a bare access() on
+/// the value path, so a zero-byte value with no `.meta` also answers true and the
+/// terminate-allow is seeded for it. That is deliberate (it matches the
+/// pre-existing container semantics), and the injection itself still fails closed
+/// a layer down: renderL7Inject skips a spec whose secret has no audience, so such
+/// a secret yields a terminated host with an EMPTY inject conf -- the host is
+/// funnelled, nothing is ever stamped.
 ///
 /// 5a review gap #1: seeding on every enforce-ON container render made renderL7
 /// terminate-allow api.anthropic.com on EVERY container sandbox (superseding the L4
@@ -380,6 +504,14 @@ pub fn seedClaudeInject(global_override: ?[]const u8, instance_override: ?[]cons
 /// already triggers a re-render (secret-add hot-reload + the enforcer reconcile), so
 /// gating the seed on `bound` has no race -- a connect re-renders with the secret
 /// present, a disconnect re-renders with it gone. Reads the store, so NOT pure.
+///
+/// It used to be paired with a second gate -- "both COGBOX_*_SECRETS_DIR overrides
+/// are set" -- as a proxy for "am I the container enforcer". That proxy silently
+/// excluded the VM-family backends (gcp / k8s microVM): cogworx binds claude-oauth
+/// host-side there and stages the guest stub, but nothing seeded a spec naming the
+/// secret, so the bind was INERT and every VM sandbox reported "Not logged in".
+/// The bound-check alone is what carries the never-connected property, so the
+/// proxy gate is gone and every render path seeds.
 pub fn claudeOAuthBound(
 	arena: std.mem.Allocator,
 	io: std.Io,
@@ -396,7 +528,9 @@ pub fn claudeOAuthBound(
 /// declares -- with nothing naming that secret the bind is INERT. This is the
 /// load-bearing link the step-4 review flagged.
 ///
-/// Called only in the container-enforcer render (see seedClaudeInject). The spec is
+/// Called on EVERY render path (VM boot render, `secret reload`, the container
+/// enforcer render, and the rule/plugin-mutation reload), gated only on
+/// claudeOAuthBound. The spec is
 /// HARMLESS when the secret is unbound: renderL7Inject emits an element ONLY when the
 /// named secret is bound AND its audience == host, so a sandbox whose owner never
 /// connected Claude (or a non-claude harness) renders nothing for it. It is also
@@ -462,6 +596,114 @@ pub fn seedClaudeInjectSpec(arena: std.mem.Allocator, network: *std.json.Value) 
 	try specs.append(.{ .object = spec });
 }
 
+/// Ensure `.network.l7.inject.specs` exists as an array and return a pointer to
+/// it, creating `.l7` / `.l7.inject` / `.l7.inject.specs` on demand and folding a
+/// legacy bool `inject` into the object form. Returns null when `network` is not
+/// an object ("full"/"none" mode). Shared by the claude + git seeds.
+fn ensureInjectSpecs(arena: std.mem.Allocator, network: *std.json.Value) !?*std.json.Array {
+	if (network.* != .object) return null;
+	const l7 = blk: {
+		if (network.object.getPtr("l7")) |v| {
+			if (v.* == .object) break :blk v;
+		}
+		try network.object.put(arena, "l7", .{ .object = .empty });
+		break :blk network.object.getPtr("l7").?;
+	};
+	const inj = blk: {
+		if (l7.object.getPtr("inject")) |v| {
+			if (v.* == .object) break :blk v;
+		}
+		try l7.object.put(arena, "inject", .{ .object = .empty });
+		break :blk l7.object.getPtr("inject").?;
+	};
+	if (inj.object.getPtr("specs")) |v| {
+		if (v.* == .array) return &v.array;
+	}
+	try inj.object.put(arena, "specs", .{ .array = std.json.Array.init(arena) });
+	return &inj.object.getPtr("specs").?.array;
+}
+
+/// Seed an inject spec into `network.l7.inject.specs[]` for every BOUND secret
+/// of kind=gitlab-oauth in the GLOBAL + instance stores, so a per-user git
+/// access-token bind actually renders (renderL7Inject only iterates specs the
+/// config names -- the bind alone is inert). cogworx's `secret bind` writes the
+/// enforcer's GLOBAL store (COGBOX_GLOBAL_SECRETS_DIR) -- on the enforcer the
+/// instance dir typically doesn't even exist -- so both stores are enumerated,
+/// with an instance secret shadowing a global one of the same name (the same
+/// precedence resolveSecret / renderL7Inject use). Unlike the single reserved
+/// claude-oauth secret, the enforcer can't know the provider secret names a
+/// priori (they are `git-<provider>`), so it enumerates the stores. HARMLESS
+/// when nothing is bound.
+///
+/// Called on every render path (same as the claude seed -- the VM-family backends
+/// apply git-grant rules too, so gating this on "am I the enforcer" left the bind
+/// equally inert there). Its own gates are what keep it safe: kind, a bound value,
+/// an audience, and an l7 rule naming that host.
+/// Each spec NAMES the secret + declares style/host; renderL7Inject's audience
+/// pin + kind override drive the actual injection. Idempotent AND shadow-safe:
+/// skips only when a spec already names THAT secret for THAT host (a prior seed),
+/// so a foreign spec targeting the same host never suppresses the per-user bind.
+/// FAIL CLOSED: a bound gitlab-oauth secret whose host NO l7 rule names is NOT
+/// seeded at all (see the gate below) — unlike claude-oauth, whose whole-host
+/// allow-on-bound is intended. Mutates `network` in place; new values allocated
+/// in `arena`. Reads the store, so NOT pure.
+pub fn seedGitInjectSpecs(
+	arena: std.mem.Allocator,
+	io: std.Io,
+	network: *std.json.Value,
+	instance_secrets_dir: []const u8,
+	global_secrets_dir: []const u8,
+) !void {
+	// Union of both stores' bound names. A name present in both resolves to the
+	// instance value below (resolveSecret shadows), and the second occurrence is
+	// dropped by the shadow-safe idempotency check (same secret name + host), so
+	// no explicit dedupe is needed.
+	const instance_names = try secret_store.listBound(arena, io, instance_secrets_dir);
+	const global_names = try secret_store.listBound(arena, io, global_secrets_dir);
+	for ([_][]const []const u8{ instance_names, global_names }) |names| for (names) |name| {
+		const resolved = (try resolveSecret(arena, io, instance_secrets_dir, global_secrets_dir, name)) orelse continue;
+		if (!resolved.bound) continue;
+		if (!std.mem.eql(u8, resolved.meta.kind, secret_mod.gitlab_oauth_kind)) continue;
+		const audience = resolved.meta.audience orelse continue; // unset -> not injectable
+
+		// FAIL CLOSED: an inject-eligible host is not blanket-allowed. A
+		// gitlab-oauth bind is only ever meaningful TOGETHER with its compiled
+		// grant rules — a seeded spec whose host no L7 rule names would make
+		// renderL7 union a WHOLE-HOST `allow <host> terminate` (no path/service
+		// constraint), injecting the owner's token on every path. That state is
+		// reachable when a racy/buggy control plane clears the grant rules before
+		// removing the bound secret, so the enforcer must not trust the bind
+		// alone: skip the seed entirely (no spec -> no allow union, no inject
+		// conf; worst case 403s until the next render re-seeds it). The
+		// claude-oauth (anthropic-oauth) seed intentionally keeps its whole-host
+		// allow-on-bound behavior — this gate is gitlab-oauth-only.
+		if (!hostNamedInRules(l7Rules(network.*), audience)) continue;
+
+		const specs = (try ensureInjectSpecs(arena, network)) orelse return;
+		// Shadow-safe idempotency: skip only when OUR secret already names this host.
+		var already = false;
+		for (specs.items) |s| {
+			if (s != .object) continue;
+			const sn = strField(s.object, "secret") orelse continue;
+			if (!std.mem.eql(u8, sn, name)) continue;
+			const h = strField(s.object, "host") orelse continue;
+			if (std.mem.eql(u8, h, audience)) {
+				already = true;
+				break;
+			}
+		}
+		if (already) continue;
+
+		var spec: std.json.ObjectMap = .empty;
+		try spec.put(arena, "host", .{ .string = try arena.dupe(u8, audience) });
+		try spec.put(arena, "style", .{ .string = secret_mod.gitlab_oauth_kind });
+		try spec.put(arena, "secret", .{ .string = try arena.dupe(u8, name) });
+		try spec.put(arena, "git_user", .{ .string = secret_mod.default_git_user });
+		try spec.put(arena, "stub", .{ .string = secret_mod.gitlab_stub_token });
+		try specs.append(.{ .object = spec });
+	};
+}
+
 /// Resolve a named secret: an instance-produced secret (e.g. a sidecar-minted
 /// session) shadows a global operator-bound one of the same name.
 fn resolveSecret(
@@ -497,6 +739,12 @@ pub fn writeL7Rules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []con
 /// plain-HTTP inject-routing list). Resolves each spec's named secret against
 /// the per-instance then global store. Both files are written from the same
 /// pass so the proxy's HTTP routing can never drift from what the addon injects.
+///
+/// `proxy_gid` is the gid the L7 proxy was dropped to (COGBOX_PROXY_RUNAS,
+/// resolved by credgrant.proxyGidFromEnv), or null where reader and store owner
+/// are the same uid (container, k8s, local -- an exact no-op there). When set,
+/// this reconciles the store's permissions so that gid can read EXACTLY the cred
+/// files the conf being written names, and nothing else in the store.
 pub fn writeL7Inject(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -504,12 +752,22 @@ pub fn writeL7Inject(
 	network: std.json.Value,
 	global_secrets_dir: []const u8,
 	instance_secrets_dir: []const u8,
+	proxy_gid: ?credgrant.Gid,
 ) !void {
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
 	var hosts: std.ArrayList(u8) = .empty;
 	defer hosts.deinit(allocator);
-	try renderL7Inject(allocator, io, network, global_secrets_dir, instance_secrets_dir, &out, &hosts);
+	var grants = credgrant.Grants.init(allocator, proxy_gid);
+	defer grants.deinit();
+	try renderL7Inject(allocator, io, network, global_secrets_dir, instance_secrets_dir, &out, &hosts, &grants);
+	// BEFORE the conf is written, deliberately: the addon re-reads the conf when
+	// its mtime changes, so a cred file it is about to be told about has to be
+	// readable already or the first requests after a live bind fail closed on a
+	// file that is one syscall away from being readable. The revoke direction is
+	// safe in this order too -- the addon can only end up denying, never stamping
+	// a credential this render just took away.
+	try grants.apply(io, &.{ instance_secrets_dir, global_secrets_dir });
 	try writeRuntimeFile(allocator, io, runtime_dir, "l7-inject-conf.json", out.items);
 	try writeRuntimeFile(allocator, io, runtime_dir, "l7-inject-hosts", hosts.items);
 }
@@ -663,6 +921,148 @@ test "renderRules funnel targets the per-instance base ports" {
 	try std.testing.expect(std.mem.indexOf(u8, s, "18443") == null);
 }
 
+// The producer half of the port-53 parameterization and the l7proxy
+// self-address floor. Without these emissions the
+// parser and consumer sides are dead code and the realized image ships the
+// permissive defaults -- arbitrary-destination DNS and a floor that rests on
+// nftables alone.
+
+test "renderRules emits no-implicit-dns FIRST, ahead of the L7 fail-closed prologue" {
+	const gpa = std.testing.allocator;
+	const src = "{\"implicitDns\":false,\"l7\":{\"mode\":\"passthrough\",\"rules\":[{\"allow\":\"x.test\"}]}}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderRules(gpa, parsed.value, 18443, &out);
+	const s = out.items;
+	// First line, not merely present: the directive is what subjects port 53
+	// to the v6 fail-close below it, and parseRules is order-independent only
+	// because this is a directive rather than a rule -- keep the file readable
+	// in the order a human reasons about it.
+	try std.testing.expect(std.mem.startsWith(u8, s, "no-implicit-dns\n"));
+	try std.testing.expect(std.mem.indexOf(u8, s, "no-implicit-dns\n").? < std.mem.indexOf(u8, s, "deny tcp ::/0").?);
+	// And it round-trips through the parser the shim and the proxy both use.
+	try std.testing.expect(!filter.parseRules(s).implicit_dns_allow);
+}
+
+test "renderRules emits exactly one hard-deny per selfAddrs entry" {
+	const gpa = std.testing.allocator;
+	const src = "{\"selfAddrs\":[\"10.0.0.7/32\",\"10.0.0.8\"],\"rules\":[{\"allow\":\"0.0.0.0/0\"}]}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderRules(gpa, parsed.value, 18443, &out);
+	const s = out.items;
+	try std.testing.expect(std.mem.indexOf(u8, s, "hard-deny 10.0.0.7/32\n") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "hard-deny 10.0.0.8\n") != null);
+	try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, s, "hard-deny "));
+
+	// End to end: the rendered line reaches the proxy's floor.
+	const rs = filter.parseRules(s);
+	try std.testing.expectEqual(@as(usize, 2), rs.hard_len);
+	try std.testing.expect(rs.hardBlocked(.{ .ipv4 = .{ 10, 0, 0, 7 } }));
+	try std.testing.expect(rs.hardBlocked(.{ .ipv4 = .{ 10, 0, 0, 8 } }));
+	// The user rule layer is untouched by the floor emission.
+	try std.testing.expect(std.mem.indexOf(u8, s, "allow 0.0.0.0/0\n") != null);
+}
+
+test "renderRules ignores malformed selfAddrs entries" {
+	const gpa = std.testing.allocator;
+	const src = "{\"selfAddrs\":[\"\",42,{\"x\":1},\"10.0.0.7\"]}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderRules(gpa, parsed.value, 18443, &out);
+	try std.testing.expectEqualStrings("hard-deny 10.0.0.7\n", out.items);
+}
+
+test "renderRules output is byte-identical to today when neither key is set" {
+	// The default-preserving guarantee that keeps the local and k8s backends
+	// untouched: same JSON in, same bytes out as before the two keys existed.
+	// A regression here changes what every existing instance enforces on its
+	// next hot reload, silently.
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"rules":[{"deny":"169.254.0.0/16"},{"allow":"0.0.0.0/0"}],
+		\\ "remap":[{"from":"tcp 1.2.3.0/24:25","to":"tcp 127.0.0.1:12525"}],
+		\\ "l7":{"mode":"terminate","rules":[{"allow":"api.example.com","terminate":true}]}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderRules(gpa, parsed.value, 18443, &out);
+	try std.testing.expectEqualStrings(
+		\\deny tcp ::/0
+		\\deny udp ::/0
+		\\deny udp 0.0.0.0/0:443
+		\\deny udp 0.0.0.0/0:80
+		\\deny 169.254.0.0/16
+		\\allow 0.0.0.0/0
+		\\remap tcp 1.2.3.0/24:25 -> tcp 127.0.0.1:12525
+		\\remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443
+		\\remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:18444
+		\\
+	, out.items);
+	// And the parsed result keeps every permissive default.
+	const rs = filter.parseRules(out.items);
+	try std.testing.expect(rs.implicit_dns_allow);
+	try std.testing.expectEqual(@as(usize, 0), rs.hard_len);
+	try std.testing.expect(rs.dns_host == null);
+}
+
+// THE GUEST-DNS REGRESSION, renderer half. The GCE backend hands the guest a
+// resolver address passt INTERCEPTS (`--dns-forward`) and re-emits to a
+// loopback forwarder on the trusted half, so the guest resolves what the HOST
+// resolves -- internal names included. That re-emitted socket is a loopback
+// connect under the passt uid, and `no-implicit-dns` (which this backend always
+// passes) puts loopback DNS back under the shim's loopback deny. Without this
+// line the rules-mode guest has no DNS at all and nothing says so.
+test "renderRules emits dns-host beside no-implicit-dns and the pair round-trips" {
+	const gpa = std.testing.allocator;
+	const src = "{\"implicitDns\":false,\"dnsHost\":\"127.0.0.53\"," ++
+		"\"rules\":[{\"deny\":\"169.254.0.0/16\"},{\"allow\":\"0.0.0.0/0\"}]}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderRules(gpa, parsed.value, 18443, &out);
+	const s = out.items;
+	try std.testing.expect(std.mem.indexOf(u8, s, "dns-host 127.0.0.53\n") != null);
+	try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, s, "dns-host "));
+
+	// End to end through the parser the shim uses: the forwarder's socket is
+	// reachable, and nothing else about port 53 or loopback moved.
+	const rs = filter.parseRules(s);
+	try std.testing.expect(!rs.implicit_dns_allow);
+	try std.testing.expectEqual(filter.Action.allow, rs.evaluate(.udp, .{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
+	try std.testing.expectEqual(filter.Action.deny, rs.evaluate(.udp, .{ .ipv4 = .{ 169, 254, 169, 254 } }, 53));
+	try std.testing.expectEqual(filter.Action.deny, rs.evaluate(.tcp, .{ .ipv4 = .{ 127, 0, 0, 1 } }, 18445));
+}
+
+test "renderRules ignores an empty or non-string dnsHost" {
+	// Fail CLOSED on a malformed value rather than emitting `dns-host ` with an
+	// empty body, which parseDnsHostBody would drop anyway -- but silently, one
+	// layer further from whoever wrote the config.
+	const gpa = std.testing.allocator;
+	for ([_][]const u8{ "{\"dnsHost\":\"\"}", "{\"dnsHost\":42}", "{\"dnsHost\":null}" }) |src| {
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+		defer parsed.deinit();
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		try renderRules(gpa, parsed.value, 18443, &out);
+		try std.testing.expectEqualStrings("", out.items);
+	}
+}
+
 test "renderRules funnels non-standard inject-host ports (deduped, 80/443 excluded)" {
 	const gpa = std.testing.allocator;
 	const src =
@@ -738,7 +1138,7 @@ test "renderL7Inject: kind=anthropic-oauth forces style + the shared stub sentin
 	var hosts: std.ArrayList(u8) = .empty;
 	defer hosts.deinit(gpa);
 	// No global store needed (the instance store binds the secret).
-	try renderL7Inject(gpa, io, parsed.value, "zig-inject-test-no-global", inst_dir, &out, &hosts);
+	try renderL7Inject(gpa, io, parsed.value, "zig-inject-test-no-global", inst_dir, &out, &hosts, null);
 	const s = out.items;
 
 	try std.testing.expect(std.mem.indexOf(u8, s, "\"style\": \"anthropic-oauth\"") != null);
@@ -749,6 +1149,9 @@ test "renderL7Inject: kind=anthropic-oauth forces style + the shared stub sentin
 	try std.testing.expect(std.mem.indexOf(u8, s, "\"style\": \"bearer\"") == null);
 	// a setup-token is static -> no refresh block is ever emitted here
 	try std.testing.expect(std.mem.indexOf(u8, s, "refresh") == null);
+	// gating is gitlab-only: an anthropic-oauth spec carries NO rules_tag, so its
+	// whole-host allow-on-bound injection stays ungated (regression guard).
+	try std.testing.expect(std.mem.indexOf(u8, s, "rules_tag") == null);
 	// the host is mirrored into the plain-HTTP inject-routing list
 	try std.testing.expect(std.mem.indexOf(u8, hosts.items, "api.anthropic.com") != null);
 }
@@ -782,7 +1185,7 @@ test "renderL7Inject: a bearer-kind secret keeps the spec's style + spec stub (o
 	defer out.deinit(gpa);
 	var hosts: std.ArrayList(u8) = .empty;
 	defer hosts.deinit(gpa);
-	try renderL7Inject(gpa, io, parsed.value, "zig-inject-test-no-global", inst_dir, &out, &hosts);
+	try renderL7Inject(gpa, io, parsed.value, "zig-inject-test-no-global", inst_dir, &out, &hosts, null);
 	const s = out.items;
 
 	// Unchanged from before this feature: the spec's style + its own stub are used,
@@ -791,15 +1194,6 @@ test "renderL7Inject: a bearer-kind secret keeps the spec's style + spec stub (o
 	try std.testing.expect(std.mem.indexOf(u8, s, "spec-stub-keeps") != null);
 	try std.testing.expect(std.mem.indexOf(u8, s, secret_mod.claude_stub_token) == null);
 	try std.testing.expect(std.mem.indexOf(u8, s, "anthropic-oauth") == null);
-}
-
-test "seedClaudeInject gates strictly on BOTH enforcer-private secret-dir overrides" {
-	// Container enforcer/worker: both set -> seed. VM boot render / non-enforcing
-	// agent: neither (or only one, which never happens) set -> no seed.
-	try std.testing.expect(seedClaudeInject("/run/cogbox-secrets/global", "/run/cogbox-secrets/instance"));
-	try std.testing.expect(!seedClaudeInject(null, "/run/cogbox-secrets/instance"));
-	try std.testing.expect(!seedClaudeInject("/run/cogbox-secrets/global", null));
-	try std.testing.expect(!seedClaudeInject(null, null));
 }
 
 test "seedClaudeInjectSpec seeds the claude-oauth spec into l7.inject.specs (idempotent)" {
@@ -881,7 +1275,7 @@ test "seeded claude-oauth spec: renderL7Inject silent when unbound, emits when b
 		defer out.deinit(gpa);
 		var hosts: std.ArrayList(u8) = .empty;
 		defer hosts.deinit(gpa);
-		try renderL7Inject(gpa, io, net, "zig-inject-test-no-global", inst_dir, &out, &hosts);
+		try renderL7Inject(gpa, io, net, "zig-inject-test-no-global", inst_dir, &out, &hosts, null);
 		try std.testing.expect(std.mem.indexOf(u8, out.items, "anthropic-oauth") == null);
 		try std.testing.expect(std.mem.indexOf(u8, out.items, secret_mod.anthropic_api_host) == null);
 		try std.testing.expect(std.mem.indexOf(u8, hosts.items, secret_mod.anthropic_api_host) == null);
@@ -904,7 +1298,7 @@ test "seeded claude-oauth spec: renderL7Inject silent when unbound, emits when b
 		defer out.deinit(gpa);
 		var hosts: std.ArrayList(u8) = .empty;
 		defer hosts.deinit(gpa);
-		try renderL7Inject(gpa, io, net, "zig-inject-test-no-global", inst_dir, &out, &hosts);
+		try renderL7Inject(gpa, io, net, "zig-inject-test-no-global", inst_dir, &out, &hosts, null);
 		try std.testing.expect(std.mem.indexOf(u8, out.items, "\"style\": \"anthropic-oauth\"") != null);
 		try std.testing.expect(std.mem.indexOf(u8, out.items, "\"cred_format\": \"raw\"") != null);
 		try std.testing.expect(std.mem.indexOf(u8, out.items, secret_mod.claude_stub_token) != null);
@@ -1005,4 +1399,340 @@ test "gap #2: seed is shadow-safe -- appends when a DIFFERENT secret already cla
 	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
 	const specs2 = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
 	try std.testing.expectEqual(@as(usize, 2), specs2.items.len);
+}
+
+test "renderL7 emits methods / exact (pathmode) / service tokens (git grant rule)" {
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"l7":{"mode":"terminate","rules":[
+		\\  {"allow":"git.example.internal","methods":"POST","path":"/g/p.git/git-upload-pack","pathmode":"exact","plugin":"git-grants"},
+		\\  {"allow":"git.example.internal","methods":"GET,POST","path":"/grp/","service":"git-upload-pack","plugin":"git-grants"},
+		\\  {"allow":"cdn.example.internal","path":"/assets/"}
+		\\]}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, parsed.value, &out);
+	const s = out.items;
+	// exact rule: methods, path, exact -- in that order; a git-grant rule now
+	// ALSO carries the injection-gating `tag=git-grants` token (last).
+	try std.testing.expect(std.mem.indexOf(u8, s, "allow git.example.internal POST /g/p.git/git-upload-pack exact tag=git-grants\n") != null);
+	// prefix rule with a service constraint + comma method list, likewise tagged.
+	try std.testing.expect(std.mem.indexOf(u8, s, "allow git.example.internal GET,POST /grp/ service=git-upload-pack tag=git-grants\n") != null);
+	// a NON-git-grant rule (no plugin=="git-grants") renders UNTAGGED: it grants
+	// plain reachability and must never make the owner's token inject-eligible.
+	try std.testing.expect(std.mem.indexOf(u8, s, "allow cdn.example.internal /assets/ tag=") == null);
+	// The rendered (tagged) lines round-trip through the zig proxy parser
+	// unchanged -- proves the proxy tolerates `tag=` (parity guard).
+	var rs: filter.L7RuleSet = undefined;
+	filter.parseL7Rules(s, &rs);
+	try std.testing.expectEqual(filter.L7Verdict.allow, rs.evaluateFull("git.example.internal", "/g/p.git/git-upload-pack", "POST"));
+	try std.testing.expectEqual(filter.L7Verdict.deny, rs.evaluateFull("git.example.internal", "/grp/proj.git/git-receive-pack", "POST"));
+}
+
+test "renderL7Inject: kind=gitlab-oauth forces style + git_user + git stub, no refresh" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const inst_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(inst_dir);
+	defer cwd.deleteTree(io, inst_dir) catch {};
+
+	// Bind a per-user git access token the way cogworx's reconcile does: a
+	// git-<provider> secret, kind=gitlab-oauth, audience pinned to the git host.
+	// The VALUE is a fictional (OSS-clean) token.
+	try secret_store.add(gpa, io, inst_dir, "git-gitlab", "glpat-FAKEFAKEFAKEFAKE", .{
+		.audience = "git.example.internal",
+		.kind = secret_mod.gitlab_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	// The spec deliberately declares a DIFFERENT style: the kind must override it.
+	const src =
+		\\{"l7":{"mode":"terminate","inject":{"enabled":true,"specs":[
+		\\  {"host":"git.example.internal","style":"bearer","secret":"git-gitlab"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	var hosts: std.ArrayList(u8) = .empty;
+	defer hosts.deinit(gpa);
+	try renderL7Inject(gpa, io, parsed.value, "zig-inject-test-no-global", inst_dir, &out, &hosts, null);
+	const s = out.items;
+
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"style\": \"gitlab-oauth\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"cred_format\": \"raw\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"git_user\": \"oauth2\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, secret_mod.gitlab_stub_token) != null);
+	// the gitlab-oauth spec carries the injection-gating rules_tag so the addon
+	// injects only on a git-grant-tagged rule's allow.
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"rules_tag\": \"git-grants\"") != null);
+	// the declared bearer style did NOT win
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"style\": \"bearer\"") == null);
+	// a re-bind token is refreshed host-side by cogworx -> NO refresh block here
+	try std.testing.expect(std.mem.indexOf(u8, s, "refresh") == null);
+	// the host is mirrored into the plain-HTTP inject-routing list
+	try std.testing.expect(std.mem.indexOf(u8, hosts.items, "git.example.internal") != null);
+}
+
+test "seedGitInjectSpecs: seeds gitlab-oauth secrets bound in the GLOBAL store only (the cogworx `secret bind` shape; host named by a grant rule), idempotent + shadow-safe, silent when unbound" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	// Cogworx's `cogbox secret bind` writes the enforcer's GLOBAL store; the
+	// instance dir does not even exist on the enforcer. This test pins the
+	// global-only path.
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+
+	// Nothing bound yet -> the seed adds no spec.
+	{
+		const src = "{\"rules\":[{\"allow\":\"0.0.0.0/0\"}]}";
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+		defer parsed.deinit();
+		var net = parsed.value;
+		try seedGitInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+		// No git secret bound -> no l7 object need be created with specs.
+		if (net.object.getPtr("l7")) |l7| {
+			if (l7.object.getPtr("inject")) |inj| {
+				if (inj.object.getPtr("specs")) |sp| {
+					try std.testing.expectEqual(@as(usize, 0), sp.array.items.len);
+				}
+			}
+		}
+	}
+
+	// Bind a git secret (+ a non-git secret that must be ignored) -- GLOBAL only.
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.internal",
+		.kind = secret_mod.gitlab_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+	try secret_store.add(gpa, io, glob_dir, "api-token", "tok", .{
+		.audience = "api.example.com",
+		.kind = "bearer",
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	{
+		// A grant rule NAMES the git host (the compiled-rules + bind pair cogworx
+		// materializes together) -> the bound secret is seeded.
+		const src =
+			\\{"rules":[{"allow":"0.0.0.0/0"}],"l7":{"rules":[
+			\\  {"allow":"git.example.internal","methods":"GET","path":"/grp/","service":"git-upload-pack","plugin":"git-grants"}]}}
+		;
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+		defer parsed.deinit();
+		var net = parsed.value;
+		try seedGitInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+		const specs = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
+		// Exactly one spec: the git secret (the bearer secret is not seeded).
+		try std.testing.expectEqual(@as(usize, 1), specs.items.len);
+		const s0 = specs.items[0].object;
+		try std.testing.expectEqualStrings("git.example.internal", s0.get("host").?.string);
+		try std.testing.expectEqualStrings(secret_mod.gitlab_oauth_kind, s0.get("style").?.string);
+		try std.testing.expectEqualStrings("git-gitlab", s0.get("secret").?.string);
+		try std.testing.expectEqualStrings("oauth2", s0.get("git_user").?.string);
+
+		// The seeded spec drives BOTH inject outputs: the addon conf names the
+		// host and the plain-HTTP routing list carries it.
+		{
+			var out: std.ArrayList(u8) = .empty;
+			defer out.deinit(gpa);
+			var hosts: std.ArrayList(u8) = .empty;
+			defer hosts.deinit(gpa);
+			try renderL7Inject(gpa, io, net, glob_dir, inst_dir, &out, &hosts, null);
+			try std.testing.expect(std.mem.indexOf(u8, out.items, "git.example.internal") != null);
+			try std.testing.expect(std.mem.indexOf(u8, hosts.items, "git.example.internal") != null);
+		}
+
+		// Idempotent: re-seeding adds nothing.
+		try seedGitInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+		try std.testing.expectEqual(@as(usize, 1), net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array.items.len);
+	}
+
+	// Shadow-safe: a foreign spec already targeting the git host under a DIFFERENT
+	// secret name must NOT suppress the per-user seed.
+	{
+		const src =
+			\\{"l7":{"rules":[
+			\\  {"allow":"git.example.internal","methods":"GET","path":"/grp/","service":"git-upload-pack","plugin":"git-grants"}],
+			\\ "inject":{"specs":[
+			\\  {"host":"git.example.internal","style":"bearer","secret":"plugin-git","plugin":"obs-plugin"}]}}}
+		;
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+		defer parsed.deinit();
+		var net = parsed.value;
+		try seedGitInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+		const specs = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
+		try std.testing.expectEqual(@as(usize, 2), specs.items.len);
+		try std.testing.expectEqualStrings("plugin-git", specs.items[0].object.get("secret").?.string);
+		try std.testing.expectEqualStrings("git-gitlab", specs.items[1].object.get("secret").?.string);
+	}
+}
+
+test "seedGitInjectSpecs: unions both stores; an instance secret shadows a global one of the same name (single spec, instance audience wins)" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(inst_dir);
+	defer cwd.deleteTree(io, inst_dir) catch {};
+
+	// Same name in BOTH stores with different audiences: the instance bind must
+	// win (resolveSecret precedence) and the name must be seeded exactly once.
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE-GLOBAL", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+	try secret_store.add(gpa, io, inst_dir, "git-gitlab", "glpat-FAKE-INSTANCE", .{
+		.audience = "git.example.internal",
+		.kind = secret_mod.gitlab_oauth_kind,
+		.tier = "durable",
+		.bound_at = 2,
+	});
+	// And an instance-ONLY bind: the union must pick it up too.
+	try secret_store.add(gpa, io, inst_dir, "git-other", "glpat-FAKE-OTHER", .{
+		.audience = "git-alt.example.internal",
+		.kind = secret_mod.gitlab_oauth_kind,
+		.tier = "durable",
+		.bound_at = 3,
+	});
+
+	// Grant rules name ALL the candidate hosts so only precedence decides.
+	const src =
+		\\{"l7":{"rules":[
+		\\  {"allow":"git.example.com","methods":"GET","path":"/grp/","service":"git-upload-pack","plugin":"git-grants"},
+		\\  {"allow":"git.example.internal","methods":"GET","path":"/grp/","service":"git-upload-pack","plugin":"git-grants"},
+		\\  {"allow":"git-alt.example.internal","methods":"GET","path":"/grp/","service":"git-upload-pack","plugin":"git-grants"}]}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+	try seedGitInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+	const specs = net.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array;
+	try std.testing.expectEqual(@as(usize, 2), specs.items.len);
+	// git-gitlab resolved through the INSTANCE store: its audience, not the
+	// global one, and no duplicate for the global entry.
+	var saw_gitlab = false;
+	var saw_other = false;
+	for (specs.items) |s| {
+		const name = s.object.get("secret").?.string;
+		const host = s.object.get("host").?.string;
+		if (std.mem.eql(u8, name, "git-gitlab")) {
+			try std.testing.expectEqualStrings("git.example.internal", host);
+			saw_gitlab = true;
+		} else if (std.mem.eql(u8, name, "git-other")) {
+			try std.testing.expectEqualStrings("git-alt.example.internal", host);
+			saw_other = true;
+		}
+	}
+	try std.testing.expect(saw_gitlab);
+	try std.testing.expect(saw_other);
+}
+
+test "seedGitInjectSpecs fails closed: GLOBAL-bound gitlab-oauth + NO rule naming the host => no spec, no allow, no inject entry; anthropic-oauth unchanged" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	// Global store (the cogworx bind target), no instance dir -- the gate must
+	// hold on the production path too, not just for instance-bound secrets.
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+
+	// The exploit precondition a racy control plane can produce: the token still
+	// BOUND while the grant rules are already cleared (or never named the host).
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.internal",
+		.kind = secret_mod.gitlab_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	// L7 rules exist but none names the git host -> the seed must SKIP: no spec,
+	// so renderL7 never unions a whole-host `allow <host> terminate` and
+	// renderL7Inject emits no conf entry / routed host. Worst case is 403s until
+	// the next render re-seeds against a correct rule set.
+	const src =
+		\\{"l7":{"mode":"terminate","rules":[{"allow":"api.example.com"}]}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+	try seedGitInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+
+	// No spec was seeded for the git host.
+	if (net.object.getPtr("l7").?.object.getPtr("inject")) |inj| {
+		if (inj.object.getPtr("specs")) |sp| {
+			try std.testing.expectEqual(@as(usize, 0), sp.array.items.len);
+		}
+	}
+
+	// The rendered l7-rules carry NO allow line for the git host.
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		try renderL7(gpa, net, &out);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "git.example.internal") == null);
+	}
+
+	// The inject conf + routed-host list carry NO entry for it either.
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		var hosts: std.ArrayList(u8) = .empty;
+		defer hosts.deinit(gpa);
+		try renderL7Inject(gpa, io, net, glob_dir, inst_dir, &out, &hosts, null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "git.example.internal") == null);
+		try std.testing.expect(std.mem.indexOf(u8, hosts.items, "git.example.internal") == null);
+	}
+
+	// CONTRAST (must stay EXACTLY as today): a bound anthropic-oauth secret with
+	// zero rules naming its host still gets its whole-host terminate-allow — the
+	// gate above is gitlab-oauth-only. (Bound global, like a cogworx bind.)
+	try secret_store.add(gpa, io, glob_dir, secret_mod.claude_oauth_secret, "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKE", .{
+		.audience = secret_mod.anthropic_api_host,
+		.kind = secret_mod.anthropic_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		try renderL7(gpa, net, &out);
+		var allow_buf: [64]u8 = undefined;
+		const allow_line = std.fmt.bufPrint(&allow_buf, "allow {s} terminate", .{secret_mod.anthropic_api_host}) catch unreachable;
+		try std.testing.expect(std.mem.indexOf(u8, out.items, allow_line) != null);
+		// and still nothing for the git host
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "git.example.internal") == null);
+	}
 }

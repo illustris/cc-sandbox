@@ -363,6 +363,7 @@ fn worker(client_fd: c_int) void {
 
 	var host: []const u8 = undefined;
 	var path: ?[]const u8 = null;
+	var method: ?[]const u8 = null;
 	var is_tls = false;
 	var ech = false;
 	switch (cl) {
@@ -389,6 +390,7 @@ fn worker(client_fd: c_int) void {
 		.http => |p| {
 			host = p.host;
 			path = p.path;
+			method = p.method;
 		},
 	}
 	if (!filter.isValidHostName(host)) {
@@ -398,7 +400,7 @@ fn worker(client_fd: c_int) void {
 
 	lockRules();
 	const needs_term = l7_rs.needsTerminate(host);
-	const verdict = l7_rs.evaluate(host, path);
+	const verdict = l7_rs.evaluateFull(host, path, method);
 	const needs_inject = inject_hosts.contains(host);
 	unlockRules();
 
@@ -503,7 +505,14 @@ fn firstVettedAddr(host: []const u8, port: u16) ?filter.IpAddr {
 	while (it) |ai| : (it = ai.ai_next) {
 		const sa = ai.ai_addr orelse continue;
 		const ip = sockaddrToIp(sa) orelse continue;
-		if (filter.isHardBlocked(ip)) continue;
+		// Ruleset-aware floor: the built-in set PLUS this instance's
+		// `hard-deny` lines (the enclosing host's own addresses). Terminate
+		// hosts always matched an explicit allow, so this is the only gate
+		// standing between a hostile owner's A record and the host half.
+		lockRules();
+		const hard = cidr_rs.hardBlocked(ip);
+		unlockRules();
+		if (hard) continue;
 		return ip;
 	}
 	return null;
@@ -761,10 +770,16 @@ fn dialUpstream(host: []const u8, port: u16, supersede_l4: bool) ?c_int {
 		const sa = ai.ai_addr orelse continue;
 		const ip = sockaddrToIp(sa) orelse continue;
 
-		// Non-overridable hard floor (loopback / this-net / link-local+metadata).
+		// Non-overridable hard floor (loopback / this-net / link-local+metadata,
+		// plus this instance's `hard-deny` addresses -- the enclosing host's
+		// own, which an owner-controlled A record would otherwise turn into a
+		// guest-triggered relay into the host half under the proxy's uid).
 		// Applies even to an explicitly-allowed vhost.
-		if (filter.isHardBlocked(ip)) {
-			logLine("l7proxy: refusing {s}: resolves into a hard-blocked range (loopback/link-local/metadata)", .{host});
+		lockRules();
+		const hard = cidr_rs.hardBlocked(ip);
+		unlockRules();
+		if (hard) {
+			logLine("l7proxy: refusing {s}: resolves into a hard-blocked range (loopback/link-local/metadata/self)", .{host});
 			continue;
 		}
 		// For an unlisted (no_match) vhost, defer to the instance L4 policy. An
@@ -824,7 +839,8 @@ pub fn rawL4Eligible(mode: AcceptMode, funnel: bool) bool {
 
 /// The gate for an unclassifiable (non-HTTP/TLS) redirect flow. It may be spliced
 /// to its LITERAL kernel-provided orig dst only when BOTH gates pass: the
-/// non-overridable SSRF hard floor admits the IP, AND the instance's ordered
+/// non-overridable SSRF hard floor admits the IP -- the built-in ranges plus
+/// this instance's `hard-deny` addresses -- AND the instance's ordered
 /// first-match L4 CIDR policy does not deny (tcp, IP, port). Pure + default-deny
 /// (an empty/no-match ruleset evaluates to .deny -> false). Deliberately
 /// STRICTER than the named splice path: there is no vhost name to `allow`, so
@@ -832,7 +848,7 @@ pub fn rawL4Eligible(mode: AcceptMode, funnel: bool) bool {
 /// mirrors the in-guest LD_PRELOAD shim, which evaluates the literal connect()
 /// destination against the same rule engine.
 pub fn rawL4Allowed(rs: *const filter.RuleSet, orig: Orig) bool {
-	if (filter.isHardBlocked(orig.addr)) return false;
+	if (rs.hardBlocked(orig.addr)) return false;
 	return rs.evaluate(.tcp, orig.addr, orig.port) != .deny;
 }
 

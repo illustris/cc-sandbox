@@ -14,6 +14,12 @@ pub const LoadError = error{
 
 pub const Loaded = struct {
 	parsed: std.json.Parsed(std.json.Value),
+	/// The config.json path this tree came from, duped into the tree's arena
+	/// (so it frees with `deinit`). The secret-store directories are derived
+	/// from this path (rules_module.resolveSecretDirs), so a reload path that
+	/// only holds a `*Loaded` can still resolve the store -- without every
+	/// verb dispatcher threading the path through to maybeReload.
+	path: []const u8,
 
 	pub fn deinit(self: *Loaded) void {
 		self.parsed.deinit();
@@ -76,7 +82,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Loaded 
 	const parsed = std.json.parseFromSlice(std.json.Value, allocator, buf, .{}) catch {
 		return error.InvalidJson;
 	};
-	return .{ .parsed = parsed };
+	return .{ .parsed = parsed, .path = try parsed.arena.allocator().dupe(u8, path) };
 }
 
 /// Atomically write `value` as jq --tab formatted JSON to `path`.
