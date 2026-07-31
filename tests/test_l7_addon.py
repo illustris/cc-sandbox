@@ -565,7 +565,7 @@ check(csrf._last_attempt.get("sentinel") == 1.0,
 # git_user, the git stub sentinel, NO refresh block. The addon must raw-read the
 # token, pick basic auth (`git_user:<token>`) on git smart-HTTP paths and Bearer
 # on the REST API, and -- for credential-less `git` -- inject over the absent auth.
-GIT_STUB = "glpat-cogbox-host-injected-placeholder"
+GIT_STUB = "glpat-cogbox-host-injected-placeholder"  # gitleaks:allow
 _gitcred = os.path.join(_d, "git-gitlab")
 _write_raw(_gitcred, "glpat-REAL-ACCESS-TOKEN\n", 1000)
 _write(_conf, [{"host": "git.example.internal", "style": "gitlab-oauth",
@@ -921,7 +921,7 @@ def _set_rules(text):
 def _set_spec(with_tag):
     spec = {"host": _ghost, "style": "gitlab-oauth", "cred_file": _gcred,
             "cred_format": "raw", "git_user": "oauth2",
-            "stub_token": "glpat-cogbox-host-injected-placeholder"}
+            "stub_token": "glpat-cogbox-host-injected-placeholder"}  # gitleaks:allow
     if with_tag:
         spec["rules_tag"] = "git-grants"
     conf = os.path.join(_gd, "inject-%s.json" % with_tag)

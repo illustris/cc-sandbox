@@ -1495,7 +1495,7 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token 
         as_user("cogbox ssh --name injauto " + shlex.quote(
             "curl -sS --max-time 12 --cacert /run/cogbox/ca-bundle.crt "
             "--resolve api.anthropic.com:443:203.0.113.5 "
-            "-H 'Authorization: Bearer " + stub + "' -H 'x-api-key: guest-key' "
+            "-H 'Authorization: Bearer " + stub + "' -H 'x-api-key: guest-key' "  # gitleaks:allow
             "https://api.anthropic.com/v1/x | grep -q 'auth=Bearer " + fake_tok + "'")),
         timeout=20,
     )

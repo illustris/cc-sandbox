@@ -55,7 +55,7 @@ pub const gitlab_oauth_kind = "gitlab-oauth";
 /// stub-staging arrives (Phase 2); Phase 1 covers credential-less `git`, which
 /// needs no in-guest stub. Single-sourced so the (future) stub-stager and the
 /// renderer name one sentinel.
-pub const gitlab_stub_token = "glpat-cogbox-host-injected-placeholder";
+pub const gitlab_stub_token = "glpat-cogbox-host-injected-placeholder"; // gitleaks:allow
 
 /// The default git username for basic-auth git smart-HTTP injection. GitLab
 /// accepts any non-empty username paired with an OAuth2/PAT token as the
@@ -64,7 +64,7 @@ pub const gitlab_stub_token = "glpat-cogbox-host-injected-placeholder";
 pub const default_git_user = "oauth2";
 
 /// The reserved secret NAME cogworx binds the per-user Claude setup-token into
-/// kind=anthropic-oauth, audience=api.anthropic.com.
+/// kind=anthropic-oauth, audience=api.anthropic.com. // gitleaks:allow
 /// The container enforcer seeds an inject spec referencing THIS name so a bound
 /// token actually renders; the bind alone is inert without the spec. Single-sourced
 /// here so the seed, the renderer, and the cogworx bind all name one secret -- a
