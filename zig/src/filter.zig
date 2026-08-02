@@ -1074,16 +1074,69 @@ fn stripRootDot(host: []const u8) []const u8 {
 	return host;
 }
 
-/// Boundary-aware left-anchored prefix match. `rule_path` matches `req_path`
-/// iff they are equal, or `req_path` extends `rule_path` at a `/` boundary.
-/// e.g. `/api` matches `/api`, `/api/`, `/api/v1` but NOT `/apifoo`.
-/// Both inputs are expected pre-normalized.
+/// Boundary-aware left-anchored prefix match, with two single-segment wildcards.
+/// `rule_path` matches `req_path` iff they are equal, or `req_path` extends
+/// `rule_path` at a `/` boundary. e.g. `/api` matches `/api`, `/api/`, `/api/v1`
+/// but NOT `/apifoo`.
+///
+/// A rule segment that is exactly `*` matches EXACTLY ONE request segment and
+/// never spans a `/`: `/a/*/c` matches `/a/b/c` but not `/a/b/x/c` and not
+/// `/a/c`. A rule segment that is exactly `#` is the same thing NARROWED TO
+/// ASCII DIGITS: it matches one segment of `[0-9]+` and nothing else, so
+/// `/a/#/c` matches `/a/12/c` but not `/a/b/c`. A `*` or `#` that is not a whole
+/// rule segment (`/a*`, `/a/#b`) is a literal character, and either character in
+/// the REQUEST is always literal -- the request side is data and is never
+/// interpreted.
+///
+/// The rule stays a PREFIX: a rule ending in a wildcard (`/a/*`) still matches
+/// deeper paths, so an ALLOW must always terminate at a literal segment. That is
+/// necessary but NOT sufficient, which is why `#` exists. `req_path` is
+/// percent-DECODED before it gets here, so an encoded slash inflates one
+/// addressed segment into several, and `*` will happily absorb the first of
+/// them: with rule `/a/*/tail`, the request `/a/x%2Ftail/anything` decodes to
+/// `/a/x/tail/anything`, the literal tail lands on the id's OWN last component,
+/// and `/anything` rides through as ordinary prefix continuation. `#` closes
+/// that for an identifier that is numeric by construction (a GitLab project or
+/// group id), because the absorbed component would have to be all digits.
+/// A DENY still cannot be rescued either way -- a left-anchored matcher can
+/// never suffix-anchor one, so a tail deny simply stops matching the encoded
+/// form. Put the boundary in the allow, and make it `#` wherever the segment is
+/// a numeric id. See path_vectors.tsv.
+///
+/// `--exact` rules compare literally (`std.mem.eql`) and do NOT honour `*`/`#`.
+///
+/// Both inputs are expected pre-normalized on the REQUEST side only: rule paths
+/// are matched verbatim, never normalized. The shared vector table
+/// `l7proxy/path_vectors.tsv` is the oracle for this function AND for the
+/// mitmproxy addon's `path_match`; the two must agree byte for byte.
 pub fn pathPrefixMatches(rule_path: []const u8, req_path: []const u8) bool {
-	if (req_path.len < rule_path.len) return false;
-	if (!std.mem.startsWith(u8, req_path, rule_path)) return false;
-	if (req_path.len == rule_path.len) return true;
+	var ri: usize = 0;
+	var qi: usize = 0;
+	while (ri < rule_path.len) {
+		const c = rule_path[ri];
+		if ((c == '*' or c == '#') and
+			(ri == 0 or rule_path[ri - 1] == '/') and
+			(ri + 1 == rule_path.len or rule_path[ri + 1] == '/'))
+		{
+			const seg_start = qi;
+			while (qi < req_path.len and req_path[qi] != '/') : (qi += 1) {
+				// ASCII digits ONLY -- not a locale/unicode "is a digit" test. The
+				// addon side must make the same choice or the two matchers diverge on
+				// a UTF-8 decoded segment.
+				if (c == '#' and (req_path[qi] < '0' or req_path[qi] > '9')) return false;
+			}
+			if (qi == seg_start) return false; // never matches an empty segment
+			ri += 1;
+			continue;
+		}
+		if (qi >= req_path.len) return false;
+		if (c != req_path[qi]) return false;
+		ri += 1;
+		qi += 1;
+	}
+	if (qi == req_path.len) return true;
 	if (rule_path.len > 0 and rule_path[rule_path.len - 1] == '/') return true;
-	return req_path[rule_path.len] == '/';
+	return req_path[qi] == '/';
 }
 
 pub const L7Line = union(enum) {

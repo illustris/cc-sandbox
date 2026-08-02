@@ -1,0 +1,242 @@
+# SHARED L7 PATH-MATCHING VECTOR TABLE -- ONE file, read by THREE suites.
+#
+# The terminate tier (HTTPS, which is ALL git API traffic) is enforced by the
+# Python addon; the passthrough/cleartext tier by the Zig proxy. A disagreement
+# between the two matchers is a security bug, not a cosmetic one, so both read
+# THIS file as their oracle:
+#
+#   zig/src/l7proxy/path_vectors_test.zig   @embedFile -- http.normalizePath + filter.pathPrefixMatches
+#   tests/test_l7_addon.py                  reads it   -- l7-mitm-addon.normalize_path + path_match
+#
+# and cogworx (the rule PRODUCER) keeps a byte-identical mirror at
+# internal/web/testdata/path_vectors.tsv, asserted by TestSharedPathVectorMirror
+# so no wildcard pattern can be compiled whose semantics are not pinned here.
+# Changing one matcher fails its own suite; "fixing" the table for one matcher
+# fails the other, because there is only one table.
+#
+# TAB-separated. Blank lines and lines starting with `#` are comments.
+#
+#   norm <TAB> <raw request path> <TAB> <expected normalized path>
+#       The request-side pipeline: strip at the first `?` or `#`, percent-decode
+#       ONCE, then collapse empty segments (trailing slash kept).
+#
+#   reject <TAB> <raw request path> <TAB> <note>
+#       The normalizer REFUSES the path outright and the caller DENIES the
+#       request (403, no credential injected). See the dot-segment block below.
+#
+#   match <TAB> yes|no <TAB> <rule path> <TAB> <raw request path> <TAB> <note>
+#       The reader normalizes the RAW request path with its own normalizer and
+#       then runs its prefix matcher against the rule path verbatim. Rule paths
+#       are NEVER normalized -- that asymmetry is deliberate and pinned below.
+#       A raw path the normalizer rejects belongs in a `reject` row, not here.
+#
+# WILDCARD SEMANTICS. A rule-path segment that is exactly `*` matches EXACTLY
+# ONE request segment and never spans a `/`. A segment that is exactly `#` is the
+# same thing narrowed to ASCII DIGITS (`[0-9]+`). Either character outside a
+# whole segment is a literal, and either one in a REQUEST path is always literal.
+# Matching stays boundary-aware left-anchored PREFIX: a rule that ends in a
+# wildcard still matches deeper paths, which is why an ALLOW must always
+# terminate at a literal segment (see the `/api/v4/projects/*` row).
+#
+# TERMINATING AT A LITERAL IS NECESSARY BUT NOT SUFFICIENT -- that is why `#`
+# exists. `%2F` decodes into a real separator, so a client-chosen `:id` can
+# inflate into several segments, and `*` absorbs the FIRST of them; if the id's
+# own LAST component equals the rule's literal tail, the tail is consumed by the
+# id and everything after it rides through as ordinary prefix continuation. The
+# `tail absorption` block below pins that against the real GitLab shapes. `#`
+# closes it for an id that is numeric by construction, because the absorbed
+# component would then have to be all digits.
+
+# ---- normalization: query/fragment, empty segments, single-pass decode ----
+norm	/v1/x?q=1	/v1/x
+norm	/v1/x#frag	/v1/x
+norm	/v1/	/v1/
+norm	//a	/a
+norm	/a//b//	/a/b/
+norm	/%61dmin/x	/admin/x
+# Dots INSIDE a segment are ordinary data; only a whole `.`/`..` segment is one.
+norm	/a/..b/c...	/a/..b/c...
+# %2F DECODES INTO A REAL SEPARATOR. GitLab accepts a URL-encoded project path
+# as `:id`, so an encoded slash INFLATES one addressed segment into several --
+# the single fact the whole carve-out design turns on.
+norm	/api/v4/projects/grp%2Fproj	/api/v4/projects/grp/proj
+norm	/api/v4/projects/grp%2fproj/issues	/api/v4/projects/grp/proj/issues
+norm	/api/v4/projects/a%2Fb%2Fc/access_tokens	/api/v4/projects/a/b/c/access_tokens
+# Decoding is SINGLE-PASS: %25 -> `%`, never re-decoded into a separator.
+norm	/api/v4/projects/grp%252Fproj	/api/v4/projects/grp%2Fproj
+# A request may carry a literal `*` or `#`, encoded or not. It stays data. A raw
+# `#` is a FRAGMENT delimiter and is stripped with everything after it, so the
+# only way one reaches a segment is percent-encoded.
+norm	/a/*/b	/a/*/b
+norm	/a/%2A/b	/a/*/b
+norm	/a/%23/b	/a/#/b
+norm	/a/#/b	/a/
+
+# ---- dot segments are REFUSED, never collapsed ----
+# The enforcer decides on the NORMALIZED path but forwards the RAW one upstream,
+# so no normalization step may let those two strings name different resources.
+# Decoding is safe in that respect: `%2F` becomes a real separator, so it can
+# only ever ADD segments, which NARROWS a left-anchored rule. Popping `..` is the
+# one step that SUBTRACTS -- and `..%2F` puts it under the client's control, so a
+# raw path lexically under a DENY normalizes INTO an ALLOW while the origin stays
+# free to route the raw form. Refusing keeps "normalization only adds segments"
+# true; nothing in the GitLab REST API or git smart-HTTP needs a dot segment.
+reject	/api/../%61dmin/./x	a `.` and a `..` segment, one percent-encoded
+reject	/v1/%2e%2e/secret	`%2e%2e` decodes to a `..` segment
+reject	/../..	popping past the root
+reject	/a/./b	a bare `.` segment
+reject	/api/v4/projects/1234/issues/../issues/9	even a self-cancelling one
+reject	/api/v4/projects/1234/issues/..%2F..%2Faccess_tokens	walking OUT of an anchored allow
+reject	/api/v4/projects/1234/access_tokens/..%2Fissues	walking INTO the allow from under a deny
+reject	/api/v4/user/keys/..%2F..%2Fprojects%2F1%2Fissues	and in from under a blanket deny
+reject	/api/v4/groups/77/access_tokens/..%2F..%2F..%2Fprojects%2F1%2Fissues	the groups twin
+reject	/api/v4/projects/1234/packages/generic/n/1/..%2F..%2F..%2F..%2Fissues	from a glob-tailed route
+
+# ---- no wildcard: the pre-existing prefix semantics, unchanged ----
+match	yes	/api	/api	equal
+match	yes	/api	/api/	extends at a slash boundary
+match	yes	/api	/api/v1	subpath
+match	no	/api	/apifoo	not a segment boundary
+match	no	/api	/ap	shorter than the rule
+match	yes	/v1/	/v1/x	trailing-slash rule covers the subtree
+match	yes	/v1/	/v1/	trailing-slash rule, exact hit
+match	no	/v1/	/v1	trailing-slash rule is strict
+match	yes	/	/anything/deep	the root prefix covers everything
+
+# ---- `*` matches exactly one segment ----
+match	yes	/a/*	/a/b	one segment
+match	no	/a/*	/a/	never matches an empty segment
+match	no	/a/*	/a	the segment is not optional
+match	yes	/a/*	/a/b/c	a rule ending in `*` is STILL a prefix rule
+match	yes	/a/*/c	/a/b/c	middle position
+match	no	/a/*/c	/a/b/x/c	never spans a slash
+match	no	/a/*/c	/a/c	not optional in the middle either
+match	yes	/a/*/c	/a/b/c/d	the prefix continues at a boundary
+match	no	/a/*/c	/a/b/cd	still boundary-aware after the star
+match	no	/a/*/c	/a//c	the empty segment collapses; nothing to consume
+match	yes	/*/b	/a/b	first position
+match	yes	/a/*/c/*/e	/a/b/c/d/e	two stars
+match	no	/a/*/c/*/e	/a/b/c/d/x/e	neither star spans
+match	yes	/a/*/	/a/b/	star then a trailing-slash tail
+match	yes	/a/*/	/a/b/c	that tail is a subtree prefix
+match	no	/a/*/	/a/b	the trailing slash is strict
+
+# ---- `#` matches exactly one ASCII-DIGIT segment ----
+match	yes	/a/#	/a/1	one digit
+match	yes	/a/#	/a/1234	several digits
+match	no	/a/#	/a/b	a non-numeric segment
+match	no	/a/#	/a/1b	a partly-numeric segment is not numeric
+match	no	/a/#	/a/b1	nor the other way round
+match	no	/a/#	/a/	never matches an empty segment
+match	no	/a/#	/a	the segment is not optional
+match	yes	/a/#	/a/1/b	a rule ending in `#` is STILL a prefix rule
+match	yes	/a/#/c	/a/12/c	middle position
+match	no	/a/#/c	/a/1/2/c	never spans a slash
+match	no	/a/#/c	/a/c	not optional in the middle either
+match	yes	/a/#/c	/a/12/c/d	the prefix continues at a boundary
+match	no	/a/#/c	/a/12/cd	still boundary-aware after the hash
+match	yes	/a/#	/a/%31	a percent-encoded digit decodes to a digit
+# ASCII digits ONLY: a locale/unicode "is a digit" test would make the two
+# matchers disagree on a UTF-8 decoded segment.
+match	no	/a/#	/a/%D9%A3	ARABIC-INDIC THREE is not an ASCII digit
+
+# ---- `*` and `#` are only wildcards as a WHOLE rule segment ----
+match	yes	/a/*b	/a/*b	`*b` is literal
+match	no	/a/*b	/a/xb	`*b` is literal
+match	yes	/a/b*	/a/b*	`b*` is literal
+match	no	/a/b*	/a/bc	`b*` is literal
+# A raw `#` starts the FRAGMENT, so the request side must encode it as `%23`.
+match	yes	/a/#b	/a/%23b	`#b` is literal
+match	no	/a/#b	/a/1b	`#b` is literal
+match	yes	/a/b#	/a/b%23	`b#` is literal
+match	no	/a/b#	/a/b1	`b#` is literal
+
+# ---- a `*` or `#` in the REQUEST is never a wildcard ----
+match	yes	/a/*	/a/*	an ordinary segment that happens to be `*`
+match	yes	/a/*	/a/%2A	same, percent-encoded
+match	no	/a/x	/a/*	the request side never wildcards
+match	no	/a/x/y	/a/*/y	nor in the middle
+match	yes	/*/x	/*/x	rule star consumes a literal request star
+match	no	/a/#	/a/%23	a literal `#` request segment is not a digit -- fail closed
+match	yes	/a/*	/a/%23	but `*` takes any one segment, `#` included
+
+# ---- rule paths are NOT normalized: the DECODED-emission invariant ----
+match	no	/api/v4/projects/grp%2Fproj	/api/v4/projects/grp%2Fproj	a %2F-bearing RULE can never match
+match	yes	/api/v4/projects/grp/proj	/api/v4/projects/grp%2Fproj	so rules must be emitted DECODED
+
+# ---- the carve-out shapes, against the %2F inflation ----
+match	yes	/api/v4/projects/*/access_tokens	/api/v4/projects/1234/access_tokens	numeric id: the deny bites
+match	yes	/api/v4/projects/*/access_tokens	/api/v4/projects/1234/access_tokens/7/rotate	prefix covers rotate
+match	no	/api/v4/projects/*/access_tokens	/api/v4/projects/grp%2Fproj/access_tokens	ENCODED id: the deny MISSES -- a deny can never be suffix-anchored
+match	no	/api/v4/projects/*/access_tokens	/api/v4/projects/a/b/c/access_tokens	and misses at every deeper nesting too
+match	yes	/api/v4/projects/*/deploy_tokens	/api/v4/projects/1234/deploy_tokens	numeric id: the deny bites
+match	no	/api/v4/projects/*/deploy_tokens	/api/v4/projects/grp%2Fproj/deploy_tokens	ENCODED id: misses, like every tail deny
+match	yes	/api/v4/projects/*/deploy_keys	/api/v4/projects/1234/deploy_keys	numeric id: the deny bites
+match	no	/api/v4/projects/*/deploy_keys	/api/v4/projects/grp%2Fproj/deploy_keys	ENCODED id: misses
+match	yes	/api/v4/groups/*/access_tokens	/api/v4/groups/77/access_tokens	numeric id: the deny bites
+match	no	/api/v4/groups/*/access_tokens	/api/v4/groups/top%2Fsub/access_tokens	ENCODED id: misses -- groups nest too
+match	yes	/api/v4/groups/*/deploy_tokens	/api/v4/groups/77/deploy_tokens	numeric id: the deny bites
+match	no	/api/v4/groups/*/deploy_tokens	/api/v4/groups/top%2Fsub/deploy_tokens	ENCODED id: misses
+# ---- the API WRITE allows: `#`, because `*` is not enough (tail absorption) ----
+# These two are the shapes cogworx's whole-instance write tier actually emits.
+match	yes	/api/v4/projects/#/issues	/api/v4/projects/1234/issues	numeric id: the allow bites
+match	yes	/api/v4/projects/#/issues	/api/v4/projects/1234/issues/9/notes	prefix covers the subtree
+match	no	/api/v4/projects/#/issues	/api/v4/projects/grp%2Fproj/issues	ENCODED id: the allow FAILS CLOSED
+match	no	/api/v4/projects/#/issues	/api/v4/projects/1234/access_tokens	a literal tail cannot be steered
+match	no	/api/v4/projects/#/issues	/api/v4/projects/1234/issues_secret	nor extended past its boundary
+# The dot-segment forms that used to reach this matcher are `reject` rows above:
+# they never get here, which is the point.
+match	yes	/api/v4/projects/#/merge_requests	/api/v4/projects/1234/merge_requests	numeric id: the allow bites
+match	yes	/api/v4/projects/#/merge_requests	/api/v4/projects/1234/merge_requests/5/approve	prefix covers approve + merge (S2)
+match	no	/api/v4/projects/#/merge_requests	/api/v4/projects/grp%2Fproj/merge_requests	ENCODED id: the allow FAILS CLOSED
+
+# ---- TAIL ABSORPTION: why those allows use `#` and not `*` ----
+# GitLab's `:id` is "ID or URL-encoded path", so the sandbox CHOOSES it. Pick an
+# encoded path whose LAST component is the rule's own literal tail and `*` eats
+# the first component, the tail is satisfied by the id's second, and the real
+# resource rides through as prefix continuation -- reaching a token mint on a
+# project named `issues` in any namespace the caller controls (push-to-create
+# makes one). The paired tail deny misses the same request. `#` fails closed on
+# all of it because a namespace component is not digits.
+match	yes	/api/v4/projects/*/issues	/api/v4/projects/mygroup%2Fissues/access_tokens	`*` ABSORBS the tail: the allow reaches a token mint
+match	no	/api/v4/projects/*/access_tokens	/api/v4/projects/mygroup%2Fissues/access_tokens	...and the paired deny misses the very same request
+match	no	/api/v4/projects/#/issues	/api/v4/projects/mygroup%2Fissues/access_tokens	`#` FAILS CLOSED: `mygroup` is not digits
+match	yes	/api/v4/projects/*/merge_requests	/api/v4/projects/mygroup%2Fmerge_requests/deploy_keys	the merge_requests twin
+match	no	/api/v4/projects/#/merge_requests	/api/v4/projects/mygroup%2Fmerge_requests/deploy_keys	`#` FAILS CLOSED here too
+match	no	/api/v4/projects/#/issues	/api/v4/projects/alice%2Fissues/variables	a PERSONAL namespace works the same way, and is refused
+# Residual, pinned so it is not forgotten: `#` narrows the absorbed component to
+# digits, it does not abolish absorption. A project at `<all-digit-namespace>/issues`
+# is still reachable, and this residual is LIVE, not theoretical -- MEASURED against
+# a real GitLab 18.5.7 on 2026-08-02, every step, not reasoned about:
+#   POST /api/v4/groups?path=99            -> 201, id=12 full_path=99
+#   POST /api/v4/projects (namespace_id=12,path=issues) -> 201
+#   GET  /api/v4/projects/99%2Fissues      -> 200, resolves to 99/issues
+# An earlier version of this comment claimed such a namespace would be
+# "unaddressable by path, therefore theoretical". That is wrong, and wrong in an
+# instructive way: it is TRUE that a bare numeric `:id` resolves as an ID (GET
+# /api/v4/groups/99 looks up group id 99, not the group whose path is "99"), which
+# is what makes the claim sound right. But the attack does not use a bare segment --
+# it uses a TWO-segment path, and GitLab resolves `:id` as a PATH whenever it
+# contains a `/`. So `99%2Fissues` addresses the project fine.
+# What actually bounds the severity: nothing prevents such a namespace, and any user
+# with group-creation rights can make one cheaply, but none exists on the deployment
+# instance today (0 all-numeric among 255 top-level namespaces) and the SANDBOX
+# cannot create one under this tier -- it would need an attacker with group-creation
+# rights on the host plus a compromised agent already holding an issues/mr grant.
+# The absolute fix is for the matcher to see the RAW segment and refuse an encoded
+# slash inside a wildcard; deliberately not done here.
+match	yes	/api/v4/projects/#/issues	/api/v4/projects/1234%2Fissues/access_tokens	the named residual: an ALL-DIGIT namespace component
+
+# ...and the same absorption on a rule with NO WILDCARD AT ALL, which is the point:
+# tail absorption belongs to PREFIX ALLOWS over an API with two addressing forms for
+# one resource, not to the wildcard. cogworx's CONCRETE-repo tier allows a plain
+# prefix on the server-resolved numeric id and has since Phase 3, long before any of
+# this. Narrowest form of the residual (it needs a project at full_path
+# "<the grant's own project id>/issues"), same shape, closed by the same deferred
+# raw-segment fix. Pinned so nobody concludes the residual arrived with `#`.
+match	yes	/api/v4/projects/1234/issues	/api/v4/projects/1234%2Fissues/access_tokens	NO wildcard: a resolved-id prefix absorbs the tail too
+match	no	/api/v4/projects/1234/issues	/api/v4/projects/9999%2Fissues/access_tokens	a different numeric namespace is outside the grant
+
+# ---- the footguns, pinned: never emit either of these as an ALLOW ----
+match	yes	/api/v4/projects/*	/api/v4/projects/1234/access_tokens	star-terminated allow = no boundary at all
+match	yes	/api/v4/projects/#	/api/v4/projects/1234/access_tokens	hash-terminated is no better -- it is still a prefix

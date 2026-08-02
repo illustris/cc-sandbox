@@ -8,4 +8,5 @@ test {
 	std.testing.refAllDecls(@import("tls.zig"));
 	std.testing.refAllDecls(@import("http.zig"));
 	_ = @import("redirect_test.zig"); // Part 2 redirect/raw-L4 conformance tests
+	_ = @import("path_vectors_test.zig"); // shared Zig<->addon path-matcher vectors
 }

@@ -42,13 +42,71 @@ check(not m.path_match("/api", "/apifoo"), "path no false prefix")
 check(m.path_match("/v1/", "/v1/x"), "path trailing slash rule")
 check(not m.path_match("/v1/", "/v1"), "path trailing slash strict")
 
-# normalize_path: percent-decode + dot-segment collapse + query strip
+# ---- the SHARED path-matching vector table -------------------------------
+#
+# zig/src/l7proxy/path_vectors.tsv is the single oracle for the two matchers
+# that must agree: this addon's normalize_path + path_match (HTTPS terminate --
+# which is ALL git API traffic, so this tier is the authoritative one) and the
+# Zig proxy's http.normalizePath + filter.pathPrefixMatches (cleartext HTTP +
+# passthrough). The Zig suite (zig/src/l7proxy/path_vectors_test.zig) reads the
+# SAME file, so a semantics change in either matcher fails its own suite, and
+# "fixing" the table for one matcher instantly fails the other. There is
+# deliberately no second copy to drift.
+VECTORS = os.path.join(HERE, "..", "zig", "src", "l7proxy", "path_vectors.tsv")
+
+_vec_norm = _vec_match = _vec_reject = 0
+with open(VECTORS, encoding="utf-8") as _fh:
+    for _line in _fh:
+        _line = _line.rstrip("\r\n")
+        if not _line or _line.startswith("#"):
+            continue
+        _row = _line.split("\t")
+        if _row[0] == "norm":
+            _got = m.normalize_path(_row[1])
+            check(_got == _row[2],
+                  "vector norm %r -> %r (got %r)" % (_row[1], _row[2], _got))
+            _vec_norm += 1
+        elif _row[0] == "reject":
+            # The normalizer must REFUSE these outright (the hooks then 403).
+            # Refusal is what keeps the string the decision is made on and the
+            # string forwarded upstream from naming different resources.
+            _got = m.normalize_path(_row[1])
+            check(_got is None,
+                  "vector reject %r: normalize_path ACCEPTED it as %r -- the decision "
+                  "path and the forwarded path can now differ" % (_row[1], _got))
+            _vec_reject += 1
+        elif _row[0] == "match":
+            check(_row[1] in ("yes", "no"), "vector expect %r" % _row[1])
+            _want = _row[1] == "yes"
+            _norm = m.normalize_path(_row[3])
+            _got = m.path_match(_row[2], _norm)
+            check(_got == _want,
+                  "vector match rule=%r req=%r (normalized %r) want=%s got=%s -- %s"
+                  % (_row[2], _row[3], _norm, _want, _got,
+                     _row[4] if len(_row) > 4 else ""))
+            _vec_match += 1
+        else:
+            # A typo'd kind would silently skip a whole class of vectors in BOTH
+            # suites -- the one way the table could stop asserting unnoticed.
+            check(False, "unknown vector kind %r" % _row[0])
+# Floors, so a truncated or mis-parsed table cannot pass by asserting nothing.
+check(_vec_norm >= 12, "vector table normalization rows (%d)" % _vec_norm)
+check(_vec_match >= 40, "vector table match rows (%d)" % _vec_match)
+check(_vec_reject >= 8, "vector table reject rows (%d)" % _vec_reject)
+
+# normalize_path: percent-decode + empty-segment collapse + query strip
 check(m.normalize_path("/v1/x?q=1") == "/v1/x", "strip query")
-check(m.normalize_path("/api/../%61dmin/./x") == "/admin/x", "normalize+decode")
-check(m.normalize_path("/v1/%2e%2e/secret") == "/secret", "%2e%2e traversal")
+check(m.normalize_path("/%61dmin/x") == "/admin/x", "percent-decode")
 check(m.normalize_path("/v1/") == "/v1/", "trailing slash preserved")
 check(m.normalize_path("//a") == "/a", "collapse double slash")
-check(m.normalize_path("/../..") == "/", "pop past root")
+# A dot segment is REFUSED, not collapsed: the decision is made on the
+# normalized path while the RAW one is forwarded upstream, so a step that
+# REMOVES segments would let a request be authorized as one resource and routed
+# as another (`..%2F` walks INTO an anchored allow from under a deny).
+check(m.normalize_path("/api/../%61dmin/./x") is None, "dot segments refused")
+check(m.normalize_path("/v1/%2e%2e/secret") is None, "%2e%2e traversal refused")
+check(m.normalize_path("/../..") is None, "pop past root refused")
+check(m.normalize_path("/a/..b/c...") == "/a/..b/c...", "dots inside a segment are data")
 
 
 # evaluate: first-match, default-deny, path-gated
@@ -958,6 +1016,54 @@ m._enforce_and_inject(_flC, "/api/v4/projects/1234/issues")
 check(_flC.response is None, "inject gate C: allowed")
 check(_flC.request.headers.get("authorization") == "Bearer " + _GTOK,
       "inject gate C: a spec with no rules_tag keeps whole-host injection (ungated)")
+
+
+# --- method-override headers are stripped -----------------------------------
+# Rules are matched on the WIRE method (flow.request.method); Rack::MethodOverride
+# and friends rewrite the request to the method one of these headers names. A
+# surviving header would let a POST the rules allow be executed as the DELETE they
+# exclude, with the owner's token already injected. Stripping is unconditional --
+# allowed or denied, injected or not -- so the origin always acts on the same
+# method the decision was made on.
+_set_rules("mode terminate\n"
+           "allow git.example.internal POST,PUT /api/v4/projects/#/issues tag=git-grants\n")
+_set_spec(with_tag=True)
+_flD = _GFlow(_ghost, "POST", CIDict({
+    "Host": _ghost,
+    "X-HTTP-Method-Override": "DELETE",
+    "X-Method-Override": "DELETE",
+    "X-HTTP-Method": "DELETE",
+}), sni=_ghost)
+m._enforce_and_inject(_flD, "/api/v4/projects/1234/issues/9")
+check(_flD.response is None, "method override: the POST itself is still allowed")
+for _h in m.METHOD_OVERRIDE_HEADERS:
+    check(_flD.request.headers.get(_h) is None,
+          "method override: %s stripped before the request is forwarded" % _h)
+check(_flD.request.headers.get("authorization") == "Bearer " + _GTOK,
+      "method override: injection is unaffected")
+
+# The primitive on its own: every spelling, case-insensitively, and it reports
+# what it removed. (_enforce_and_inject calls it as its FIRST act, before the
+# method is read, so the denied path is covered by construction -- a denied flow
+# cannot be exercised here because _deny needs mitmproxy's http module.)
+_ovh = CIDict({"x-http-method-override": "DELETE", "X-Method-Override": "PATCH",
+               "X-HTTP-METHOD": "PUT", "Authorization": "Bearer keep-me"})
+check(sorted(m.strip_method_override(_ovh)) == sorted(m.METHOD_OVERRIDE_HEADERS),
+      "strip_method_override: reports every removed spelling")
+for _h in m.METHOD_OVERRIDE_HEADERS:
+    check(_h not in _ovh, "strip_method_override: %s gone" % _h)
+check(_ovh.get("authorization") == "Bearer keep-me",
+      "strip_method_override: touches nothing else")
+check(m.strip_method_override(CIDict({})) == [], "strip_method_override: no-op on a clean request")
+
+# The numeric wildcard, end to end through the real rule parser and evaluator:
+# the tail-absorption shape a `*` rule would have ALLOWED must be denied here.
+check(m.evaluate(m.RULES, _ghost, m.normalize_path(
+    "/api/v4/projects/mygroup%2Fissues/access_tokens"), "POST") == "deny",
+      "numeric wildcard: a %2F-encoded id whose last component is the literal tail is DENIED")
+check(m.evaluate(m.RULES, _ghost, m.normalize_path(
+    "/api/v4/projects/1234/issues"), "POST") == "allow",
+      "numeric wildcard: the numeric-id form is still allowed")
 
 
 if fails:

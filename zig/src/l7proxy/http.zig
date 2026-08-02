@@ -1,8 +1,9 @@
 // Pure HTTP/1.x request-head parsing for the L7 proxy's plaintext (:80) and
 // terminated paths. Extracts the Host (port stripped) and a normalized
-// request path (percent-decoded, dot-segments collapsed, query stripped) so
+// request path (percent-decoded, query stripped, empty segments collapsed) so
 // the L7 rule engine can match a boundary-aware path prefix without being
-// fooled by `%2e%2e` / `/a/../b` tricks.
+// fooled by `%2F` encoding tricks. A `.` or `..` segment is REFUSED outright
+// rather than collapsed -- see normalizePath.
 //
 // Strict and fail-closed: bare-LF line endings, absent/duplicate Host,
 // absolute-form authority != Host (request smuggling / fronting), the h2
@@ -172,7 +173,9 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 	return false;
 }
 
-fn stripQuery(p: []const u8) []const u8 {
+// pub so path_vectors_test.zig can drive the REAL request-side pipeline
+// (strip -> normalize) instead of a copy of it.
+pub fn stripQuery(p: []const u8) []const u8 {
 	const q = std.mem.indexOfAny(u8, p, "?#") orelse return p;
 	return p[0..q];
 }
@@ -195,8 +198,24 @@ fn hexVal(ch: u8) u8 {
 	return ch - 'A' + 10;
 }
 
-/// Percent-decode then collapse `.`/`..`/empty segments. Returns a slice of
-/// `out` (always starts with `/`), or null on overflow / malformed input.
+/// Percent-decode, then collapse empty segments. Returns a slice of `out`
+/// (always starts with `/`), or null on overflow / malformed input / a DOT
+/// SEGMENT -- and the sole caller turns null into `.deny`.
+///
+/// WHY A DOT SEGMENT IS REFUSED RATHER THAN COLLAPSED. The enforcer decides on
+/// this normalized path but forwards the ORIGINAL raw one upstream, so the two
+/// strings must not be able to name different resources. Percent-decoding alone
+/// is safe in that respect: a `%2F` becomes a real separator, so decoding can
+/// only ever ADD segments, which NARROWS a left-anchored rule (an allow anchored
+/// at a literal tail stops matching -- fail closed). Popping `..` is the one
+/// step that SUBTRACTS, and `..%2F` puts it under the client's control: a raw
+/// path lexically under a deny (`/api/v4/projects/1234/access_tokens/..%2Fissues`)
+/// normalizes INTO an allow (`/api/v4/projects/1234/issues`), so the request
+/// would be authorized -- and credential-injected -- as one resource while the
+/// origin stays free to route the raw form as another. No GitLab REST or git
+/// smart-HTTP request needs a `.` or `..` segment, so refusing is cheap and is
+/// the only direction that keeps "normalization can only ADD segments" true.
+/// Pinned by the shared vector table's `reject` rows.
 pub fn normalizePath(raw: []const u8, out: []u8) ?[]const u8 {
 	var dec: [4096]u8 = undefined;
 	var dn: usize = 0;
@@ -224,11 +243,10 @@ pub fn normalizePath(raw: []const u8, out: []u8) ?[]const u8 {
 
 	var it = std.mem.splitScalar(u8, decoded, '/');
 	while (it.next()) |seg| {
-		if (seg.len == 0 or (seg.len == 1 and seg[0] == '.')) continue; // collapse // and /./
-		if (seg.len == 2 and seg[0] == '.' and seg[1] == '.') {
-			if (ns > 0) ns -= 1; // pop
-			continue;
-		}
+		if (seg.len == 0) continue; // collapse `//`; an empty segment names nothing
+		// A `.` or `..` segment is REFUSED, never collapsed -- see the doc comment.
+		if (seg.len == 1 and seg[0] == '.') return null;
+		if (seg.len == 2 and seg[0] == '.' and seg[1] == '.') return null;
 		if (ns >= segs.len) return null;
 		const off = @intFromPtr(seg.ptr) - @intFromPtr(decoded.ptr);
 		segs[ns] = .{ .off = off, .len = seg.len };
@@ -283,21 +301,23 @@ test "parse strips host port" {
 	try t.expectEqualStrings("/", r.ok.path);
 }
 
-test "parse normalizes dot-segments and percent-encoding" {
+test "parse normalizes percent-encoding" {
 	var oh: [256]u8 = undefined;
 	var op: [256]u8 = undefined;
-	const r = parse("GET /api/../%61dmin/./x HTTP/1.1\r\nHost: a.test\r\n\r\n", &oh, &op);
+	const r = parse("GET /%61dmin/x HTTP/1.1\r\nHost: a.test\r\n\r\n", &oh, &op);
 	try t.expect(r == .ok);
 	try t.expectEqualStrings("/admin/x", r.ok.path);
 }
 
-test "parse rejects %2e%2e traversal" {
+test "parse DENIES a dot-segment request" {
+	// The whole request is refused, not silently rewritten: the decision is made
+	// on the normalized path while the RAW one is forwarded, so a step that
+	// REMOVES segments would let a request be authorized as one resource and
+	// routed by the origin as another. See normalizePath's doc comment.
 	var oh: [256]u8 = undefined;
 	var op: [256]u8 = undefined;
-	const r = parse("GET /v1/%2e%2e/secret HTTP/1.1\r\nHost: a.test\r\n\r\n", &oh, &op);
-	try t.expect(r == .ok);
-	// /v1/../secret -> /secret  (so a rule on /v1/ would NOT match)
-	try t.expectEqualStrings("/secret", r.ok.path);
+	try t.expect(parse("GET /api/../%61dmin/./x HTTP/1.1\r\nHost: a.test\r\n\r\n", &oh, &op) == .deny);
+	try t.expect(parse("GET /v1/%2e%2e/secret HTTP/1.1\r\nHost: a.test\r\n\r\n", &oh, &op) == .deny);
 }
 
 test "parse preserves trailing slash" {
@@ -367,9 +387,16 @@ test "precheck: a lowercase first byte is out of scope (isHttpStart gates it)" {
 	try t.expect(requestLinePrecheck("ssh-2.0\r\n") == .deny);
 }
 
-test "normalizePath root and pops past root" {
+test "normalizePath root, empty segments, and refused dot segments" {
 	var op: [256]u8 = undefined;
 	try t.expectEqualStrings("/", normalizePath("/", &op).?);
-	try t.expectEqualStrings("/", normalizePath("/../..", &op).?);
 	try t.expectEqualStrings("/a", normalizePath("//a", &op).?);
+	// A dot segment is refused outright (the caller denies), in every form:
+	// bare, encoded, and the `..%2F` shape that walks INTO an anchored allow.
+	try t.expect(normalizePath("/../..", &op) == null);
+	try t.expect(normalizePath("/a/./b", &op) == null);
+	try t.expect(normalizePath("/v1/%2e%2e/secret", &op) == null);
+	try t.expect(normalizePath("/api/v4/projects/1234/access_tokens/..%2Fissues", &op) == null);
+	// ...but a segment that merely CONTAINS dots is ordinary data.
+	try t.expectEqualStrings("/a/..b/c...", normalizePath("/a/..b/c...", &op).?);
 }

@@ -157,19 +157,73 @@ def host_match(pattern, host):
 
 
 def path_match(rule_path, req_path):
-    # Boundary-aware left-anchored prefix (mirrors filter.pathPrefixMatches).
-    if not req_path.startswith(rule_path):
-        return False
-    if len(req_path) == len(rule_path):
+    # Boundary-aware left-anchored prefix with two single-segment wildcards
+    # (mirrors filter.pathPrefixMatches -- BYTE-FOR-BYTE the same semantics;
+    # this tier is authoritative for HTTPS terminate, so a divergence is a
+    # security bug). A rule segment that is exactly `*` matches EXACTLY ONE
+    # request segment and never spans a `/`; a rule segment that is exactly `#`
+    # is the same narrowed to ASCII DIGITS. Either character outside a whole rule
+    # segment is a literal, and either in the REQUEST is always literal.
+    #
+    # The rule stays a PREFIX, so a rule ending in a wildcard still matches
+    # deeper paths -- an ALLOW must therefore terminate at a literal segment.
+    # That is necessary but NOT sufficient, which is why `#` exists: req_path is
+    # percent-DECODED before it gets here, so an encoded slash inflates one
+    # addressed segment into several and `*` absorbs the first of them --
+    # rule `/a/*/tail` matches raw `/a/x%2Ftail/anything`, the literal tail
+    # landing on the id's OWN last component. `#` closes that for an identifier
+    # that is numeric by construction. Oracle: zig/src/l7proxy/path_vectors.tsv.
+    ri = qi = 0
+    n, m_len = len(rule_path), len(req_path)
+    while ri < n:
+        c = rule_path[ri]
+        if (c in ("*", "#")
+                and (ri == 0 or rule_path[ri - 1] == "/")
+                and (ri + 1 == n or rule_path[ri + 1] == "/")):
+            seg_start = qi
+            while qi < m_len and req_path[qi] != "/":
+                # ASCII digits ONLY -- deliberately not str.isdigit(), which is
+                # true for Arabic-Indic and superscript digits and would diverge
+                # from the Zig matcher on a UTF-8 decoded segment.
+                if c == "#" and not ("0" <= req_path[qi] <= "9"):
+                    return False
+                qi += 1
+            if qi == seg_start:
+                return False  # never matches an empty segment
+            ri += 1
+            continue
+        if qi >= m_len or c != req_path[qi]:
+            return False
+        ri += 1
+        qi += 1
+    if qi == m_len:
         return True
     if rule_path.endswith("/"):
         return True
-    return req_path[len(rule_path)] == "/"
+    return req_path[qi] == "/"
 
 
 def normalize_path(p):
-    # Strip query/fragment, percent-decode, collapse '.'/'..'/empty segments
-    # (mirrors l7proxy/http.zig normalizePath, incl. trailing-slash handling).
+    """Strip query/fragment, percent-decode, collapse empty segments.
+
+    Returns None -- meaning DENY -- when the decoded path carries a `.` or `..`
+    segment. Mirrors l7proxy/http.zig normalizePath byte for byte, including the
+    trailing-slash handling and this refusal; oracle:
+    zig/src/l7proxy/path_vectors.tsv.
+
+    WHY A DOT SEGMENT IS REFUSED RATHER THAN COLLAPSED. Enforcement decides on
+    this normalized path but mitmproxy forwards the ORIGINAL raw one upstream, so
+    the two strings must not be able to name different resources. Decoding alone
+    is safe in that respect -- a `%2F` becomes a real separator, so it can only
+    ever ADD segments, which NARROWS a left-anchored rule (an allow anchored at a
+    literal tail stops matching: fail closed). Popping `..` is the one step that
+    SUBTRACTS, and `..%2F` puts it under the client's control: a raw path
+    lexically under a deny (`/api/v4/projects/1234/access_tokens/..%2Fissues`)
+    normalizes INTO an allow (`/api/v4/projects/1234/issues`), so the request
+    would be authorized -- and the owner's token injected -- as one resource
+    while the origin stays free to route the raw form as another. No GitLab REST
+    or git smart-HTTP request needs a dot segment.
+    """
     p = p.split("?", 1)[0].split("#", 1)[0]
     p = urllib.parse.unquote(p)
     if not p.startswith("/"):
@@ -177,12 +231,10 @@ def normalize_path(p):
     trailing = p.endswith("/")
     parts = []
     for seg in p.split("/"):
-        if seg == "" or seg == ".":
-            continue
-        if seg == "..":
-            if parts:
-                parts.pop()
-            continue
+        if seg == "":
+            continue  # collapse `//`; an empty segment names nothing
+        if seg == "." or seg == "..":
+            return None
         parts.append(seg)
     if not parts:
         return "/"
@@ -367,6 +419,44 @@ def set_cookie(headers, name, value):
     if not replaced:
         pairs.append(name + "=" + value)
     headers["cookie"] = "; ".join(pairs)
+
+
+# Headers that make an origin execute a DIFFERENT method than the one on the
+# wire. Rack::MethodOverride (GitLab's Rails stack) rewrites a POST into the
+# method named by `X-HTTP-Method-Override`; other stacks honour the two spellings
+# beside it. Enforcement is decided on `flow.request.method`, so leaving one of
+# these in place would let a method the rules allow (POST) be executed as one
+# they exclude (DELETE) -- with the host-side credential already injected.
+#
+# STRIPPED, not rejected, and stripped for EVERY request that reaches the
+# enforcer (allowed or denied, injected or not): the header carries no
+# information the wire method does not, so removing it can only ever make the
+# origin agree with the string the decision was made on.
+#
+# RESIDUAL, accepted explicitly: Rack::MethodOverride also honours a `_method`
+# field in an `application/x-www-form-urlencoded` BODY. This addon is header-only
+# by construction -- pack endpoints are enforced in `requestheaders` and their
+# bodies are STREAMED, never buffered -- so inspecting bodies here would mean
+# buffering every request body in the proxy. GitLab's REST API does not accept
+# form-encoded writes for the endpoints this reaches (they are JSON), so the
+# reachable form of this residual is small; it is named rather than silently
+# assumed away.
+METHOD_OVERRIDE_HEADERS = (
+    "x-http-method-override",
+    "x-method-override",
+    "x-http-method",
+)
+
+
+def strip_method_override(headers):
+    """Remove every method-override header, in place. Returns the names removed
+    (for the debug log), so a caller can see that a guest tried it."""
+    removed = []
+    for h in METHOD_OVERRIDE_HEADERS:
+        if h in headers:
+            del headers[h]
+            removed.append(h)
+    return removed
 
 
 def apply_injection(headers, style, token, account_id=None, cookie_name=None):
@@ -920,6 +1010,13 @@ def _enforce_and_inject(flow, path, query_service=None):
     either `requestheaders` (pack endpoints, before the body) or `request`."""
     RULES.maybe_reload()
 
+    # BEFORE anything reads the method: the rules are matched on the wire method,
+    # so a surviving override header would let the origin run a different one.
+    overrides = strip_method_override(flow.request.headers)
+    if overrides and os.environ.get("COGBOX_L7_DEBUG_INJECT"):
+        _cred_log("method-override stripped host=%s headers=%s"
+                  % (flow.request.pretty_host, ",".join(overrides)))
+
     sni = flow.client_conn.sni
     # We connected to the upstream by vetted IP, so use the client's SNI for
     # the upstream TLS handshake + cert validation.
@@ -984,6 +1081,18 @@ def _enforce_and_inject(flow, path, query_service=None):
         # bridge creds) -- forward it to the upstream untouched.
 
 
+def _decision_path(flow):
+    """The normalized path every decision is made on, or None once the flow has
+    been 403'd because it carries a dot segment (normalize_path's refusal). The
+    flow is marked handled so the later hook does not re-decide it."""
+    path = normalize_path(flow.request.path)
+    if path is None:
+        flow.cogbox_handled = True
+        _deny(flow, "dot segment in path")
+        return None
+    return path
+
+
 def requestheaders(flow):
     """Decide + inject for git pack endpoints BEFORE the (possibly huge)
     clone/push body is read, and stream the body through instead of buffering it
@@ -992,7 +1101,9 @@ def requestheaders(flow):
     are left to the `request` hook (unchanged); we mark handled flows so `request`
     skips them (and so a streamed request -- where `request` may not fire -- is
     still enforced)."""
-    path = normalize_path(flow.request.path)
+    path = _decision_path(flow)
+    if path is None:
+        return  # already 403'd: refused before any body is read
     if not is_pack_endpoint(path):
         return
     flow.cogbox_handled = True
@@ -1006,10 +1117,13 @@ def requestheaders(flow):
 
 def request(flow):
     # Pack endpoints are already fully handled (enforced + injected + streamed)
-    # in requestheaders; skip them here to avoid double-processing.
+    # in requestheaders; skip them here to avoid double-processing. A dot-segment
+    # refusal marks the flow handled too, so it is caught by the same guard.
     if getattr(flow, "cogbox_handled", False):
         return
-    path = normalize_path(flow.request.path)
+    path = _decision_path(flow)
+    if path is None:
+        return
     _enforce_and_inject(flow, path, query_service=_query_service(flow))
 
 
@@ -1048,8 +1162,11 @@ def responseheaders(flow):
     # body that slips through is harmless -- we never read response bodies.
     # Also stream git pack-endpoint responses: a clone's git-upload-pack response
     # body can be gigabytes and must not buffer in the proxy.
+    # `or ""` because normalize_path REFUSES a dot-segment path (returns None);
+    # such a flow was already 403'd in requestheaders, so it is never a pack
+    # endpoint and this hook must not raise on it.
     if (resp_ct == "text/event-stream" or "text/event-stream" in req_accept
-            or is_pack_endpoint(normalize_path(flow.request.path))):
+            or is_pack_endpoint(normalize_path(flow.request.path) or "")):
         flow.response.stream = True
 
 

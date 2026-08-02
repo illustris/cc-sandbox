@@ -2932,6 +2932,11 @@
 				# from ../ relative to tests/; stage them so the check can grep them.
 				cp ${./cogbox-launch.sh} cogbox-launch.sh
 				cp ${./flake.nix} flake.nix
+				# The SHARED path-matcher vector table. The Zig suite embeds this
+				# very file; staging it here is what makes the two matchers assert
+				# against ONE oracle rather than two copies that can drift.
+				mkdir -p zig/src/l7proxy
+				cp ${./zig/src/l7proxy/path_vectors.tsv} zig/src/l7proxy/path_vectors.tsv
 				mkdir tests
 				cp ${./tests/test_l7_addon.py} tests/test_l7_addon.py
 				python3 tests/test_l7_addon.py
