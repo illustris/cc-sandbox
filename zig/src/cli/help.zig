@@ -408,6 +408,8 @@ pub const L7 =
 	\\  cogbox l7 [-n NAME] add allow|deny HOST [--passthrough | --path P
 	\\                              | --terminate [--insecure-upstream]] [--at N]
 	\\  cogbox l7 [-n NAME] del INDEX
+	\\  cogbox l7 [-n NAME] clear --plugin TAG   (drop every TAG-tagged rule)
+	\\  cogbox l7 [-n NAME] replace --plugin TAG --from-stdin
 	\\  cogbox l7 [-n NAME] set                  (reads HOST rules from stdin)
 	\\  cogbox l7 [-n NAME] mode passthrough|terminate
 	\\
@@ -423,6 +425,13 @@ pub const L7 =
 	\\                         (implies --terminate; the proxy-side equivalent of
 	\\                         curl -k, for internal self-signed/mismatched certs)
 	\\      --at N             Insert at 1-based position N (default: append)
+	\\      --plugin TAG       Tag a rule (add), or select the tagged set to drop
+	\\                         (clear) / drop and re-append (replace)
+	\\      --from-stdin       replace only: read the new rule set from stdin, one
+	\\                         `allow|deny HOST [flags...]` line per rule (the argv
+	\\                         tail of `add`; blank and # lines skipped, --at and
+	\\                         --plugin not accepted per line). Appended in stdin
+	\\                         order, in ONE config edit and ONE reload.
 	\\  -h, --help             Show this help and exit
 	\\
 	\\HOST is an SNI/Host pattern: an exact name (api.example.com), a left

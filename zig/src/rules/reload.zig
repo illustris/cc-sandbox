@@ -110,6 +110,50 @@ fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
 	return false;
 }
 
+/// The inject-spec hosts renderL7 UNIONS into the terminate-allow set: every
+/// `.l7.inject.specs[].host` that no `.l7.rules[]` entry already names.
+///
+/// This exists so the count and the render share ONE predicate. renderL7 emits
+/// exactly one `allow <host> terminate` LINE per host this yields, which is why
+/// the rendered document is LONGER than `.l7.rules[]`, and it is rendered lines
+/// -- not array entries -- that filter.parseL7Rules caps (it compiles the first
+/// filter.max_l7_rules and silently drops the rest, while the terminate-tier
+/// addon reading the same document has no cap). Anything budgeting against that
+/// cap must count these lines too; iterating them here rather than re-deriving
+/// the predicate is what keeps the two from drifting.
+pub const InjectUnionIter = struct {
+	specs: ?std.json.Array,
+	rules: ?std.json.Array,
+	i: usize = 0,
+
+	pub fn next(self: *InjectUnionIter) ?[]const u8 {
+		const specs = self.specs orelse return null;
+		while (self.i < specs.items.len) {
+			const spec = specs.items[self.i];
+			self.i += 1;
+			if (spec != .object) continue;
+			const h = strField(spec.object, "host") orelse continue;
+			if (hostNamedInRules(self.rules, h)) continue;
+			return h;
+		}
+		return null;
+	}
+};
+
+pub fn injectUnionIter(network: std.json.Value) InjectUnionIter {
+	return .{ .specs = injectSpecs(network), .rules = l7Rules(network) };
+}
+
+/// How many rendered `l7-rules` lines renderL7 appends BEYOND `.l7.rules[]` --
+/// i.e. the delta between the config array's length and the rule-line count the
+/// enforcer's cap applies to. See InjectUnionIter.
+pub fn injectUnionCount(network: std.json.Value) usize {
+	var it = injectUnionIter(network);
+	var n: usize = 0;
+	while (it.next()) |_| n += 1;
+	return n;
+}
+
 /// Render `.network` to wire-format rule lines for the LD_PRELOAD shim. Pure
 /// -- no I/O. Ordering on disk: host-topology directives (`no-implicit-dns`,
 /// `hard-deny`), L7 fail-closed denies, user CIDR rules, user remaps, then the
@@ -356,15 +400,15 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 	// l7 rule. Whether injection actually fires for that host is decided
 	// separately by renderL7Inject (only when the secret is bound + audience
 	// matches); an unbound host still terminates and simply isn't injected.
-	if (injectSpecs(network)) |specs| {
-		for (specs.items) |spec| {
-			if (spec != .object) continue;
-			const h = strField(spec.object, "host") orelse continue;
-			if (hostNamedInRules(rules, h)) continue;
-			try out.appendSlice(allocator, "allow ");
-			try out.appendSlice(allocator, h);
-			try out.appendSlice(allocator, " terminate\n");
-		}
+	//
+	// The selection is InjectUnionIter's, not a loop of its own: these lines are
+	// why the rendered document is longer than `.l7.rules[]`, and injectUnionCount
+	// -- what the `l7 replace` cap budgets with -- counts exactly what this emits.
+	var inject_it = injectUnionIter(network);
+	while (inject_it.next()) |h| {
+		try out.appendSlice(allocator, "allow ");
+		try out.appendSlice(allocator, h);
+		try out.appendSlice(allocator, " terminate\n");
 	}
 }
 
@@ -902,6 +946,76 @@ test "renderL7 unions inject hosts as terminate-allows, deduped against existing
 	try std.testing.expect(std.mem.indexOf(u8, s, "allow api.example.com terminate\n") != null);
 	// a host already named by an l7 rule is NOT duplicated by the union
 	try std.testing.expect(std.mem.count(u8, s, "already.test") == 1);
+}
+
+test "injectUnionCount is exactly what renderL7 appends beyond .l7.rules[]" {
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"l7":{"mode":"terminate","rules":[{"allow":"already.test"},{"deny":"blocked.test"}],
+		\\ "inject":{"enabled":true,"specs":[
+		\\   {"host":"api.example.com","style":"bearer","secret":"api-token"},
+		\\   {"host":"already.test","style":"bearer","secret":"app-session"},
+		\\   {"host":"app.example.com","style":"bearer","secret":"api-token"},
+		\\   {"style":"bearer","secret":"api-token"},
+		\\   "not-an-object"]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	// Two unnamed hosts; the rule-named one and the two malformed entries yield
+	// no line.
+	try std.testing.expectEqual(@as(usize, 2), injectUnionCount(parsed.value));
+
+	// And that is literally the delta between the config array and the rendered
+	// rule-line count -- the quantity filter.parseL7Rules caps. Counting the array
+	// instead is how a replace can pass its own cap check and still render a
+	// document whose tail the enforcer silently drops.
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, parsed.value, &out);
+	var rendered: usize = 0;
+	var lines = std.mem.splitScalar(u8, out.items, '\n');
+	while (lines.next()) |line| {
+		if (std.mem.startsWith(u8, line, "allow ") or std.mem.startsWith(u8, line, "deny ")) rendered += 1;
+	}
+	const array_len = l7Rules(parsed.value).?.items.len;
+	try std.testing.expectEqual(array_len + injectUnionCount(parsed.value), rendered);
+}
+
+test "renderL7 overflows filter.max_l7_rules on an at-cap array (the inject-union delta the l7-replace cap must budget for)" {
+	const gpa = std.testing.allocator;
+	var src: std.ArrayList(u8) = .empty;
+	defer src.deinit(gpa);
+	try src.appendSlice(gpa, "{\"l7\":{\"mode\":\"terminate\",\"rules\":[");
+	for (0..filter.max_l7_rules) |i| {
+		if (i > 0) try src.appendSlice(gpa, ",");
+		try src.appendSlice(gpa, "{\"allow\":\"a.test\"}");
+	}
+	// One inject spec whose host no rule names -- e.g. the claude-oauth audience on
+	// an instance that never allow-listed it. renderL7 appends its terminate-allow
+	// AFTER the array, so the document carries max+1 rule lines.
+	try src.appendSlice(gpa, "],\"inject\":{\"enabled\":true,\"specs\":[{\"host\":\"api.example.com\",\"style\":\"bearer\",\"secret\":\"api-token\"}]}}}");
+
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src.items, .{});
+	defer parsed.deinit();
+	try std.testing.expectEqual(@as(usize, 1), injectUnionCount(parsed.value));
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, parsed.value, &out);
+	try std.testing.expect(std.mem.indexOf(u8, out.items, "allow api.example.com terminate\n") != null);
+
+	// The enforcer compiles the first max_l7_rules and DROPS the rest in silence,
+	// while the terminate-tier addon parsing the same document has no cap: the
+	// inject-union line is gone from one layer and honoured by the other.
+	var set: filter.L7RuleSet = undefined;
+	filter.parseL7Rules(out.items, &set);
+	try std.testing.expectEqual(filter.max_l7_rules, set.len);
+	var compiled_injected = false;
+	for (set.rules[0..set.len]) |r| {
+		if (std.mem.eql(u8, r.host.slice(), "api.example.com")) compiled_injected = true;
+	}
+	try std.testing.expect(!compiled_injected);
 }
 
 test "renderRules funnel targets the per-instance base ports" {

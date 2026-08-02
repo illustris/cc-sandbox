@@ -196,6 +196,9 @@ pub fn build(b: *std.Build) void {
 		.optimize = optimize,
 	});
 	l7_test_mod.addImport("filter", filter_mod);
+	// Mirrors l7_mod: cli.zig reaches the rules module for reload.injectUnionCount
+	// (the rendered-line delta the replace cap budgets for).
+	l7_test_mod.addImport("rules_module", rules_mod);
 	const l7_tests = b.addTest(.{
 		.root_module = l7_test_mod,
 	});

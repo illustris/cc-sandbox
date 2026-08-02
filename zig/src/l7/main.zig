@@ -10,6 +10,7 @@ pub const rule = @import("rule.zig");
 
 const rules_module = @import("rules_module");
 const config = rules_module.config;
+const reload = rules_module.reload;
 
 pub fn dispatch(
 	allocator: std.mem.Allocator,
@@ -58,6 +59,7 @@ pub fn dispatch(
 		.del => |d| try cmdDel(allocator, io, args, rules_arr, d, &loaded),
 		.clear => |c| try cmdClear(allocator, io, args, rules_arr, c, &loaded),
 		.set => try cmdSet(allocator, io, args, rules_arr, &loaded),
+		.replace => |r| try cmdReplace(allocator, io, args, net, rules_arr, r, &loaded),
 		.mode => |m| try cmdMode(allocator, io, args, l7, m, &loaded),
 	}
 }
@@ -182,15 +184,10 @@ fn cmdAdd(
 	// The 0-based index of the rule object once inserted, so an optional --plugin
 	// tag can be stamped onto exactly it.
 	var inserted_idx: usize = undefined;
-	const attrs: rule.Attrs = .{
-		.path = a.path,
-		.terminate = a.terminate,
-		.insecure = a.insecure,
-		.passthrough = a.passthrough,
-		.methods = a.methods,
-		.exact = a.exact,
-		.service = a.service,
-	};
+	// cli.attrsOf, never a struct literal here: cmdReplace projects the same
+	// AddArgs, and a second copy of the mapping is how the two verbs would come to
+	// emit different rule objects for the same input.
+	const attrs = cli.attrsOf(a);
 	if (a.pos) |p| {
 		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, attrs) catch |err| switch (err) {
 			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
@@ -209,8 +206,7 @@ fn cmdAdd(
 	// --plugin NAME: tag the inserted rule so `plugin del NAME` removes exactly it
 	// (the same `"plugin"` field the plugin verb's merge stamps).
 	if (a.plugin) |tag| {
-		const obj = &rules_arr.items[inserted_idx].object;
-		try obj.put(tree_alloc, try tree_alloc.dupe(u8, "plugin"), .{ .string = try tree_alloc.dupe(u8, tag) });
+		try stampPlugin(tree_alloc, &rules_arr.items[inserted_idx], tag);
 	}
 
 	try config.save(allocator, io, args.config_path, loaded.root().*);
@@ -237,6 +233,14 @@ fn cmdAdd(
 		try announce(allocator, io, "Added: {s} {s}{s}", .{ action_str, a.host, suffix });
 	}
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
+}
+
+/// Stamp `"plugin": <tag>` onto a rule object. Shared by `l7 add --plugin` and
+/// `l7 replace --plugin` so a batched rule and a singly-added one carry the tag
+/// through the SAME code path -- the tag is what `clear`/`replace`/`plugin del`
+/// match on, so a second spelling of it here would be a silent ownership leak.
+fn stampPlugin(tree_alloc: std.mem.Allocator, item: *std.json.Value, tag: []const u8) !void {
+	try item.object.put(tree_alloc, try tree_alloc.dupe(u8, "plugin"), .{ .string = try tree_alloc.dupe(u8, tag) });
 }
 
 fn cmdDel(
@@ -268,6 +272,105 @@ fn cmdClear(
 	try config.save(allocator, io, args.config_path, loaded.root().*);
 	try announce(allocator, io, "Cleared {d} l7 rule(s) tagged '{s}'.", .{ removed, c.plugin });
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
+}
+
+/// `l7 replace --plugin TAG --from-stdin`: drop every TAG-tagged rule and append
+/// the stdin set in its place, as ONE config edit and ONE reload.
+///
+/// This subsumes `clear --plugin TAG` + N flagless `add`s. Doing it as a batch
+/// ADD would not: that still needs a separate clear, i.e. two saves, two
+/// reloads, and a real window in between where the previous grants are gone and
+/// the new ones are not yet in force.
+///
+/// The result is bit-identical to the clear-then-add sequence it replaces:
+/// append-only in stdin order, after every other rule. First-match evaluation
+/// makes position relative to OTHER rules load-bearing (an earlier user `deny`
+/// must still win), and "after everything else" is exactly the old behaviour.
+///
+/// Over-cap is a LOUD refusal, never a truncation: the enforcer compiles the
+/// first filter.max_l7_rules rule lines of the rendered document while the
+/// terminate-tier addon reading the same document has no cap, so a silently
+/// dropped tail would make the two enforcement layers disagree about what is
+/// allowed. The bound is on the RESULTING RENDERED DOCUMENT, not on the batch
+/// and not on `.l7.rules[]` either: the batch is appended to every rule that
+/// survives deleteByPlugin, AND renderL7 adds a terminate-allow line for each
+/// inject-spec host no rule names, so a batch that fits on its own -- or even a
+/// result whose array fits -- can still overflow (cli.checkRenderedCap). It
+/// binds only a replace that GROWS the rule set, though: a revoke or a narrowing
+/// edit on an instance that is already over cap must always succeed, or the
+/// withdrawn grant's rules would stay in force with no way to remove them.
+fn cmdReplace(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	args: cli.Args,
+	net: *std.json.Value,
+	rules_arr: *std.json.Array,
+	r: cli.ReplaceArgs,
+	loaded: *config.Loaded,
+) !void {
+	const payload = try readStdinAll(allocator, io);
+	defer allocator.free(payload);
+
+	var parsed: std.ArrayList(cli.AddArgs) = .empty;
+	defer parsed.deinit(allocator);
+	var bad_line: []const u8 = "";
+	cli.parseReplacePayload(allocator, payload, &parsed, &bad_line) catch |err| switch (err) {
+		error.OutOfMemory => return err,
+		error.TooManyRules => return die(
+			allocator,
+			io,
+			"{d} rules on stdin exceeds the {d}-rule limit; refusing to truncate",
+			.{ parsed.items.len, cli.max_total_rules },
+			65,
+		),
+		else => return die(allocator, io, "invalid rule line: {s}", .{bad_line}, 65),
+	};
+
+	const tree_alloc = loaded.treeAllocator();
+	const removed = rule.deleteByPlugin(rules_arr, r.plugin);
+	// deleteByPlugin has already run, so rules_arr now holds exactly what the
+	// batch is being appended TO: every user rule and every other plugin's rules.
+	const surviving = rules_arr.items.len;
+	for (parsed.items) |a| {
+		// The SAME projection cmdAdd uses; see cli.attrsOf.
+		const attrs = cli.attrsOf(a);
+		const n = rule.append(tree_alloc, rules_arr, a.action, a.host, attrs) catch |err| switch (err) {
+			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
+			else => return err,
+		};
+		// Every rule in the batch is stamped from the SINGLE argv --plugin value.
+		try stampPlugin(tree_alloc, &rules_arr.items[n - 1], r.plugin);
+	}
+
+	// The cap is checked AFTER the append and against the whole tree, because the
+	// quantity the enforcer bounds is rendered LINES, and renderL7 emits one extra
+	// `allow <host> terminate` per inject-spec host that no rule names -- a set the
+	// batch itself changes (a batched allow for a git host suppresses that host's
+	// union line). `surviving` + that delta is what the batch is landing on top of;
+	// `removed` goes in too, so a batch that does not GROW the rule set is never
+	// refused -- otherwise an already-over-cap instance could never be revoked or
+	// narrowed. Dying here is still a clean no-op on disk: die() exits before
+	// config.save, so the whole edit so far is only in the in-memory tree.
+	const inject_lines = reload.injectUnionCount(net.*);
+	cli.checkRenderedCap(net.*, surviving, parsed.items.len, removed) catch return die(
+		allocator,
+		io,
+		"{d} rendered rule lines ({d} already present + {d} on stdin + {d} inject-union allow(s)) exceeds the {d}-rule limit; refusing to truncate",
+		.{ surviving + parsed.items.len + inject_lines, surviving, parsed.items.len, inject_lines, cli.max_total_rules },
+		65,
+	);
+
+	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try announce(allocator, io, "Replaced {d} l7 rule(s) tagged '{s}' with {d}.", .{ removed, r.plugin, parsed.items.len });
+	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
+}
+
+/// Read all of stdin with a 1 MiB cap, mirroring `secret add --from-stdin`.
+fn readStdinAll(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+	const stdin = std.Io.File.stdin();
+	var sbuf: [4096]u8 = undefined;
+	var r = stdin.readerStreaming(io, &sbuf);
+	return r.interface.allocRemaining(allocator, .limited(1 << 20));
 }
 
 fn cmdSet(
