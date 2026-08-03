@@ -1101,8 +1101,9 @@
 					ln -sfn "$cjson" /root/.claude.json
 
 					# Stage (marker present) or remove (absent) the redacted stub. The
-					# verb single-sources the stub sentinel from the secret module and
-					# never writes a real token.
+					# verb single-sources the stub sentinel from the secret module,
+					# never writes a real token, and removes ONLY a file carrying that
+					# sentinel (a credential an in-guest /login wrote is the user's).
 					${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub "$cdir" "$marker"
 				'';
 
@@ -1116,30 +1117,33 @@
 				# how it reads an ABSENT marker:
 				#
 				#   marker ABSENT  -> UNMANAGED: a standalone single-host-user VM whose
-				#     launcher staged its OWN redacted placeholder identity
 				#     launcher staged its own redacted placeholder identity. Leave it
-				#     untouched -- deleting it
-				#     would break that model's on-the-wire injection.
-				#   marker == "0"  -> cogworx MANAGED, owner DISCONNECTED: drop the stub
-				#     (overlay whiteout over the launcher placeholder) so claude-code
-				#     falls back to in-guest /login (fail-closed).
+				#     untouched -- exit BEFORE calling the verb, because that placeholder
+				#     carries the same sentinel the verb removes, and deleting it would
+				#     break that model's on-the-wire injection.
+				#   marker == "0"  -> cogworx MANAGED, owner DISCONNECTED (or never
+				#     connected -- the control plane cannot tell those apart and writes
+				#     "0" for both): hand it to the verb, which removes the stub (an
+				#     overlay whiteout over the launcher placeholder) so claude-code falls
+				#     back to in-guest /login. It removes ONLY a file carrying cogbox's
+				#     own sentinel: a credential the user obtained with an in-guest
+				#     /login lands at the same path, is theirs, and stays. Fail-closed
+				#     does not depend on that file anyway -- cogworx unbinds the enforcer
+				#     secret and the render gate then emits no inject spec at all.
 				#   marker present, not "0" -> cogworx MANAGED, owner CONNECTED: stage the
 				#     redacted sentinel (the pod-side proxy stamps the real Bearer over
 				#     it); the real token never enters the guest.
 				#
-				# The sentinel is single-sourced through the verb (never hardcoded in
-				# this shell); only the removal is done inline. cogworx writes the
-				# marker host-side on the 9p SOURCE and restarts this oneshot (and it
-				# re-runs at every boot, so the persisted marker survives a restart).
+				# Both the sentinel AND the removal rule are single-sourced through the
+				# verb (never hardcoded in this shell), so container and VM now share one
+				# rule: "remove only what cogbox wrote". cogworx writes the marker
+				# host-side on the 9p SOURCE and restarts this oneshot (and it re-runs at
+				# every boot, so the persisted marker survives a restart).
 				claudeStubScriptVm = pkgs.writeShellScript "cogbox-claude-stub-vm" ''
 					set -eu
 					marker=/var/lib/cogbox/claude-oauth.bound
 					[ -e "$marker" ] || exit 0
-					if [ "$(cat "$marker" 2>/dev/null || true)" = "0" ]; then
-						rm -f /root/.claude/.credentials.json
-					else
-						${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub /root/.claude "$marker"
-					fi
+					${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub /root/.claude "$marker"
 				'';
 			in {
 				nixpkgs.config.allowUnfree = true;
