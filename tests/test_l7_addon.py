@@ -402,6 +402,30 @@ with open(os.path.join(HERE, "..", "flake.nix")) as _f:
 check("ANTHROPIC_AUTH_TOKEN" not in _flake,
       "no ANTHROPIC_AUTH_TOKEN env stub in the launcher (would shadow the cred file)")
 
+# The ZIG side must carry the SAME literal. The sentinel is duplicated out of
+# necessity -- the VM launcher is shell, the container stub-staging is Zig -- and
+# the two copies were coupled only by a comment. Drift used to self-heal: the
+# container bind leg overwrote the in-guest credential blindly, so a stub written
+# with a stale sentinel was simply replaced by the current one. It now refuses to
+# write over a credential it does not recognize as its own, which turns drift
+# PERMANENT: the old-sentinel stub stays, should_inject stops recognizing it, and
+# the box 401s silently with only a journal warning to show for it. Both values
+# are EXTRACTED from their sources, never retyped, or this test just becomes the
+# third copy that can drift.
+import re as _re
+
+with open(os.path.join(HERE, "..", "zig", "src", "secret", "main.zig")) as _f:
+    _secret_zig = _f.read()
+_zig_stub = _re.search(r'pub const claude_stub_token = "([^"]*)";', _secret_zig)
+# Anchor to harness_stub_token's body: several other per-harness case statements
+# also carry a `claude-code)` arm, so an unanchored match reads the wrong one.
+_stub_fn = _re.search(r"harness_stub_token\(\) \{(.*?)\n\}", _launch, _re.S)
+_sh_stub = _re.search(r'claude-code\)\s*echo\s*"([^"]*)"', _stub_fn.group(1)) if _stub_fn else None
+check(_zig_stub is not None, "zig claude_stub_token literal found in secret/main.zig")
+check(_sh_stub is not None, "launcher claude-code stub literal found in harness_stub_token")
+check(bool(_zig_stub) and bool(_sh_stub) and _zig_stub.group(1) == _sh_stub.group(1),
+      "stub token agrees between cogbox-launch.sh and zig/src/secret/main.zig (no drift)")
+
 # CredStore: conf + cred file, host normalization, mtime hot-reload, fail-closed
 import json as _json
 import tempfile

@@ -11,12 +11,16 @@
 //
 //   marker PRESENT and not "0" -> write the redacted stub (accessToken = the
 //     shared sentinel; the enforcer's mitm addon stamps the real Bearer ONLY
-//     over it). The real token never enters the agent -- only the inert stub is
-//     ever written here.
+//     over it), but ONLY over an absent file or our own sentinel. The real
+//     token never enters the agent -- only the inert stub is ever written here.
 //   marker "0" (the VM-family backends' explicit "not bound") or ABSENT (the
 //     container clears the marker instead) -> remove the stub, but ONLY when the
-//     file carries our own sentinel. A credential the sandbox user placed with
-//     an in-guest /login lands at this exact path and is THEIRS: it must survive.
+//     file carries our own sentinel.
+//
+// BOTH legs are gated the same way, because a credential the sandbox user
+// obtained with an in-guest /login lands at this exact path and is THEIRS: the
+// in-guest session must supersede the host-managed identity, so this verb never
+// removes and never overwrites a file it did not write itself.
 //
 // Removing the stub is UX, not denial: what makes a disconnected owner's traffic
 // fail closed is host-side -- cogworx unbinds the enforcer secret, and the
@@ -45,11 +49,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
 }
 
 /// Make `<claude_dir>/.credentials.json` match the marker: stage the redacted
-/// stub when `marker` says bound, else remove OUR OWN stub. Idempotent (a boot
-/// oneshot + a connect/disconnect trigger both call it), so a re-run with the
-/// marker present leaves the stub in place -- the basis for restart persistence.
-/// Pure of the real token: the only value it ever writes is the shared sentinel
-/// stub.
+/// stub when `marker` says bound -- writing only over an absent file or OUR OWN
+/// sentinel -- else remove OUR OWN stub. Idempotent (a boot oneshot + a
+/// connect/disconnect trigger both call it), so a re-run with the marker present
+/// leaves the stub in place -- the basis for restart persistence. Pure of the
+/// real token: the only value it ever writes is the shared sentinel stub.
 pub fn reconcile(allocator: std.mem.Allocator, io: std.Io, claude_dir: []const u8, marker: []const u8) !void {
 	const cwd = std.Io.Dir.cwd();
 	const cred_path = try std.fs.path.join(allocator, &.{ claude_dir, ".credentials.json" });
@@ -66,11 +70,51 @@ pub fn reconcile(allocator: std.mem.Allocator, io: std.Io, claude_dir: []const u
 
 	if (connected) {
 		// ~/.claude must exist before the cred file lands in it (the oneshot
-		// symlinks ~/.claude at this PVC dir; createDirPath is a no-op when present).
+		// symlinks ~/.claude at this PVC dir; createDirPath is a no-op when
+		// present). It stays ABOVE the gate: on a fresh instance the dir does
+		// not exist yet and the absent-branch write needs somewhere to land.
 		try cwd.createDirPath(io, claude_dir);
-		const json = try secret_mod.stubCredentialJson(allocator);
-		defer allocator.free(json);
-		try writeFile0600(io, cred_path, json);
+		// Write ONLY over what cogbox wrote -- the mirror image of the removal
+		// rule below. A credential the sandbox user obtained with an in-guest
+		// /login lands at this exact path and MUST supersede the host-managed
+		// identity; this oneshot re-runs at every boot and cogworx restarts it
+		// on every lifecycle re-drive, so an unconditional stamp logged such a
+		// user out again on each restart. Nothing is weakened by keeping it:
+		// the mitm addon stamps the owner's Bearer only over an empty or
+		// exactly-stub credential and forwards any other one upstream
+		// untouched, so a preserved token can never carry another identity.
+		const decision: StageDecision = blk: {
+			// ABSENT is the one state isOurStub cannot express: readSmall stats
+			// first and maps every failure to null, so a MISSING file reads as
+			// "not ours" -- right for a delete, wrong here. Gating on isOurStub
+			// alone would skip the very FIRST stage and never arm the feature.
+			// Stat NO-FOLLOW, as readSmall does, so a symlink is "present, not
+			// ours" and is never written THROUGH; every stat failure other than
+			// a genuinely missing path is not-writable, the non-destructive
+			// answer this file already takes for an unreadable credential.
+			if (cwd.statFile(io, cred_path, .{ .follow_symlinks = false })) |_| {
+				break :blk if (isOurStub(allocator, io, cred_path)) .stage else .keep_foreign;
+			} else |err| {
+				break :blk if (err == error.FileNotFound) .stage else .{ .unreadable = err };
+			}
+		};
+		switch (decision) {
+			.stage => {
+				const json = try secret_mod.stubCredentialJson(allocator);
+				defer allocator.free(json);
+				try writeFile0600(io, cred_path, json);
+			},
+			// A skip must be LOUD, because nothing else can show it: the unit is
+			// Type=oneshot RemainAfterExit=true (so it reads `active (exited)`)
+			// and cogworx's stub probes read the MARKER, never the credential, so
+			// a skipped stage still reports "bound/staged" in the UI. Without a
+			// line here, "the user's own credential is in charge" and "the path
+			// was unreadable" both look exactly like a healthy stage, and a "Not
+			// logged in" report has no signal to go on. Silence on the staging
+			// path is then unambiguous: a warning appears iff nothing was written.
+			.keep_foreign => warnSkip(allocator, io, "__claude-stub: {s} carries no cogbox stub sentinel (or is not a readable regular file), so it is the sandbox user's own credential and supersedes the host-managed one: leaving it alone, NOT staging the stub", .{cred_path}),
+			.unreadable => |err| warnSkip(allocator, io, "__claude-stub: cannot inspect {s} ({s}); NOT staging the stub (refusing to truncate a file that may be the sandbox user's own credential)", .{ cred_path, @errorName(err) }),
+		}
 	} else if (isOurStub(allocator, io, cred_path)) {
 		// Disconnected / never-connected: drop OUR OWN stub so claude-code hits
 		// /login -- and only ours. An owner who never connected at the cogworx
@@ -82,6 +126,30 @@ pub fn reconcile(allocator: std.mem.Allocator, io: std.Io, claude_dir: []const u
 		cwd.deleteFile(io, cred_path) catch {};
 	}
 }
+
+/// Warn to STDERR about a skipped stage -- the reason only, never the file's
+/// bytes. Quiet under the test runner: stdout is the zig test protocol (see
+/// secret.zig's `announce`), and a test step that writes to STDERR makes
+/// `zig build test` print it as "failed command" even when every test passed,
+/// i.e. a green gate that reads red. A failed log write never fails a reconcile.
+fn warnSkip(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args: anytype) void {
+	if (@import("builtin").is_test) return;
+	util.warn(allocator, io, fmt, args) catch {};
+}
+
+/// What the bind leg decided about the credential path -- carried out of the
+/// probe so a SKIP can name its reason in the journal instead of looking exactly
+/// like a healthy stage. `isOurStub` stays the only content predicate.
+const StageDecision = union(enum) {
+	/// Absent, or ours (empty / carries the sentinel): safe to (re-)write.
+	stage,
+	/// Present but not ours. Usually the credential an in-guest /login wrote;
+	/// also anything readSmall refuses (symlink, FIFO, >64KB, unreadable), which
+	/// takes the same non-destructive answer, so the message says both.
+	keep_foreign,
+	/// The path could not even be stat'ed (EIO, ELOOP, EACCES, ...).
+	unreadable: anyerror,
+};
 
 /// Did COGBOX write the file at `path`? Only then may reconcile remove it.
 ///
@@ -235,6 +303,15 @@ fn writeCred(gpa: std.mem.Allocator, io: std.Io, claude_dir: []const u8, bytes: 
 	try writeFile0600(io, p, bytes);
 }
 
+// Remove `<claude_dir>/.credentials.json`. Stands in for the documented escape
+// hatch back to host-managed auth: an in-guest /logout (or an `rm`), after which
+// the bind leg's ABSENT branch may stage the sentinel again.
+fn deleteCred(gpa: std.mem.Allocator, io: std.Io, claude_dir: []const u8) !void {
+	const p = try std.fmt.allocPrint(gpa, "{s}/.credentials.json", .{claude_dir});
+	defer gpa.free(p);
+	try std.Io.Dir.cwd().deleteFile(io, p);
+}
+
 fn writeMarker(io: std.Io, marker: []const u8, bytes: []const u8) !void {
 	try writeFile0600(io, marker, bytes);
 }
@@ -285,7 +362,11 @@ test "claude stub: a credential the user placed in-guest is NEVER removed" {
 	}
 
 	// Our OWN stub is still dropped on an explicit disconnect: bind (marker not
-	// "0") stages the sentinel, then unbind ("0") removes it.
+	// "0") stages the sentinel, then unbind ("0") removes it. The user's own
+	// credential must go first -- the bind leg refuses to write over it, which is
+	// the documented escape hatch back to host-managed auth: only once the user
+	// clears their own credential (an in-guest /logout) may the stub stage again.
+	try deleteCred(gpa, io, claude_dir);
 	try writeMarker(io, marker, "1\n");
 	try reconcile(gpa, io, claude_dir, marker);
 	{
@@ -296,6 +377,191 @@ test "claude stub: a credential the user placed in-guest is NEVER removed" {
 	try writeMarker(io, marker, "0\n");
 	try reconcile(gpa, io, claude_dir, marker);
 	try std.testing.expect(!credExists(io, claude_dir));
+}
+
+test "claude stub: a credential the user placed in-guest is NEVER overwritten" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpDir(gpa, io);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+
+	const claude_dir = try std.fmt.allocPrint(gpa, "{s}/.claude", .{root});
+	defer gpa.free(claude_dir);
+	const marker = try std.fmt.allocPrint(gpa, "{s}/claude-oauth.bound", .{root});
+	defer gpa.free(marker);
+
+	// An in-guest /login wrote a credential that carries NO cogbox sentinel.
+	const user_cred = "{\"claudeAiOauth\":{\"accessToken\":\"oat-placeholder-from-an-in-guest-login\"}}\n";
+	try writeCred(gpa, io, claude_dir, user_cred);
+
+	// The owner IS connected, so cogworx keeps re-driving the BIND leg: at every
+	// boot of the oneshot and on every lifecycle re-drive. The user's in-guest
+	// session must supersede that, so their bytes stay byte-identical across all
+	// of it -- both marker spellings of BOUND included ("1" on the VM-family
+	// backends, an EMPTY file on the container, which trims to "" != "0").
+	try writeMarker(io, marker, "1\n");
+	try reconcile(gpa, io, claude_dir, marker);
+	try reconcile(gpa, io, claude_dir, marker);
+	try writeMarker(io, marker, "");
+	try reconcile(gpa, io, claude_dir, marker);
+	try std.testing.expect(credExists(io, claude_dir));
+	{
+		const cred = try readCred(gpa, io, claude_dir);
+		defer gpa.free(cred);
+		try std.testing.expectEqualStrings(user_cred, cred);
+	}
+
+	// The gate must still let the FIRST stage through, or every sandbox ends up
+	// stubless: ABSENT is the one state isOurStub cannot express, so gating the
+	// write on isOurStub alone would disarm the feature entirely. Clearing the
+	// credential (the escape hatch: an in-guest /logout) resumes host-managed
+	// auth on the next run of the oneshot.
+	try deleteCred(gpa, io, claude_dir);
+	try writeMarker(io, marker, "1\n");
+	try reconcile(gpa, io, claude_dir, marker);
+	try std.testing.expect(credExists(io, claude_dir));
+	{
+		const cred = try readCred(gpa, io, claude_dir);
+		defer gpa.free(cred);
+		try std.testing.expect(std.mem.indexOf(u8, cred, secret_mod.claude_stub_token) != null);
+	}
+
+	// ...and re-staging over OUR OWN stub stays idempotent (restart persistence).
+	try reconcile(gpa, io, claude_dir, marker);
+	{
+		const cred = try readCred(gpa, io, claude_dir);
+		defer gpa.free(cred);
+		try std.testing.expect(std.mem.indexOf(u8, cred, secret_mod.claude_stub_token) != null);
+	}
+
+	// A ZERO-BYTE credential is OURS and must stay writable -- the second state
+	// (besides ABSENT) the gate has to let through, and the only self-heal for a
+	// TORN stub write: writeFile0600 create-truncates and only then writes, so a
+	// pod OOM-kill or eviction between those two syscalls leaves exactly a 0-byte
+	// file. If that clause were ever "hardened" away, the bind leg would refuse
+	// forever -- every boot and every re-drive -- and a connected owner's sandbox
+	// would stay permanently stubless while the marker still reads bound, so the
+	// 5m sweep would skip it too. Pinned here because no other test covers it.
+	try writeCred(gpa, io, claude_dir, "");
+	try reconcile(gpa, io, claude_dir, marker);
+	{
+		const cred = try readCred(gpa, io, claude_dir);
+		defer gpa.free(cred);
+		try std.testing.expect(std.mem.indexOf(u8, cred, secret_mod.claude_stub_token) != null);
+	}
+}
+
+test "claude stub: a symlink at the cred path is never written THROUGH" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpDir(gpa, io);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+
+	const claude_dir = try std.fmt.allocPrint(gpa, "{s}/.claude", .{root});
+	defer gpa.free(claude_dir);
+	const marker = try std.fmt.allocPrint(gpa, "{s}/claude-oauth.bound", .{root});
+	defer gpa.free(marker);
+
+	// Guest root can write this path, so it can plant a DANGLING symlink there.
+	// The bind leg's presence probe must therefore stat NO-FOLLOW: `access` (or any
+	// following stat) reports a dangling link as ABSENT, and createFile would then
+	// write the stub THROUGH it, at a path the guest chose. A symlink is instead
+	// "present, not ours" -> skipped. Losing the stub in that case is the harmless
+	// direction (the stub is inert and the guest broke its own inheritance).
+	try cwd.createDirPath(io, claude_dir);
+	const link = try std.fmt.allocPrint(gpa, "{s}/.credentials.json", .{claude_dir});
+	defer gpa.free(link);
+	const target = try std.fmt.allocPrint(gpa, "{s}/would-be-clobbered", .{root});
+	defer gpa.free(target);
+	try cwd.symLink(io, target, link, .{});
+
+	try writeMarker(io, marker, "1\n");
+	try reconcile(gpa, io, claude_dir, marker);
+	try std.testing.expectError(error.FileNotFound, cwd.statFile(io, target, .{}));
+
+	// The unbind leg agrees (readSmall refuses a non-regular file), so the link is
+	// not removed either -- both legs simply leave what is not ours alone.
+	try writeMarker(io, marker, "0\n");
+	try reconcile(gpa, io, claude_dir, marker);
+	{
+		const st = try cwd.statFile(io, link, .{ .follow_symlinks = false });
+		try std.testing.expectEqual(std.Io.File.Kind.sym_link, st.kind);
+	}
+}
+
+test "claude stub: a cred path that cannot be STAT'd is never truncated" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpDir(gpa, io);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+
+	const claude_dir = try std.fmt.allocPrint(gpa, "{s}/.claude", .{root});
+	defer gpa.free(claude_dir);
+	const marker = try std.fmt.allocPrint(gpa, "{s}/claude-oauth.bound", .{root});
+	defer gpa.free(marker);
+	const cred_path = try std.fmt.allocPrint(gpa, "{s}/.credentials.json", .{claude_dir});
+	defer gpa.free(cred_path);
+
+	// An in-guest /login wrote a credential that carries NO cogbox sentinel...
+	const user_cred = "{\"claudeAiOauth\":{\"accessToken\":\"oat-placeholder-from-an-in-guest-login\"}}\n";
+	try writeCred(gpa, io, claude_dir, user_cred);
+
+	// ...and then the path stopped being STAT-able while the file itself stayed
+	// put -- the state the bind leg's `err == error.FileNotFound` narrowing exists
+	// for, and the only one no other test here reaches (a symlink, a FIFO and a
+	// directory all STAT fine no-follow and land in `keep_foreign` instead).
+	// Dropping the claude dir's SEARCH bit is the portable stand-in for the field
+	// shapes: a ceph-csi remount handing back EIO, or the dir losing a mode/ACL
+	// under the state PVC. READ is kept, so reconcile's createDirPath still sees
+	// an existing directory; all the gate needs is a stat that fails with
+	// something OTHER than FileNotFound.
+	const no_search = std.Io.File.Permissions.fromMode(0o400);
+	const restored = std.Io.File.Permissions.fromMode(0o700);
+	try cwd.setFilePermissions(io, claude_dir, no_search, .{});
+	// Registered AFTER the deleteTree defer above, so it runs BEFORE it (LIFO):
+	// teardown needs the search+write bits back to unlink the credential.
+	defer cwd.setFilePermissions(io, claude_dir, restored, .{}) catch {};
+
+	// Root ignores a missing search bit (CAP_DAC_OVERRIDE), so under root this
+	// test cannot reach the state it exists to pin -- skip loudly rather than
+	// pass vacuously. The nix check builds unprivileged, so the gate does cover
+	// it; only a root-run `zig build test` skips.
+	if (cwd.statFile(io, cred_path, .{ .follow_symlinks = false })) |_| {
+		return error.SkipZigTest;
+	} else |err| if (err == error.FileNotFound) return error.SkipZigTest;
+
+	// The owner IS connected, so the BIND leg runs -- and that narrowing is the
+	// one clause between this state and a truncating write: classify any stat
+	// failure as "absent, safe to stage" and writeFile0600 create-TRUNCATES what
+	// may be the sandbox user's own credential, the exact loss this verb exists
+	// to prevent. The skip must also not fail the run: the oneshot is ordered
+	// before other units, so an error here would cascade into the boot.
+	try writeMarker(io, marker, "1\n");
+	try reconcile(gpa, io, claude_dir, marker);
+
+	// Give the search bit back (the transient EIO/mode change healed) and read:
+	// the user's bytes, untouched, and no sentinel stamped over them.
+	try cwd.setFilePermissions(io, claude_dir, restored, .{});
+	{
+		const cred = try readCred(gpa, io, claude_dir);
+		defer gpa.free(cred);
+		try std.testing.expectEqualStrings(user_cred, cred);
+	}
 }
 
 test "claude stub: survives a simulated restart (marker persists -> re-staged)" {

@@ -1102,8 +1102,10 @@
 
 					# Stage (marker present) or remove (absent) the redacted stub. The
 					# verb single-sources the stub sentinel from the secret module,
-					# never writes a real token, and removes ONLY a file carrying that
-					# sentinel (a credential an in-guest /login wrote is the user's).
+					# never writes a real token, and TOUCHES ONLY a file carrying that
+					# sentinel -- it neither removes NOR overwrites anything else (a
+					# credential an in-guest /login wrote is the user's, and that
+					# session supersedes the host-managed identity).
 					${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub "$cdir" "$marker"
 				'';
 
@@ -1132,13 +1134,17 @@
 				#     secret and the render gate then emits no inject spec at all.
 				#   marker present, not "0" -> cogworx MANAGED, owner CONNECTED: stage the
 				#     redacted sentinel (the pod-side proxy stamps the real Bearer over
-				#     it); the real token never enters the guest.
+				#     it), but ONLY over an absent file or cogbox's own sentinel -- a
+				#     credential an in-guest /login wrote is the user's and supersedes
+				#     the host-managed identity, so it is left alone (the verb warns to
+				#     the journal when it skips). The real token never enters the guest.
 				#
-				# Both the sentinel AND the removal rule are single-sourced through the
-				# verb (never hardcoded in this shell), so container and VM now share one
-				# rule: "remove only what cogbox wrote". cogworx writes the marker
-				# host-side on the 9p SOURCE and restarts this oneshot (and it re-runs at
-				# every boot, so the persisted marker survives a restart).
+				# Both the sentinel AND the write/remove rule are single-sourced through
+				# the verb (never hardcoded in this shell), so container and VM now share
+				# one rule: "touch only what cogbox wrote" -- write AND remove. cogworx
+				# writes the marker host-side on the 9p SOURCE and restarts this oneshot
+				# (and it re-runs at every boot, so the persisted marker survives a
+				# restart).
 				claudeStubScriptVm = pkgs.writeShellScript "cogbox-claude-stub-vm" ''
 					set -eu
 					marker=/var/lib/cogbox/claude-oauth.bound
@@ -2941,6 +2947,10 @@
 				# against ONE oracle rather than two copies that can drift.
 				mkdir -p zig/src/l7proxy
 				cp ${./zig/src/l7proxy/path_vectors.tsv} zig/src/l7proxy/path_vectors.tsv
+				# The stub-token no-drift assertion compares the launcher's literal
+				# against the Zig one, so stage that source too.
+				mkdir -p zig/src/secret
+				cp ${./zig/src/secret/main.zig} zig/src/secret/main.zig
 				mkdir tests
 				cp ${./tests/test_l7_addon.py} tests/test_l7_addon.py
 				python3 tests/test_l7_addon.py
