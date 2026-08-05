@@ -487,6 +487,23 @@ block metadata access. With it, the boot and control path
 touches no resolver at all. `gce-image-metadata-pin` asserts the realized
 `/etc/hosts` and refuses a resolved configured not to read it.
 
+Leaving the default in place and *choosing* it are indistinguishable in the built
+image, so a **publishable** bake has to say which it means: a config that sets
+`cogworx.gce.controlCAPublicKey` -- the publishability gate, since a CA-less image
+can authenticate no control connection -- while `vpcResolver` still names the VPC
+resolver fails to evaluate unless it also sets
+`cogworx.gce.allowMetadataResolver = true`. That is not a ban on the default; it
+is an acknowledgement, and it exists because the address of a full recursive
+resolver comes from an operator-side module: a bake composed without that module
+falls back to the default silently, and every sandbox from the published image
+then resolves neither internal names nor peering-shadowed public ones, with
+nothing failing loudly. The guard is an assertion in the host module rather than a
+flake check, for the same reason the control-PAM one is: it has to travel into an
+operator's composed build, and an assertion in the operator module would disappear
+together with the module whose absence is the bug. `gce-image-resolver-bake`
+asserts that it fires, that both documented ways out satisfy it, and that the
+CA-less default host still evaluates.
+
 ### Composing additional modules
 
 `lib.mkGceHost` accepts `extraModules`. Security-sensitive SSH options are

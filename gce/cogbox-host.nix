@@ -20,6 +20,7 @@
 #   resolver-deadline.nix the in-VM belt for the resolver self-destruct
 {
 	config,
+	options,
 	lib,
 	pkgs,
 	self,
@@ -29,6 +30,14 @@
 }:
 let
 	cfg = config.cogworx.gce;
+
+	# GCE's VPC resolver, read from `vpcResolver`'s own DECLARATION below rather
+	# than repeated as another literal. The publishability assertion has to
+	# recognise "the default was left in place", and a copy of the address here
+	# would go stale the moment the declared default moved. (`options` is the
+	# merged option TREE passed to every module -- not the `options` attribute
+	# this file returns.)
+	declaredVpcResolver = options.cogworx.gce.vpcResolver.default;
 
 	# The sshd ACCOUNT stack, minus our own rule: the floor the control user's
 	# exemption has to stay below, and the value the assertion compares against.
@@ -247,6 +256,37 @@ in
 				The full recursive resolver systemd-resolved uses for all names.
 				The guest reaches it indirectly through the host-side forwarder.
 				The default is GCE's VPC resolver.
+			'';
+		};
+		allowMetadataResolver = lib.mkOption {
+			type = lib.types.bool;
+			default = false;
+			description = ''
+				Affirms that GCE's VPC/metadata resolver -- `vpcResolver`'s own
+				default -- is the INTENDED upstream for a PUBLISHABLE image.
+
+				It changes nothing at runtime. It exists because leaving the
+				default in place and CHOOSING it are indistinguishable in the
+				built image, and the difference is not small: the VPC resolver
+				NXDOMAINs split-horizon internal names, and returns EMPTY
+				answers for public names a peering zone shadows. A deployment
+				that needs either kind of name must point `vpcResolver` at a
+				full recursive resolver that serves both -- and because the
+				guest resolves through the host's forwarder, a bake that misses
+				that address leaves EVERY sandbox up and healthy resolving
+				neither, with nothing failing loudly.
+
+				That is exactly how the address gets lost: it comes from an
+				operator-side module (the internal resolver's address is not in
+				this tree), so a bake composed WITHOUT that module falls back to
+				this default silently. Hence an affirmation rather than prose:
+				the assertion below refuses a bake that sets
+				`controlCAPublicKey` -- the publishability gate -- while
+				`vpcResolver` still names the VPC resolver, unless this is true.
+				It is an ACKNOWLEDGEMENT, not a ban: the link-local default is a
+				supported configuration (see the DNS-upstream section of the
+				README), and a deployment that genuinely wants it sets one
+				boolean once.
 			'';
 		};
 		l7PortBase = lib.mkOption {
@@ -663,6 +703,29 @@ in
 				message = lib.concatStringsSep "\n\n" [
 					("cogworx.gce: the control user's PAM account exemption is no longer first-and-local in security.pam.services.sshd.rules.account (enable=${lib.boolToString pamControl.enable}, control=\"${pamControl.control}\", order=${toString pamControl.order}, lowest other order=${toString sshdAccountOrderFloor}).")
 					("A directory-backed account module above it can refuse the control certificate whenever its daemon or directory is unavailable.")
+				];
+			}
+			{
+				# A PUBLISHABLE image must have CHOSEN its DNS upstream, and for
+				# the same placement reason as the rule above: the address of a
+				# full recursive resolver comes from an operator-side module, so
+				# an assertion living in THAT module would disappear together
+				# with the address it guards -- which is precisely the bake that
+				# went out resolving neither internal nor shadowed public names.
+				#
+				# Gated on `controlCAPublicKey == ""` because that is already the
+				# publishability gate (see the `warnings` entry below: a CA-less
+				# image is fail-closed and cannot authenticate a control
+				# connection, so it is not publishable). So this fires only on a
+				# bake meant for publication, and the default `packages.gce-image`
+				# output -- CA-less on purpose -- keeps evaluating.
+				assertion = cfg.controlCAPublicKey == ""
+					|| cfg.vpcResolver != declaredVpcResolver
+					|| cfg.allowMetadataResolver;
+				message = lib.concatStringsSep "\n\n" [
+					("cogworx.gce: this image bakes a control CA -- it is meant to be PUBLISHED -- while its DNS upstream is still GCE's VPC/metadata resolver (cogworx.gce.vpcResolver = \"${cfg.vpcResolver}\").")
+					("That resolver NXDOMAINs split-horizon internal names and returns EMPTY answers for public names a peering zone shadows, and the guest resolves through the host's forwarder, so every sandbox created from this image comes up healthy resolving neither -- with nothing failing loudly.")
+					("Set cogworx.gce.vpcResolver to a full recursive resolver that serves both kinds of name, or set cogworx.gce.allowMetadataResolver = true to affirm that the VPC resolver is the intended upstream for this image.")
 				];
 			}
 		];

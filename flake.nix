@@ -2735,6 +2735,29 @@
 			# The realized sshd PAM stack, read as a string so gce-image-control-pam
 			# can assert the ORDER of the account rules rather than their presence.
 			gcePamSshd = gceCfg.security.pam.services.sshd.text;
+			# The DNS-upstream publishability guard (cogworx.gce's second
+			# assertion), exercised through the same bake seam an operator uses:
+			# does a CA-baked host still EVALUATE?
+			#
+			# Forced through `system.build.toplevel.drvPath` because that is the
+			# attribute NixOS makes THROW on a failed assertion. `config.assertions`
+			# is only a list -- a tryEval over it succeeds in every leg, so the
+			# negative leg below would pass no matter what the module asserted.
+			gceResolverBakeEvals = extraModules: (builtins.tryEval (mkGceHost "x86_64-linux" {
+				extraModules = [ { cogworx.gce.controlCAPublicKey = gceBakeCAKey; } ] ++ extraModules;
+			}).config.system.build.toplevel.drvPath).success;
+			# Default upstream, unaffirmed: must NOT evaluate.
+			gceResolverDefaultBakeEvals = gceResolverBakeEvals [ ];
+			# Pointed at another resolver: must evaluate. 192.0.2.1 is
+			# documentation-range (RFC 5737) -- nothing dials it, the leg only reads
+			# whether the assertion fired.
+			gceResolverPointedBakeEvals = gceResolverBakeEvals [ { cogworx.gce.vpcResolver = "192.0.2.1"; } ];
+			# Default upstream, affirmed: must evaluate.
+			gceResolverAffirmedBakeEvals = gceResolverBakeEvals [ { cogworx.gce.allowMetadataResolver = true; } ];
+			# And the CA-less default host, which the guard must leave alone:
+			# `packages.gce-image` builds this one. Memoized -- the other gce-image-*
+			# checks force this same toplevel.
+			gceResolverDefaultHostEvals = (builtins.tryEval gceToplevel.drvPath).success;
 		in lib.optionalAttrs ((mkHarnesses system pkgs) ? "hermes-agent") {
 			# Exercise the same helper used by the container state unit. There is no
 			# container boot harness in this repository, so retain one invocation check.
@@ -3815,6 +3838,61 @@
 				esac
 				if [ "$(printf '%s' "$bakedExtraCA" | grep -c .)" != 2 ]; then
 					echo "FAIL: the baked CA file holds $(printf '%s' "$bakedExtraCA" | grep -c .) key lines, expected 2 (control CA + one contributed); a joined or blank-padded file is not what sshd parses" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The DNS upstream has to be a DELIBERATE bake-time choice, and this
+			# check exists because one bake proved it was not. An image published
+			# WITHOUT the operator-side module that supplies a full recursive
+			# resolver's address left `cogworx.gce.vpcResolver` at its default: every
+			# sandbox created from it came up healthy resolving neither internal
+			# names nor public ones a peering zone shadowed, and nothing surfaced it.
+			# Every existing gce-image-* check passed on that image --
+			# gce-image-guest-dns compares resolved's upstream against the option, so
+			# a fallen-back option agrees with itself.
+			#
+			# The guard is an assertion in the host module rather than a check here,
+			# and it has to be: an assertion in the operator module would vanish
+			# together with the module whose absence IS the bug. What this check adds
+			# is the part an assertion cannot demonstrate about itself -- that it
+			# fires, that both documented ways out satisfy it, and that it leaves the
+			# CA-less default host alone.
+			gce-image-resolver-bake = pkgs.runCommand "gce-image-resolver-bake" {
+				defaultBakeEvals = lib.boolToString gceResolverDefaultBakeEvals;
+				pointedBakeEvals = lib.boolToString gceResolverPointedBakeEvals;
+				affirmedBakeEvals = lib.boolToString gceResolverAffirmedBakeEvals;
+				defaultHostEvals = lib.boolToString gceResolverDefaultHostEvals;
+			} ''
+				fails=0
+				# 1. THE FIRING LEG, and the one that keeps the other three from
+				#    being decoration: a publishable bake (control CA set) that
+				#    left the upstream at its default and did not affirm it must
+				#    not evaluate at all.
+				if [ "$defaultBakeEvals" != false ]; then
+					echo "FAIL: a CA-baked host with cogworx.gce.vpcResolver left at its default still evaluates; the publishability assertion is gone or unreachable, so a bake composed without the module that supplies a full recursive resolver publishes silently, resolving neither internal names nor peering-shadowed public ones" >&2
+					fails=$((fails + 1))
+				fi
+				# 2. Pointing the upstream elsewhere is the fix the assertion's
+				#    message names, so it must evaluate -- otherwise the guard is
+				#    a ban on baking at all.
+				if [ "$pointedBakeEvals" != true ]; then
+					echo "FAIL: a CA-baked host with cogworx.gce.vpcResolver pointed at another resolver does not evaluate; the assertion is comparing the wrong thing and no image could be baked" >&2
+					fails=$((fails + 1))
+				fi
+				# 3. And so must the acknowledgement, because the link-local
+				#    default is a supported configuration, not a defect.
+				if [ "$affirmedBakeEvals" != true ]; then
+					echo "FAIL: a CA-baked host with cogworx.gce.allowMetadataResolver = true does not evaluate; the affirmation the assertion's own message tells an operator to set does not work" >&2
+					fails=$((fails + 1))
+				fi
+				# 4. The CA-less default host is NOT publishable and must stay
+				#    evaluable regardless of its upstream: `packages.gce-image`
+				#    builds it, and so does every other check here.
+				if [ "$defaultHostEvals" != true ]; then
+					echo "FAIL: the default (CA-less) gce host no longer evaluates; the publishability gate has widened past a bake meant for publication and packages.gce-image is dead" >&2
 					fails=$((fails + 1))
 				fi
 				[ "$fails" -eq 0 ] || exit 1
