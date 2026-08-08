@@ -1098,12 +1098,14 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 	// `nix-store --realise` to fetch the recorded runner from the cache -- a
 	// record pointing at a closure that never made it into the cache would make
 	// that realise fail (the launcher then falls back to eval, so it's still
-	// safe, but recording it would be pointless). The rev marker we write is
-	// flake_source, which equals the launcher's baked @flakeSource@ (both the
-	// worker pod and the sandbox launcher run the SAME cogbox image, so the same
-	// COGBOX_FLAKE_SOURCE / @flakeSource@ store path) -- the marker therefore
-	// matches and the record self-heals across image bumps (a stale rev simply
-	// fails the launcher's `[ "$FP_REV" = "@flakeSource@" ]` guard and re-evals).
+	// safe, but recording it would be pointless). The key we write is
+	// "<flake_source>#<reexec package>", which equals the launcher's baked
+	// @flakeSource@#@reexecPackage@ (both the worker pod and the sandbox launcher
+	// run the SAME cogbox image, so the same COGBOX_FLAKE_SOURCE and
+	// COGBOX_REEXEC_PACKAGE) -- the key therefore matches, and the record
+	// self-heals across image bumps and across a different composed package alike
+	// (either one fails the launcher's `[ "$FP_REV" = "$RUNNER_KEY" ]` guard and
+	// re-evals). See writeRunnerRecord for why the package attribute is in there.
 	if (pushed) writeRunnerRecord(ctx, flake_source, first);
 }
 
@@ -1521,6 +1523,20 @@ fn toplevelRecordCurrent(ctx: *const Ctx) bool {
 	return std.mem.eql(u8, std.mem.trim(u8, rec_hash, " \t\r"), cur_hex);
 }
 
+/// Remove the launcher's runner.path fast-path record. Called from
+/// regenComposition, i.e. on every plugin mutation, because the record names a
+/// runner composed from the PREVIOUS plugin set and nothing else in it changes
+/// when that set does. Best-effort: the record is an optimization, so a delete
+/// that fails costs at worst nothing, and a delete that succeeds costs at worst
+/// one eval boot.
+fn removeRunnerRecord(ctx: *const Ctx) void {
+	const allocator = ctx.allocator;
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return;
+	const p = std.fs.path.join(allocator, &.{ instance_config_dir, "runner.path" }) catch return;
+	defer allocator.free(p);
+	std.Io.Dir.cwd().deleteFile(ctx.io, p) catch {};
+}
+
 /// Remove the toplevel record (+ its crash-loop attempt marker) so agentInit boots the baked
 /// base. Called by the reconcile when an instance has no plugins (all removed). Best-effort.
 fn removeToplevelRecord(ctx: *const Ctx) void {
@@ -1539,15 +1555,28 @@ fn removeToplevelRecord(ctx: *const Ctx) void {
 /// The file lives at <instance_config_dir>/runner.path on the shared state PVC
 /// (the worker pod mounts it at the SAME XDG_CONFIG_HOME the sandbox launcher
 /// does), where instance_config_dir = dirname(plugins_flake_dir). Contents must
-/// byte-match what the launcher writes/reads: `printf '%s\n%s\n' <rev> <runner>`
-/// -- two newline-terminated lines, line1 = the flakeSource (image rev) marker,
-/// line2 = the composed runner out-path. Written atomically (tmp + rename) so a
-/// partial write can't leave a half-record the launcher would misread; any
-/// failure is warned and swallowed (a missing/short record just makes the first
-/// boot fall back to eval, never a failed verb).
+/// byte-match what the launcher writes/reads: `printf '%s\n%s\n' <key> <runner>`
+/// -- two newline-terminated lines, line1 = the record KEY, line2 = the composed
+/// runner out-path. Written atomically (tmp + rename) so a partial write can't
+/// leave a half-record the launcher would misread; any failure is warned and
+/// swallowed (a missing/short record just makes the first boot fall back to
+/// eval, never a failed verb).
+///
+/// The key is "<flakeSource>#<reexecPackage>", not the flakeSource alone. One
+/// flake source builds SEVERAL cogbox packages whose composed runners differ
+/// (cogbox vs cogbox-hosted), and their @flakeSource@ is byte-identical, so a
+/// rev-only key let a record written for one validate for the other -- the
+/// launcher would then realize a runner built for a different guest storage
+/// layout and skip the re-exec that would have rebuilt it. COGBOX_REEXEC_PACKAGE
+/// is baked next to COGBOX_FLAKE_SOURCE by mkCogboxAttr; absent (an unwrapped
+/// binary, or an image predating it) it means the default package, "cogbox".
+/// Spelling the key differently from the launcher is not dangerous -- the
+/// launcher simply rejects the record and evals -- but it silently costs a fresh
+/// instance the entire point of this pre-write, so the two must move together.
 fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const u8) void {
 	const allocator = ctx.allocator;
 	const cwd = std.Io.Dir.cwd();
+	const reexec_package = ctx.parent_env.get("COGBOX_REEXEC_PACKAGE") orelse "cogbox";
 
 	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse {
 		warn(ctx, "runner push: plugins-flake dir has no parent; skipping record (boot will eval)", .{}) catch {};
@@ -1558,7 +1587,7 @@ fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const 
 	const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
 	defer allocator.free(tmp_path);
 
-	const contents = std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ flake_source, runner }) catch return;
+	const contents = std.fmt.allocPrint(allocator, "{s}#{s}\n{s}\n", .{ flake_source, reexec_package, runner }) catch return;
 	defer allocator.free(contents);
 
 	{
@@ -1873,6 +1902,25 @@ fn l7RulesOrNull(loaded: *config.Loaded) ?*std.json.Array {
 /// on the next plugin command.
 fn regenComposition(ctx: *const Ctx, plugins_arr: *std.json.Array) !void {
 	const allocator = ctx.allocator;
+
+	// The composition is about to change, so ANY recorded composed runner is now
+	// stale -- drop it before writing the new flake. Without this the launcher's
+	// skip-eval fast path is keyed on the image rev and the package attribute and
+	// on nothing else, so a SECOND plugin add against an unchanged image matched
+	// the record written for the first, realized that runner and skipped the
+	// re-exec that would have composed the new one: the plugin is installed, the
+	// UI says so, and the guest never gets it. On k8s that was masked, because the
+	// worker's prebuildAndPushRunner overwrites the record moments later from
+	// finalizeComposition; on a backend with no worker pod (GCE) nothing rewrote
+	// it and the staleness was permanent until the image rev moved.
+	//
+	// Unconditional, including the no-plugins branch below: an instance whose last
+	// plugin was just removed must not keep a record either, and a delete of a
+	// file that is not there is free. Best-effort by construction -- removeRecord
+	// swallows its errors -- and losing the record can only cost one eval boot,
+	// which is exactly what correctness requires here anyway.
+	removeRunnerRecord(ctx);
+
 	if (plugins_arr.items.len == 0) {
 		try compose.removeCompositionFlake(allocator, ctx.io, ctx.plugins_flake_dir);
 		return;

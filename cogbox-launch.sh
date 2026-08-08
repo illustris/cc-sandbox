@@ -855,6 +855,13 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		else
 			read -r INIT_SSH INIT_HTTP INIT_L7 <<< "$(next_available_ports)"
 		fi
+		# NOTE: no storeOverlaySize key. It used to be seeded as "16G", which
+		# resize-store-overlay.service then remounted /nix/.rw-store to on every
+		# boot -- larger than the guest's entire RAM, so a large `nix build`
+		# OOM-killed the guest instead of failing cleanly with ENOSPC. Absent, the
+		# guest keeps whatever the flake declares (a fraction of RAM on the
+		# workstation profile, a block volume on the hosted one); an operator who
+		# sets the key explicitly still wins.
 		jq -n --tab \
 			--argjson vcpu "$INIT_VCPU" \
 			--argjson mem "$INIT_MEM" \
@@ -870,7 +877,6 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 				httpPort: $http,
 				l7PortBase: $l7base,
 				overlaySize: "128M",
-				storeOverlaySize: "16G",
 				bindAddr: $bindaddr,
 				network: $network
 			}' > "$INSTANCE_CONFIG_DIR/config.json"
@@ -982,13 +988,46 @@ fi
 # RUNNER_DIR at it. The plugins re-exec re-evaluates the ENTIRE cogbox NixOS
 # config every boot (~100s cold) because --override-input marks the flake
 # mutable and disables nix's eval cache.
+#
+# @reexecPackage@ is the flake PACKAGE ATTRIBUTE to re-exec through, baked in by
+# mkCogbox, and it is not decoration: `nix run path:<flake>` with no attribute
+# resolves packages.default, which is always the WORKSTATION `cogbox`. On the GCE
+# backend the image bakes cogbox-hosted, whose guest keeps work/ and
+# machine-state on a dedicated block volume -- so an attribute-less re-exec would
+# rebuild the workstation guest instead, and the first plugin add would silently
+# unmount the user's data pool and show them the stale retained 9p work tree.
+# @reexecPackage@ is "cogbox" for every non-GCE build, i.e. exactly what
+# packages.default already resolved to.
 RUNNER_DIR="${RUNNER_DIR:-@runner@}"
 # Self-recorded fast path (plugins only). Once a plugins re-exec has built the
 # composed runner, it writes its out-path here so the NEXT boot can realize
 # that store path directly -- no flake eval. The file lives on the state PVC
 # (under INSTANCE_CONFIG_DIR), so it persists across boots. Two lines:
-#   line1 = the cogbox flakeSource (image rev) the runner was built against;
+#   line1 = the RECORD KEY, "<flakeSource>#<reexecPackage>";
 #   line2 = the composed runner out-path.
+#
+# The key carries the package attribute and not just the image rev, and that is
+# not decoration. @flakeSource@ is BYTE-IDENTICAL for cogbox and cogbox-hosted
+# -- they are two packages built from one flake source -- while @runner@ and the
+# composed runner built from it are not. Keyed on the rev alone, a record
+# written by one package validated for the other, so a boot could realize a
+# runner composed against a DIFFERENT guest storage layout and skip the re-exec
+# that would have rebuilt it. That is a whole-instance failure in both
+# directions (a guest that cannot open its drives, or one that mounts the wrong
+# ones and shows an empty work tree), and it is sticky, because FAST_PATH=1 is
+# precisely the path that does not rewrite the record.
+#
+# The GCE image now bakes exactly one package, so the collision has no live
+# instance to happen on; this closes it at the source anyway, because the record
+# outlives any single image and the cost is one string.
+#
+# A record written by an OLDER cogbox carries the bare flakeSource on line 1 and
+# therefore no longer matches. That is the intended and only behaviour: the boot
+# falls through to the normal re-exec, which rewrites the record in the new form.
+# It costs one eval boot, and every such instance was going to pay one anyway --
+# changing this file changes ${self}, so @flakeSource@ itself moved and the old
+# record would have missed on the rev alone.
+RUNNER_KEY="@flakeSource@#@reexecPackage@"
 RUNNER_PATH_FILE="$INSTANCE_CONFIG_DIR/runner.path"
 FAST_PATH=0
 
@@ -1037,8 +1076,9 @@ if [ -z "${COGBOX_REEXECED:-}" ]; then
 		FP_REV="" FP_RUNNER=""
 		{ IFS= read -r FP_REV; IFS= read -r FP_RUNNER; } < "$RUNNER_PATH_FILE" || true
 		# Only trust the record when it was written against the current image
-		# rev (@flakeSource@ expands to this cogbox's source store path).
-		if [ "$FP_REV" = "@flakeSource@" ] && [ -n "$FP_RUNNER" ]; then
+		# rev AND the same package attribute -- see RUNNER_KEY above for why the
+		# rev alone is not a key.
+		if [ "$FP_REV" = "$RUNNER_KEY" ] && [ -n "$FP_RUNNER" ]; then
 			if [ -e "$FP_RUNNER/bin/microvm-run" ]; then
 				RUNNER_DIR="$FP_RUNNER"
 				FAST_PATH=1
@@ -1056,7 +1096,7 @@ if [ -z "${COGBOX_REEXECED:-}" ] && [ "$FAST_PATH" -ne 1 ]; then
 		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
 			"${PLUGIN_SUBST_OPTS[@]}" \
-			run "path:@flakeSource@" \
+			run "path:@flakeSource@#@reexecPackage@" \
 			--override-input userExtensions "path:$PLUGINS_FLAKE_DIR" \
 			--override-input userExtensions/user/nixpkgs "path:@nixpkgsSource@" \
 			-- "${ORIG_ARGS[@]}"
@@ -1069,7 +1109,7 @@ if [ -z "${COGBOX_REEXECED:-}" ] && [ "$FAST_PATH" -ne 1 ]; then
 		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
 			"${PLUGIN_SUBST_OPTS[@]}" \
-			run "path:@flakeSource@" \
+			run "path:@flakeSource@#@reexecPackage@" \
 			--override-input userExtensions "path:$INSTANCE_FLAKE_DIR" \
 			--override-input userExtensions/nixpkgs "path:@nixpkgsSource@" \
 			-- "${ORIG_ARGS[@]}"
@@ -1084,7 +1124,7 @@ fi
 # re-exec stays on the eval path). Best-effort: a write failure must not abort
 # boot, hence the `|| true`.
 if [ -n "${COGBOX_REEXECED:-}" ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
-	printf '%s\n%s\n' "@flakeSource@" "@runner@" > "$RUNNER_PATH_FILE" 2>/dev/null || true
+	printf '%s\n%s\n' "$RUNNER_KEY" "@runner@" > "$RUNNER_PATH_FILE" 2>/dev/null || true
 fi
 
 # -- init-only stops here ------------------------------------------
@@ -1113,7 +1153,12 @@ HTTP_PORT=$(jq -r '.httpPort // 8080' "$ACTIVE_CONFIG")
 L7_BASE=$(jq -r '.l7PortBase // 18443' "$ACTIVE_CONFIG")
 L7_MITM_PORT=$(( L7_BASE + 2 ))
 OVERLAY_SIZE=$(jq -r '.overlaySize // "128M"' "$ACTIVE_CONFIG")
-STORE_OVERLAY_SIZE=$(jq -r '.storeOverlaySize // "16G"' "$ACTIVE_CONFIG")
+# Empty, not "16G": the size file this writes is what resize-store-overlay.service
+# remounts /nix/.rw-store to, and 16G exceeds the guest's whole RAM, so the old
+# default turned a large in-guest `nix build` into an OOM instead of an ENOSPC. No
+# file => the guest keeps the size the flake declares. An explicit config value is
+# still honoured, so an operator can pin one per instance.
+STORE_OVERLAY_SIZE=$(jq -r '.storeOverlaySize // ""' "$ACTIVE_CONFIG")
 BIND_ADDR=$(jq -r '.bindAddr // "127.0.0.1"' "$ACTIVE_CONFIG")
 
 # -- Host-integration knobs (all empty/off by default) --------------
@@ -1232,7 +1277,22 @@ fi
 # -- Write VM-side config into the data directory ------------------
 mkdir -p "$REAL_DATA/.config"
 echo "$OVERLAY_SIZE" > "$REAL_DATA/.config/overlay-size"
-echo "$STORE_OVERLAY_SIZE" > "$REAL_DATA/.config/store-overlay-size"
+# Only write the store-overlay size when one was actually configured. An ABSENT
+# file means "use the size the flake declared"; a present file means "remount to
+# this", and resize-store-overlay.service reads it on every boot. Writing an empty
+# file would make that unit remount to size= (invalid), so remove instead -- and
+# removing it is also how an instance created before this change stops being
+# pinned to the old 16G once its config.json no longer names a size.
+# Note the reach: an instance created BEFORE this change still has an explicit
+# storeOverlaySize in its config.json, so it keeps being pinned to whatever that
+# says until the key is removed. Deliberate -- silently rewriting a user's instance
+# config is worse than a stale size, and the hosted profile is covered anyway
+# because resize-store-overlay.service is gated off there.
+if [ -n "$STORE_OVERLAY_SIZE" ]; then
+	echo "$STORE_OVERLAY_SIZE" > "$REAL_DATA/.config/store-overlay-size"
+else
+	rm -f "$REAL_DATA/.config/store-overlay-size"
+fi
 # The VM's authorized_keys is the user-managed file (per-instance override, else
 # the shared one) unioned with cogbox's own pubkey, so `cogbox ssh` works out of
 # the box. The union is keyed on the key file's existence, not the AUTO_KEYS
@@ -1433,6 +1493,47 @@ trap cogbox_cleanup EXIT
 trap 'exit 143' TERM INT
 
 ln -sfn "$REAL_DATA" "$RUNTIME/data"
+
+# The machine-state pool image (workstation profile with
+# `cogbox.storage.machineState = "persist"`; the path does not exist otherwise).
+# It has an `[ ! -e "$image" ]` autoCreate hazard -- a first mkfs interrupted by a
+# Ctrl-C, a host reboot or a full disk leaves the file present with a garbage
+# superblock, autoCreate skips it forever, and /var/lib/cogbox-guest then fails to
+# mount on every subsequent boot.
+#
+# Nothing analogous is needed for the HOSTED profile's two volumes: they are
+# logical volumes on the dedicated per-instance disk, both autoCreate = false, and
+# the GCE host half owns creating, sizing and formatting them before this script
+# ever runs. There is no image file in the instance data dir for either of them.
+#
+# It CANNOT be handled by deleting the image, because this one holds the USER'S
+# DATA: ~/.cache, ~/.local, ~/.config, /var/lib/docker and the
+# guest journal, up to the whole configured pool size. `dumpe2fs -h` reads ONLY
+# the primary superblock, and a damaged primary superblock is the ordinary
+# recoverable case -- ext4 keeps backups, and `e2fsck -b 32768 <img>` is the
+# standard repair -- so this test cannot tell a never-formatted image from a
+# populated one with one bad block. Deleting on that test would destroy a
+# recoverable filesystem, unprompted, on every `cogbox start`.
+#
+# So RENAME, never remove. The runner's createVolumesScript then finds no image
+# and creates a fresh one, so the self-heal is the same; the difference is that
+# the old bytes are still there to fsck. The timestamp suffix is deliberate: a
+# second interruption must not overwrite the first casualty.
+#
+# harness-overlay-img does delete-and-recreate on this same test, and that stays
+# as it is: it is a 128 MiB guest-side overlay whose contents the read-only 9p
+# lower can supply again, and its history is a boot that WEDGED because a corrupt
+# image was kept. This is a host-side data pool. Different bytes, different rule.
+MACHINE_STATE_IMG="$RUNTIME/data/machine-state.img"
+if [ -f "$MACHINE_STATE_IMG" ] && ! @dumpe2fs@ -h "$MACHINE_STATE_IMG" >/dev/null 2>&1; then
+	MACHINE_STATE_ASIDE="$MACHINE_STATE_IMG.corrupt-$(date -u +%Y%m%d%H%M%S)"
+	if mv "$MACHINE_STATE_IMG" "$MACHINE_STATE_ASIDE"; then
+		echo "cogbox: $MACHINE_STATE_IMG has no readable ext4 primary superblock (interrupted first format, or a crash mid-write); moved it to $MACHINE_STATE_ASIDE and letting the runner create a fresh one. It is NOT deleted -- if it was a populated pool, ext4 keeps backup superblocks and 'e2fsck -b 32768 $MACHINE_STATE_ASIDE' is the repair." >&2
+	else
+		echo "cogbox: $MACHINE_STATE_IMG has no readable ext4 primary superblock and could not be moved aside; refusing to start rather than booting a guest whose data pool cannot mount" >&2
+		exit 1
+	fi
+fi
 
 # -- Per-harness runtime sources -----------------------------------
 # The QEMU runner expects a 9p source path or fw_cfg file at

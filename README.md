@@ -246,7 +246,7 @@ VM -- no rebuild needed.
 | `sshPort` | int | 2222 | Host port forwarded to guest SSH (22) |
 | `httpPort` | int | 8080 | Host port forwarded to guest 8080 |
 | `overlaySize` | string | `128M` | Persistent harness overlay image |
-| `storeOverlaySize` | string | `16G` | Writable nix store tmpfs |
+| `storeOverlaySize` | string | absent | Optional override for the writable nix store tmpfs. Absent means "whatever the guest declares" (half of RAM). It used to be seeded as `16G`, which is more than the guest's entire RAM, so a large in-guest `nix build` OOM-killed the guest instead of failing with `ENOSPC`. |
 | `bindAddr` | string | `127.0.0.1` | Host bind address for port forwards |
 | `network` | string/object | seeded `rules` | `"full"`, `"none"`, or `{"rules":[...]}` |
 | `network.implicitDns` | bool | absent (`true`) | `false` drops the implicit port-53 allow for this instance |
@@ -309,12 +309,206 @@ variables -- see [Internals](docs/internals.md#host-side-path-overrides).
 |---|---|
 | vCPUs | 16 |
 | RAM | 32 GB |
-| Writable nix store | 16 GB tmpfs overlay |
+| Guest root (`/`) | tmpfs, half of RAM |
+| Writable nix store | tmpfs overlay, half of RAM |
 | Harness overlay (shared) | 128 MB ext4 image, per-harness subdirs |
 | SSH | 127.0.0.1:2222 -> 22 |
 | HTTP | 127.0.0.1:8080 -> 8080 |
 | Network | rules (private/bogon denied, public allowed) |
 | Docker | enabled |
+| Storage profile | `workstation` (see below) |
+
+### Storage profiles
+
+Where durable guest data lives is a single internal option,
+`cogbox.storage.profile`, because the right answer differs by deployment:
+
+| Class | `workstation` (default) | `hosted` |
+|---|---|---|
+| Host harness config | read-only 9p lower | read-only 9p lower |
+| `work` tree | 9p share of the instance data dir | data-pool volume on the dedicated disk |
+| harness-config diffs | 128 MB ext4 loop image | data-pool volume on the dedicated disk |
+| machine-state (`~/.cache`, `~/.local`, `~/.config`, `/var/lib/docker`, journal) | tmpfs root (opt in with `machineState = "persist"`) | data-pool volume on the dedicated disk |
+| writable `/nix/store` upper | tmpfs, half of RAM | its own volume on the same disk, remade each host boot |
+| `/tmp` | tmpfs | tmpfs |
+
+`workstation` is the historical layout and is what a developer running
+`cogbox` on their own machine wants: the host filesystem is precious and
+shared, the sandbox is meant to be re-creatable, and a RAM-backed root is a
+feature. `hosted` is for a platform that runs one sandbox per disposable
+single-tenant VM, where the guest *is* the user's only machine and nothing
+should be lost on reboot. Set it with an extra module:
+
+```nix
+extraModules = [ { cogbox.storage.profile = "hosted"; } ];
+```
+
+`hosted` needs TWO block volumes -- the data pool and the writable
+`/nix/store` upper, which has to be its own volume because `microvm.nix` marks
+a volume `neededForBoot` exactly when its mount point is the writable store
+overlay. They come from ONE dedicated disk, carved into a volume group with a
+logical volume each. That is LVM rather than two partitions for one reason:
+growing a disk only ever yields free space after the *last* partition, so with
+fixed partitions whichever one sits first could never be extended and one
+concern would permanently block the other's growth. A volume group shares its
+free extents, so either volume can take new space.
+
+The carving is entirely host-side (`cogworx-guest-disk.service` on the GCE
+backend). The guest is never told about it: it sees two ordinary virtio-blk
+devices and mounts them by filesystem *label*, so there is no volume-group
+activation anywhere on the guest's boot path.
+
+Under `hosted` a pool that fails to appear must still yield a guest you can
+log into, and that takes three mechanisms rather than one. Every bind carries
+`x-systemd.requires=` on the pool, which is what stops a bind from showing an
+empty directory where the user's data should be; and every mount an absent pool
+can fail is `nofail`, which is what keeps that failure from failing
+`local-fs.target`, whose `OnFailure=emergency.target` would leave the guest with
+no sshd at all. The second set is larger than it looks: besides the pool and its
+binds it includes the four harness overlay mounts and the two opencode ephemeral
+binds, none of which name a pool path in their own fstab line -- systemd derives
+a hard `Requires=` on the pool for them from their parent directory, their bind
+source and their overlay upper/work dirs. `cogbox-guest-pool-degradable` derives
+that set from the realized fstab and fails the build if any member of it is
+`local-fs.target`-required.
+
+The third is about SERVICES, and `nofail` cannot reach it: a service that
+hard-`Requires=` one of those mounts fails when the mount does, taking whatever
+it was preparing with it. That is a class, not a list -- the same mounts are
+perfectly ordinary preconditions under `workstation` -- so a service names the
+mount *paths* it depends on and the profile decides the strength: `Requires=`
+where the mount is a genuine precondition in every profile, `Wants=` (plus the
+same `After=`) where `hosted` moves it onto the pool. Three units are in it
+today: `harness-setup-dirs`, whose failure would leave the harness overlay
+upperdirs uncreated; `cogbox-brain-materialize`, whose failure is a work tree
+with no brain; and `cogbox-claude-stub`, whose failure leaves a credential the
+control plane believes it reconciled. `cogbox-guest-pool-degradable` scans every
+realized service unit for both spellings of the hard dependency (`Requires=` and
+`RequiresMountsFor=`), so a service added later joins the rule or fails the
+build.
+
+Every one of those units is a `Type=oneshot`, for which systemd *disables* the
+start timeout by default, and several of them sit in front of sshd. Each
+therefore carries an explicit `TimeoutStartSec` with the reason in a comment
+beside it -- an unbounded oneshot on the boot path is a guest that hangs with
+nothing in `systemctl --failed`, which is indistinguishable from the wedge this
+whole profile is written against. The bounds are chosen to degrade rather than
+wedge: at the deadline the unit fails, its dependent binds do not happen, and
+`nofail` turns that into the pre-pool layout instead of `emergency.target`.
+
+**`nofail` bounds a FAILURE; only a timeout bounds a HANG -- and the jobs that
+can hang are mostly not written here.** A pass-2 pool line makes
+systemd-fstab-generator emit a hard `Requires=` on `systemd-fsck@<device>`, and
+`autoResize` (which renders as nothing but `x-systemd.growfs`) makes it emit
+`systemd-growfs@<mount>` plus an ordering drop-in that puts `local-fs.target`
+*after* it. Both of those upstream units ship `TimeoutSec=infinity`. A provider
+disk that answers its device probe and then stalls on reads -- the same fault
+class this profile is written against, and one the 30s
+`x-systemd.device-timeout` does not cover, because that bounds the device
+appearing and not the reads afterwards -- leaves either job in uninterruptible
+D-state, so the mount job never completes and the guest sits in "Booting" with
+an *empty* `systemctl --failed`. Two units nixpkgs contributes are in the same
+class: `systemd-tmpfiles-setup`, which chowns `/var/log/journal` (a pool bind
+here) and gates `sysinit.target`, and the `rw-<mount>` overlay pre-mount units,
+which mkdir their upper/work dirs on the pool ahead of
+`cogbox-brain-materialize`. All of them get a finite bound under `poolEnabled`,
+and each bound sets `TimeoutStopSec` as well: bounding only the start fires
+SIGTERM at a process wedged in D-state on the device that stalled and then waits
+forever for it to die, which parks the unit in `deactivating` and wedges the
+boot one state further along. `cogbox-guest-pool-boot-bounded` re-derives those
+unit names from the generator's own output and fails the build if a rendered
+bound does not match one -- the only way an escaping mistake or a label rename
+shows up, since a drop-in naming an instance systemd never creates is silent.
+None of this is `hosted`-only: `workstation` with `machineState = "persist"`
+declares the same volume with the same label and gets the same generated jobs,
+so the check runs over both profiles.
+
+Nor is it guest-only. The GCE **host** has the identical shape and had it worse:
+its `/var/lib/cogbox-state` fstab line carries `x-systemd.before=sshd.service`
+*and* `x-systemd.before=cogworx-supervisor.service`, so the two jobs systemd
+interposes on that mount -- `cogworx-state-disk.service` (a `Type=oneshot`, for
+which systemd DISABLES the start timeout by default) and the
+`systemd-fsck@<device>.service` the generator synthesises from the pass-2 line
+(upstream `TimeoutSec=infinity`) -- could each hold *both* the host's sshd and
+the VM launcher indefinitely. With the supervisor gone there is no
+`ssh <vm> cogbox <verb>` control channel left, so that state has no recovery
+path at all. Both are bounded now, and `gce-image-host-boot-bounded` derives the
+unit names from the generator's output over the host fstab exactly as the guest
+check does. `nofail` does not substitute for either bound: it unhooks the mount
+from `local-fs.target` and leaves the explicit `x-systemd.before=` edges in
+place. **`nofail` bounds FAILURE; only a timeout bounds a HANG.**
+
+What a pool-less boot gives you, stated precisely and **not** as "it degrades to
+`workstation`": sshd comes up, and `~/work` is whatever is at the legacy 9p
+path. **Read that literally, because it depends on whether the instance has
+already migrated.** Before the migration it is the user's full work tree,
+untouched. *After* it, the migration has renamed that directory to
+`work.pre-pool` and left an empty one in its place -- deliberately, so that a
+boot on the pre-pool layout cannot present a stale copy as current -- so `~/work`
+is **EMPTY** on such a boot. Harness *state* is not available either --
+`/root/.claude` and friends are pool-backed under this profile, so their overlays
+do not mount and the harnesses start from their baked defaults.
+
+**This is a boot to diagnose from, not a supported way to run**, and that is the
+whole reason `nofail` is still on the pool mount. It is not a second storage
+mode and it is not a fallback: a pool the host carved, formatted and labelled
+successfully which the guest then cannot mount is the *one* fault on this path
+that the host cannot see, so the guest has to come up far enough to put the
+failed mount in its own `systemctl --failed` where a person can read it.
+Fail-closed there would give you `emergency.target`, no sshd, and no explanation
+on either side. Nothing is silently lost in the meantime: anything a user writes
+into that empty tree is found by the next healthy boot, which fires the fork
+warning naming both trees and both sizes and retires the legacy copy under a
+numbered `.pre-pool.1`, `.2`, ... rather than hiding it under the bind.
+
+The GCE image is **hosted-only**. There is one baked guest storage profile and
+nothing selects between two at runtime. An earlier revision put a chooser in
+front of `cogbox` that fell back to the workstation runner whenever the host
+would not carve; it was removed, and the reason was not the ~23 MB of extra
+closure it cost. It was that the image could then run in two modes while every
+piece of per-instance state -- the state disk, the instance config dir, the
+recorded runner path, the retained 9p work tree, the harness overlay image --
+persisted **across the flip**. Four separate blocker rounds each turned up one
+instance of that; they were one structural fact, and removing the flip removes
+the class.
+
+So when `cogworx-guest-disk` refuses -- absent disk, unreadable disk, foreign
+filesystem, foreign volume group -- there are no logical volumes for QEMU to
+open and **the guest does not start**. That outcome is accepted. What is not
+accepted is the shape it used to have, an instance stuck in "Booting" that
+nobody could diagnose, so three things make it legible and all three are
+asserted by `gce-image-hosted-guest-profile`:
+
+- the **host half stays up and reachable** -- `cogworx-guest-disk` declares no
+  host mount, orders itself before nothing on the host's boot path, and the
+  supervisor only `Wants=` it, so sshd and `ssh <vm> cogbox <verb>` answer on
+  exactly the boots where the guest does not;
+- the failure is a **failed unit**, not a job parked in `activating`: three of
+  the four refusals exit non-zero and the unit carries an explicit finite
+  `TimeoutStartSec` (a `Type=oneshot` has none by default);
+- and it is **named**. `cogworx-supervisor` is handed the hosted guest's own
+  volume paths as `COGWORX_GUEST_VOLUMES`, and supervise.sh leg (e2) tests them
+  before the launch and fatals with the missing device on serial -- the one
+  channel the control plane has on a VM whose guest never came up. The fourth
+  refusal, an absent device, is exit 0 on purpose: a resolver VM legitimately
+  boots this image with no guest disk, and that unit cannot tell the two apart.
+  Leg (e2) can, because it only runs on a boot that is about to start a guest.
+
+Growing an instance is "grow the disk, restart", and the two volumes get there
+by different routes. The host runs `pvresize` and then extends the volumes --
+the store overlay to its configured size, the pool into whatever is left -- and
+it does that *before* the guest launches, so the guest never sees the old size.
+The pool's filesystem is then grown by the guest, because the pool mounts
+`autoResize`, which works only there: `x-systemd.growfs` needs
+`systemd-growfs@.service`, a stage-2 unit with no counterpart in the initrd.
+The store overlay *is* an initrd mount, so nothing in the guest could grow it;
+instead the host lays its filesystem down fresh at the volume's current size on
+every host boot. That also keeps the `/nix/store` upper exactly as ephemeral as
+the tmpfs it replaces, and self-heals a `mkfs` that was interrupted on a volume
+the guest's stage 1 cannot boot without.
+
+The read-only harness lower is identical in both profiles -- that is the
+security property, and the hosted case loses nothing by keeping it.
 
 Pre-installed tools: core — `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`, `nixfs`; search/files — `ripgrep`, `fd`, `bat`, `sd`; data wrangling — `yq-go`, `duckdb`, `miller`, `dasel`, `gron`, `datamash`, `jo`; HTTP/DNS/web — `xh`, `websocat`, `dnsutils`, `htmlq`, `pup`; shell glue — `moreutils` (plus `xargs -P` for parallelism).
 Harness binaries (with launchers): `claude-code` (`c`), `hermes-agent`
@@ -336,12 +530,15 @@ instead of its own pod; nothing in it changes the local or Kubernetes paths.
 | `nixosConfigurations.cogbox-x86_64-gce` | The host system. x86_64 only -- GCE nested virtualization is Intel-series only |
 | `packages.x86_64-linux.gce-image` | `disk.raw` in the sparse gzipped tar `gcloud compute images create` imports |
 | `apps.x86_64-linux.push-gce-image` | Stage in GCS + register the image in a family. Run it with the image-pipeline identity, never the control plane's credential |
+| `nixosConfigurations.cogbox-<arch>-hosted` | The guest with `cogbox.storage.profile = "hosted"`. A separate configuration because the guest closure is baked into a package, and a host module cannot reach a guest option |
+| `packages.<system>.cogbox-hosted` | `cogbox` baked against that guest. The GCE image ships this and ONLY this -- it is hosted-only, `packages.cogbox` and its runner are not in the image closure, and nothing chooses between them at launch; nothing else uses it |
 
 Units, all root-owned:
 
 | Unit | Job |
 |---|---|
 | `cogworx-state-disk.service` | Format `/dev/disk/by-id/google-cogworx-state` on first boot ONLY (`blkid` guard); an unconditional mkfs would destroy the L7 CA, the secret store and the VM host key on every resume |
+| `cogworx-guest-disk.service` | Carve `/dev/disk/by-id/google-cogworx-guest` into a volume group with two logical volumes -- the guest's data pool and its writable `/nix/store` overlay -- keep them grown to the disk, and put a labelled ext4 on each. It NEVER MOUNTS a guest filesystem; the volumes are handed straight to QEMU. Five cases: absent (exit 0, a resolver VM has no such disk), unreadable (exit 1, a fault), already-LVM (recognised, nothing re-created), a foreign filesystem or volume group (left alone), and provably blank (carved). The pool's `mkfs` is guarded by the same three probes as the disk, because it holds the user's only copy of their work tree: blankness must be PROVED by a successful read, then left unrefuted by `blkid -p` (exit 2, no TYPE) and by `wipefs --no-act` (exit 0, no signature) -- a read proof is required because a device that errors on read looks identical to a blank one through either signature probe. The store overlay's `mkfs` is deliberately unconditional: it holds no user data, and remaking it is both how it stays ephemeral and how it grows. Pulled in and ordered by the supervisor (`Wants=`/`After=`, deliberately not `Requires=`), since with no host mount unit there is no `x-systemd.before=` seam and neither `mkfs` nor a grow may race the VM launch |
 | `cogworx-attr-scrub.service` | Delete the previous boot's readiness/host-key guest attributes. Retries forever, and is deliberately independent of the floor unit |
 | `cogworx-floor.service` | Install the nftables floor, then verify it with seven live connect probes -- three of them against a listener the probe binds itself -- and refuse the boot if the self-address set is empty |
 | `cogworx-supervisor.service` | The sandbox lifecycle. `Requires=` both of the above, so a failed floor or scrub can never yield a running sandbox |
@@ -445,10 +642,33 @@ Guest attributes published back, both stamped `<nonce> <payload>`:
 `cogworx/vm-host-key` (every boot class, before any sandbox start) and
 `cogworx/ready` (level-held; deleted when the sandbox stops).
 
-Two things the image cannot supply and the operator must:
+Three things the image cannot supply and the operator must:
 `cogworx.gce.controlCAPublicKey` (empty means sshd trusts no control CA and
-nothing can log in), and a state disk attached with the fixed `deviceName`
-`cogworx-state`.
+nothing can log in), a state disk attached with the fixed `deviceName`
+`cogworx-state`, and -- for the hosted storage profile below -- a second data
+disk attached with the fixed `deviceName` `cogworx-guest`. Both device names are
+cross-repo wire contracts with the control plane, not provider-assigned values:
+the host resolves them as `/dev/disk/by-id/google-<deviceName>` and can only
+find a disk whose name both halves spell the same way. The guest disk is
+**required for a sandbox boot**: a VM without one still reaches
+`multi-user.target`, and its sshd and control channel answer normally, but with
+no volume group there is nothing for QEMU to open, so no sandbox starts and
+`cogworx-supervisor` fatals on serial naming the missing volume. (That is why
+`cogworx-guest-disk` itself treats an absent disk as exit 0 -- a resolver VM
+boots this same image with no guest disk by design, and that unit runs on every
+boot class.) Size the guest disk for both halves of what it carries -- the store
+overlay's logical volume is thick, taking `cogworx.gce.storeOverlaySizeMiB`
+(16 GiB by default) outright, and the data pool gets the rest.
+
+This image is **hosted-only**: it bakes the `hosted` storage profile and nothing
+selects a second one at runtime. It does NOT need `cogbox.storage.profile`
+passed to `mkGceHost`, and passing it there would do nothing. `mkGceHost`'s
+`extraModules` configure the HOST system, whereas the storage profile is a GUEST
+option, and the guest closure is baked inside `packages.cogbox-hosted` (the
+runner's store path is substituted into `cogbox-launch.sh`). That is why the
+hosted guest is a second `nixosConfiguration` and a second package -- exactly one
+of which ships here: `cogbox` on this host is a thin environment wrapper around
+`cogbox-hosted`, and the workstation runner is not in the image closure at all.
 
 `packages.gce-image` builds the DEFAULT host config, whose
 `controlCAPublicKey` is empty -- fail-closed, and therefore not publishable.
@@ -522,11 +742,71 @@ explicitly.
   `aarch64-linux` only.
 - One instance per name at a time (PID lock per runtime directory).
   Multiple differently-named instances can run simultaneously.
-- The writable nix store overlay is a tmpfs -- installed packages do not
-  persist across VM reboots (but see
-  [pre-populating the store](docs/extensions.md#example-pre-populate-the-nix-store-with-build-deps)).
+- Installed packages do not persist across VM reboots: the writable nix
+  store overlay is wiped in both storage profiles -- a tmpfs under
+  `workstation`, so on every guest boot; a block volume the host reformats
+  under `hosted`, so on every *host* boot (a guest relaunch inside one host
+  boot keeps it, which is harmless -- store paths are content-addressed). See
+  [pre-populating the store](docs/extensions.md#example-pre-populate-the-nix-store-with-build-deps).
 - Changing `overlaySize` only affects newly created overlay images; delete
-  the overlay image to recreate with a new size.
+  the overlay image to recreate with a new size. The `hosted` profile has no
+  overlay image at all, so the knob does nothing there.
+- Under `hosted`, the two surfaces that already held persistent data are
+  migrated once, on the first hosted boot: the `work` tree (from the 9p
+  share) and the harness overlay uppers (from the `overlaySize` loop image).
+  Either migration refuses rather than half-copies, and a refusal leaves that
+  one path on its old home instead of failing the boot. Machine-state that
+  lived on the tmpfs root is *not* migrated -- it never survived a reboot to
+  begin with. Both are bounded (15 minutes for `work`, 5 for the overlay
+  image), because the `work` bind is ordered in front of sshd: a copy that
+  wedges would otherwise hold the login prompt for the rest of the boot. A
+  migration killed at its deadline writes no marker, so the next boot retries
+  it from scratch and the legacy copy stays authoritative meanwhile.
+- A completed migration RETAINS the copy it replaced, renamed to
+  `work.pre-pool` / `harness-overlay.img.pre-pool` on the same share.
+  Renamed, not merely shadowed by the bind: a boot on the pre-pool layout --
+  a rolled-back image, or a boot where the pool did not appear -- would
+  otherwise present a stale-but-complete-looking tree as if it were current,
+  and the next healthy boot would hide whatever was written into it. If a
+  fork does form anyway, the pool copy wins and the migration says so loudly,
+  naming both paths and both sizes, and retires the other side so the same
+  fork cannot form twice. Nothing is ever deleted; reclaiming the
+  `.pre-pool` copies is a deliberate later step.
+- "The legacy copy is occupied" means it holds a REGULAR FILE -- the same
+  definition of content the migration's own `measure()` uses -- and not "it has
+  an entry in it". That distinction is the whole point, because on both legs the
+  system SCAFFOLDS the legacy surface before anything can look at it, so neither
+  copy is ever empty by the time it is judged. `harness-overlay-img` lays a fresh
+  ext4 back at the legacy path whenever a hosted instance takes one boot on the
+  `workstation` runner, and `harness-setup-dirs` then mkdirs every harness's
+  overlay upper/work tree into it; `cogbox-brain-materialize` is wantedBy
+  `multi-user.target` in every VM profile and writes `.cogbox/brain`, the
+  `.claude/` and `.opencode/` link trees and `AGENTS.md` into `~/work` on any
+  boot where the pool bind did not happen. Every one of those writes is a
+  directory or a symlink, so the tree's own `files/bytes` reads `0 0` -- and
+  judging occupancy by apparent size, or by a readdir, fired the fork warning on
+  that non-event and stashed the copy, leaking one `.pre-pool` onto the state
+  disk per hosted<->workstation flap with nothing to reclaim it. The harness leg
+  still reads the superblock and loop-mounts the image to look inside (it cannot
+  be judged from the outside at all), and still prunes `lost+found`; what it
+  counts inside is regular files, at any depth, because real harness content is
+  nested. Both directions are covered by `cogbox-guest-migrate-behaviour`, which
+  seeds those cases by RUNNING the realized scaffolding units rather than
+  imitating them: a recreated-and-scaffolded image and a scaffolded `~/work`
+  must stay silent and stay where they are, a populated one must still be named
+  and retired.
+- Under `hosted`, the writable `/nix/store` overlay is a real block volume on
+  the guest disk rather than a tmpfs, which is what makes a runaway in-guest
+  `nix build` fail with `ENOSPC` instead of OOM-killing the guest. It lives on
+  the SAME dedicated disk as the data pool, as a second logical volume, so the
+  instance's state disk carries none of it and does not need to be sized for
+  it. The **sizing requirement is on the guest disk**: that volume is thick,
+  taking `cogworx.gce.storeOverlaySizeMiB` (16 GiB by default) outright, and
+  the pool gets only what is left. The two never compete after the fact, since
+  the store volume is remade at exactly its own size on every host boot and the
+  pool takes the whole remainder; raising the number moves free space from the
+  pool to the overlay on the next boot, and lowering it does nothing until the
+  instance is recreated (the host never shrinks a volume).
 - Network `rules` mode filters at the passt syscall level; traffic
   handled internally by passt (ARP, DHCP, gateway ping responses) is not
   subject to user rules. See

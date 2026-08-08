@@ -499,6 +499,69 @@
 					};
 				};
 			})
+			# Storage profile: WHERE durable guest data lives. This sits under
+			# cogbox.* because that is the name the storage design agreed on, but it
+			# is a genuinely different KIND of option from every sibling above: those
+			# are filled in by third-party PLUGIN modules (the brain contract), and
+			# storage layout is platform-set. Hence internal + visible = false (the
+			# precedent is gce/cogbox-host.nix's own internal options), and hence the
+			# two dangerous values are deliberately NOT options at all -- the hosted
+			# block-DEVICE path and the machine-state mount-point LIST are plain
+			# let-bindings below. A plugin-settable device path would hand a
+			# third-party flake module a raw host block device inside the guest, and a
+			# plugin-settable mount-point list is mount-point injection into root's
+			# home; both are strictly worse than the guest-side power plugins already
+			# have.
+			({ lib, ... }: {
+				options.cogbox.storage = {
+					profile = lib.mkOption {
+						type = lib.types.enum [ "workstation" "hosted" ];
+						default = "workstation";
+						internal = true;
+						visible = false;
+						description = ''
+							"workstation" is today's layout, now stated rather than
+							inherited: machine-state on the RAM-backed root, work/ on the
+							host-visible 9p share, a read-only 9p lower for harness
+							config. "hosted" puts work/ + machine/ + harness-rw/ on one
+							dedicated block volume the host never mounts, and moves the
+							writable /nix/store overlay off RAM. The read-only 9p harness
+							lower is unchanged in BOTH profiles -- that is the local
+							security property and the hosted case loses nothing by
+							keeping it.
+						'';
+					};
+					machineState = lib.mkOption {
+						type = lib.types.enum [ "ephemeral" "persist" ];
+						default = "ephemeral";
+						internal = true;
+						visible = false;
+						description = ''
+							Workstation opt-in: back machine-state with an auto-created
+							image file in the instance's data dir instead of the tmpfs
+							root. Ignored under profile = "hosted", which always persists.
+						'';
+					};
+					sizeMiB = lib.mkOption {
+						type = lib.types.int;
+						default = 20480;
+						internal = true;
+						visible = false;
+						description = ''
+							Size of the AUTO-CREATED workstation machine-state image, in
+							MiB (microvm.nix's `size` unit). Unused under profile =
+							"hosted": that disk is sized control-plane side.
+						'';
+					};
+					# There is deliberately NO store-overlay size option here. Under
+					# `hosted` BOTH volumes are logical volumes the host carves out of
+					# the one dedicated disk and both set autoCreate = false, so the
+					# guest sizes neither of them -- microvm.nix reads `size` only
+					# inside the autoCreate branch of createVolumesScript. The knob
+					# lives where the carving happens: cogworx.gce.storeOverlaySizeMiB
+					# in gce/cogbox-host.nix.
+				};
+			})
 			userExt
 			({ config, pkgs, lib, utils, ... }: let
 				harnesses = mkHarnesses system pkgs;
@@ -517,6 +580,817 @@
 				# cogworx k8s pod env (XDG_CONFIG_HOME/COGBOX_DATA).
 				stateRoot = "/var/lib/cogbox-state";
 				cogboxData = "${stateRoot}/data/cogbox";
+				# Container backend MACHINE-STATE: the tool/editor/cache state that
+				# lives on the ephemeral container writable layer today, and is
+				# therefore destroyed by every pod restart while the per-instance PVC
+				# sits nearly idle. That PVC is already this instance's dedicated disk
+				# -- it holds the work tree, the brain, the claude home and the hermes
+				# home -- so persisting these three needs no volume, no mkfs and no
+				# resize: only that the paths RESOLVE under ${stateRoot}/machine.
+				#
+				# A plain let-binding, deliberately NOT a cogbox.* option: cogbox.* is
+				# the plugin-contribution namespace (see options.cogbox above), so a
+				# plugin-settable list of guest paths to redirect would be
+				# symlink-point injection into root's home. Adding a path later is a
+				# one-line edit here.
+				#
+				# NEVER /root ITSELF, and never a path another mount or link owns.
+				# /root carries the four harness OVERLAY mounts (/root/.claude,
+				# /root/.hermes, /root/.config/opencode, /root/.local/share/opencode),
+				# two ephemeral binds (/root/.cache/opencode,
+				# /root/.local/state/opencode), the runtime /root/work symlink, the
+				# fw_cfg-written /root/.claude.json and the tmpfiles-managed
+				# /root/.nix-channels; a link over /root shadows every one of them at
+				# once.
+				#
+				# The three roots below are the PARENTS of four of those mounts, which
+				# is exactly why this list is CONTAINER-ONLY. On this target
+				# `fileSystems` is `lib.mkIf isVm` and evaluates to {} -- there is no
+				# mount at or under these paths to orphan, and no mount ordering to get
+				# wrong, which is what makes a validated symlink the right mechanism
+				# here and the wrong one on the VM. The container-state-unit check
+				# asserts both halves: zero container mounts, and the VM's still
+				# present. /var/lib/docker is absent on purpose (docker is VM-only).
+				containerMachineState = [
+					{ guest = "/root/.cache"; sub = "cache"; }
+					{ guest = "/root/.local"; sub = "local"; }
+					{ guest = "/root/.config"; sub = "config"; }
+				];
+
+				# ===== VM storage profile (cogbox.storage) =====================
+				storageCfg = config.cogbox.storage;
+				hosted = storageCfg.profile == "hosted";
+				# The data pool exists when hosted, or when a workstation user opts
+				# into persistent machine-state. Everything pool-shaped below keys on
+				# this, so `workstation` + `ephemeral` -- the default, and every local
+				# user today -- declares no volume and no bind at all.
+				poolEnabled = isVm && (hosted || storageCfg.machineState == "persist");
+
+				poolMount = "/var/lib/cogbox-guest";
+				# == cogworx's guestDiskDevice. microvm.nix turns a volume's `label`
+				# into device = /dev/disk/by-label/<label> instead of an
+				# ORDER-DEPENDENT /dev/vd<letter>, which matters here because a second
+				# volume exists and drive letters follow list position.
+				poolLabel = "cogworx-guest";
+				poolUnit = "${utils.escapeSystemdPath poolMount}.mount";
+				cogboxUnit = "${utils.escapeSystemdPath "/var/lib/cogbox"}.mount";
+
+				# The two jobs SYSTEMD ITSELF puts on the pool's boot path. Nothing here
+				# writes either unit; systemd-fstab-generator synthesises them from the
+				# realized fstab, which is exactly why they escaped the round-2 audit of
+				# "every oneshot this change adds".
+				#
+				#   systemd-fsck@<escaped pool device>.service
+				#       the pool line is fs_passno 2, so the generator emits
+				#       Requires= + After= this instance on the pool .mount.
+				#   systemd-growfs@<escaped pool mount>.service
+				#       autoResize renders as nothing but x-systemd.growfs, and the
+				#       generator turns that into a .wants symlink on the pool .mount
+				#       PLUS a local-fs.target.d drop-in ordering local-fs.target After=
+				#       it -- so it gates sysinit.target, hence basic.target, hence sshd.
+				#
+				# Both names are DERIVED, never spelled: they are what systemd-escape
+				# produces for the pool's device and mount point, so renaming the label
+				# or the mount point moves the drop-ins with it instead of silently
+				# orphaning them. cogbox-guest-pool-boot-bounded re-derives the same two
+				# names from the GENERATOR'S output and fails if a rendered drop-in does
+				# not match, which is the only way to catch an escaping mistake.
+				poolDevice = "/dev/disk/by-label/${poolLabel}";
+				poolFsckUnit = "systemd-fsck@${utils.escapeSystemdPath poolDevice}.service";
+				poolGrowfsUnit = "systemd-growfs@${utils.escapeSystemdPath poolMount}.service";
+				# A finite bound for a unit whose upstream text has none, as a DROP-IN
+				# body. Both halves are set, and the stop half is the load-bearing one:
+				# upstream systemd-fsck@.service and systemd-growfs@.service say
+				# `TimeoutSec=infinity`, which sets the START *and the STOP* timeout to
+				# infinity. Bounding only the start would fire SIGTERM at the bound and
+				# then wait forever for a process that is in uninterruptible D-state on
+				# the very device that stalled -- the unit parks in `deactivating`, the
+				# job still never completes, and the guest is wedged exactly as before,
+				# just one state further along. With both set systemd escalates
+				# SIGTERM -> SIGKILL -> "processes still around after final SIGKILL,
+				# ignoring" and the unit reaches `failed`, which is what makes the
+				# failure both survivable and VISIBLE in `systemctl --failed`.
+				poolJobTimeout = start: lib.concatStringsSep "\n" [
+					"[Service]"
+					"TimeoutStartSec=${toString start}"
+					"TimeoutStopSec=60"
+					""
+				];
+
+				# HOST paths of the two hosted volumes. NOT options -- see the
+				# cogbox.storage module comment.
+				#
+				# BOTH live on the ONE dedicated per-instance disk, as logical volumes
+				# in a volume group the GCE host half creates on it
+				# (gce/guest-disk.nix). LVM rather than two fixed partitions, and that
+				# is the whole reason it is here: with partitions, growing the provider
+				# disk only ever yields free space AFTER the last one, so whichever
+				# partition sits first can never be extended and one concern blocks the
+				# other's growth forever. A volume group shares its free extents, so
+				# EITHER logical volume can take new space -- which is what makes
+				# decision 5 (grow the disk, restart, the guest grows into it) true for
+				# both surfaces rather than for one of them.
+				#
+				# The GUEST is never told about any of this. It sees two ordinary
+				# virtio-blk devices and mounts them BY LABEL: nothing in the guest
+				# configuration names the volume group, a logical volume or a
+				# device-mapper path, so there is no volume-group activation anywhere on
+				# the guest's boot path and no guest-side failure mode to get wrong.
+				# (nixpkgs puts lvm2's udev rules in every NixOS initrd by its own
+				# default, here as before this change; the point is that nothing in this
+				# layout DEPENDS on them.) cogbox-guest-volume-hosted asserts the
+				# by-label resolution and the absence of any dm path in both profiles.
+				#
+				# /dev/<vg>/<lv> rather than the /dev/mapper/ spelling: both are created
+				# by lvm2 -- through its udev rules where udev runs (services.lvm.enable
+				# defaults true, and the GCE host evaluates it true) and through its own
+				# node management where it does not -- so neither is less stable than
+				# the other, and /dev/mapper/ mangles a dash in the VG name into a
+				# double dash (cogworx--guest-pool), an error-prone literal to keep in
+				# step across two repositories. These strings are one half of a wire
+				# contract with gce/guest-disk.nix, which spells the same names.
+				hostedVG = "cogworx-guest";
+				hostedPoolLV = "/dev/${hostedVG}/pool";
+
+				# The writable /nix/store overlay, hosted profile. Its OWN volume, not a
+				# subdirectory of the pool, and that is forced rather than preferred:
+				# microvm.nix marks a volume neededForBoot only when its mountPoint IS
+				# microvm.writableStoreOverlay, and the overlay upper genuinely is
+				# needed in stage 1 -- /nix/store is an overlay whose upperdir lives
+				# under it, and the overlay's own pre-mount unit carries
+				# RequiresMountsFor on that path. Putting the POOL on the initrd path
+				# instead would cost two things this design may not lose:
+				# `x-systemd.growfs`, which IS restart-to-grow (systemd-growfs@.service
+				# is absent from the initrd's upstream unit list, and in stage 2 the
+				# mount is already active so its Wants= never fires), and the fail-safe
+				# below -- a pool that failed to mount would take /nix/store with it and
+				# wedge the guest with no sshd.
+				#
+				# Being a real block device is what this is actually for: today a large
+				# `nix build` fills a 16G tmpfs on an ~11.7 GiB-RAM guest and OOMs the
+				# guest instead of failing cleanly.
+				#
+				# STILL EPHEMERAL, and now the host is what makes it so: the format leg
+				# re-creates this logical volume's filesystem on every HOST boot, before
+				# the guest is launched. Three things ride on that one line. It keeps
+				# today's tmpfs semantics exactly -- nothing in a /nix/store overlay is
+				# user data, and making installed packages suddenly survive a reboot is
+				# a behaviour change nothing asked for. It is the self-heal for an
+				# interrupted first mkfs, which matters more here than anywhere else
+				# because this mount is neededForBoot and no in-guest unit could repair
+				# it. And it is how this volume GROWS: `x-systemd.growfs` cannot run for
+				# an initrd mount (systemd-growfs@.service is a stage-2 upstream unit
+				# and this nixpkgs has no stage-1 resize at all), so a filesystem laid
+				# down fresh at the logical volume's current size is the only honest way
+				# to make restart-to-grow true for this half.
+				hostedStoreLV = "/dev/${hostedVG}/store";
+				storeOverlayLabel = "cogworx-store-rw";
+
+				# Tmpfs sizing, explicit in BOTH profiles. 50% for / is the value
+				# microvm.nix already defaults to, now stated rather than inherited.
+				# /nix/.rw-store drops from a fixed size=16G -- larger than the guest's
+				# entire RAM -- to the same fraction, so a runaway build fails with
+				# ENOSPC instead of OOM-killing the guest.
+				rootTmpfsSize = "50%";
+				storeOverlayTmpfs = "50%";
+
+				# machine-state binds: guest path -> { sub; before }. NEVER /root
+				# ITSELF: it carries four harness OVERLAY mounts (.claude, .hermes, and
+				# .config/opencode + .local/share/opencode via their parents), two
+				# ephemeral binds, the runtime /root/work symlink, the fw_cfg-written
+				# /root/.claude.json and a tmpfiles-managed /root/.nix-channels. A /root
+				# bind shadows all of them at once.
+				#
+				# The three home roots below are PARENTS of harness mounts, which is not
+				# the same hazard: systemd orders a mount unit after its path-prefix
+				# parents, so the bind lands FIRST and the harness overlay mounts on top
+				# of it. Nothing is shadowed, because no overlay lower/upper/work dir
+				# lives under these paths -- the lowers are the read-only 9p mounts
+				# under /var/lib/harness-lower and the uppers live under
+				# /var/lib/harness-rw. The read-only 9p lower is untouched in both
+				# profiles, and cogbox-guest-binds-ordered asserts both halves of that:
+				# no /root mount, harness overlays still present.
+				# `before` on an entry is NOT decoration, and the journal bind is the
+				# reason the field exists rather than the only user of it. Every bind
+				# here is `nofail` (see mkPoolBind), and nofail is what MOVES the
+				# generated unit from local-fs.target.requires to .wants -- which also
+				# strips the Before=local-fs.target the generator would otherwise emit
+				# (systemd.mount(5): "the mount unit is not ordered before these target
+				# units"). MEASURED on the realized hosted fstab: every one of the 14
+				# pool-dependent units lands in local-fs.target.wants and NOT ONE
+				# carries Before=local-fs.target, while the non-nofail
+				# nix-.rw\x2dstore.mount does.
+				#
+				# So local-fs.target -> sysinit -> basic -> multi-user is reachable
+				# while these binds are still queued, and NOTHING is ordered after them
+				# except what says so explicitly. Any unit that WRITES THROUGH a
+				# pool-bound path therefore needs an entry here, or it writes to the
+				# directory the bind is about to cover and its work vanishes under the
+				# mount with no error anywhere. That is not hypothetical: it is the
+				# recorded "plugins deliver nothing" shape.
+				machineStateBinds = {
+					"/root/.cache" = { sub = "machine/root/.cache"; };
+					"/root/.local" = { sub = "machine/root/.local"; };
+					"/root/.config" = { sub = "machine/root/.config"; };
+					# dockerd creates its data root itself and nixpkgs' docker module
+					# declares no ordering on /var/lib/docker (no RequiresMountsFor, no
+					# After= on any mount). Unordered, a boot where this bind is slow --
+					# its own x-systemd.device-timeout=30s on the pool, or an fsck --
+					# lets dockerd initialise /var/lib/docker on the TMPFS ROOT and keep
+					# writing to the shadowed inodes for the whole session, which is
+					# precisely the RAM-eating failure this profile exists to remove.
+					"/var/lib/docker" = {
+						sub = "machine/var/lib/docker";
+						before = [ "docker.service" ];
+					};
+					# A guest journal that survives reboot -- the reason repeated
+					# "the sandbox is full" reports went undiagnosed, since the journal
+					# lived on the tmpfs root and every restart destroyed the evidence.
+					# This is a MOUNT and nothing else: journald already runs
+					# Storage=persistent (the nixpkgs default; cogbox configures
+					# journald nowhere). systemd-journal-flush.service carries
+					# RequiresMountsFor=/var/log/journal of its own; the explicit
+					# before= is the gce/state-disk.nix house idiom and costs nothing.
+					"/var/log/journal" = {
+						sub = "machine/log/journal";
+						before = [ "systemd-journal-flush.service" ];
+					};
+				};
+				# work/ and harness-rw/ join the pool only when HOSTED. work/ is bound
+				# ONTO the 9p path rather than repointing WORK: brainMaterializeScript
+				# hardcodes WORK=/var/lib/cogbox/work and brain-trust seeds claude's
+				# trust under the LITERAL project key .projects["/var/lib/cogbox/work"],
+				# so a bind keeps both literally true -- and it RETAINS the old 9p copy
+				# by SHADOWING it rather than deleting it, which is the design's "retain
+				# for at least one release" with zero extra code. harness-rw/ becomes a
+				# plain directory on the pool, retiring the 128 MiB ext4-in-a-file-on-
+				# ext4 loop image.
+				#
+				# BOTH of those replace a surface that already held persistent user data
+				# on an existing instance, so BOTH need a migration, not just work/.
+				# harness-rw's old home is the loop IMAGE on the 9p state dir, and it
+				# holds the four harness overlay UPPERS -- claude's settings.json,
+				# history, todos and a hand-placed .credentials.json, the hermes home,
+				# and opencode's config + data. Repointing it at a freshly-mkdir'd pool
+				# directory with no migration would present every one of those as gone on
+				# the first hosted boot (the read-only 9p lower supplies only the baked
+				# defaults), with the old image still on the state disk but nothing
+				# mounting it and nothing saying so.
+				poolBinds = machineStateBinds // lib.optionalAttrs hosted {
+					"/var/lib/cogbox/work" = {
+						sub = "work";
+						requires = [ cogboxUnit "cogbox-guest-work-migrate.service" ];
+						# cogbox-brain-materialize writes THROUGH this path -- WORK is
+						# the literal /var/lib/cogbox/work (brainMaterializeScript) and
+						# it creates $WORK/.cogbox/brain, the four .claude/ link trees,
+						# .opencode/, .agents/skills and AGENTS.md -- and it is ordered
+						# after NOTHING on this chain of its own accord (its after= is
+						# the state mount plus the hermes/codex overlay mounts). With
+						# nofail stripping Before=local-fs.target, the first hosted boot
+						# of an existing instance ran it while the multi-GB
+						# cogbox-guest-work-migrate cp was still going: the brain landed
+						# in the legacy 9p directory, the migration's own verify could
+						# not see it (measure() counts regular files and this leg writes
+						# only directories and symlinks), stash() then renamed that
+						# directory to work.pre-pool, and the bind covered a work tree
+						# with no brain, no skills/agents/commands and no AGENTS.md --
+						# silently, once per instance, self-healing only on the NEXT
+						# boot. Type=oneshot RemainAfterExit means it does not retry
+						# within the boot.
+						#
+						# Before=, not Requires=: ordering is satisfied by the mount
+						# job COMPLETING, success or failure, so a pool-absent boot
+						# still degrades instead of holding the brain hostage. The cost
+						# is honest and worth naming -- brain-materialize is itself
+						# Before=sshd.service, so on the ONE boot that migrates, sshd
+						# now waits for the copy instead of racing it.
+						before = [ "cogbox-brain-materialize.service" ];
+					};
+					"/var/lib/harness-rw" = {
+						sub = "harness-rw";
+						requires = [ cogboxUnit "cogbox-guest-harness-migrate.service" ];
+					};
+				};
+				poolBindUnits = map (guest: "${utils.escapeSystemdPath guest}.mount")
+					(lib.attrNames poolBinds);
+
+				# Every pool-backed bind Requires= the pool mount AND the subdir
+				# creator. That is what makes the fail-SAFE work: pool absent -> the
+				# binds do not run -> the guest still reaches multi-user with sshd,
+				# reading and writing the legacy 9p paths, so somebody can log in and
+				# read the failed mount out of `systemctl --failed`. Fail-CLOSED here
+				# would wedge the guest with no sshd for a fault the HOST cannot see
+				# either (see the `nofail` note on the pool mount below), and a bind
+				# over an EMPTY pool directory would show the user an empty work tree
+				# with no failed unit at all. Both alternatives are worse.
+				#
+				# This is a DIAGNOSTIC boot, not a second storage mode: the pool is the
+				# only place a hosted instance's data lives, and nothing here is a
+				# supported way to run. Today's layout, NOT today's contents, and the
+				# difference is worth a line because it reads as data loss when it is
+				# not. On an instance
+				# that has already migrated, stash() has renamed the legacy work
+				# directory to work.pre-pool and recreated it EMPTY (that emptiness is
+				# the loud signal a pre-pool boot is meant to give), so a degraded boot
+				# after the migration shows an empty ~/work. The live copy is on the
+				# pool volume and the pre-migration copy is next to it; the degraded
+				# boot is for diagnosing, not for working in.
+				poolRequires = [
+					"x-systemd.requires=${poolUnit}"
+					"x-systemd.after=${poolUnit}"
+					"x-systemd.requires=cogbox-guest-dirs.service"
+					"x-systemd.after=cogbox-guest-dirs.service"
+				];
+				mkPoolBind = guest: b: {
+					device = "${poolMount}/${b.sub}";
+					fsType = "none";
+					# `nofail` on EVERY bind, not just on the pool mount, and this is the
+					# whole difference between "degrades" and "wedges". A non-nofail
+					# fstab entry is emitted by systemd-fstab-generator into
+					# local-fs.target.REQUIRES (nofail moves it to .wants), and
+					# local-fs.target ships OnFailure=emergency.target with
+					# OnFailureJobMode=replace-irreversibly -- so ONE failed bind
+					# replaces the whole queued multi-user.target transaction and the
+					# guest comes up with no sshd. `nofail` on the pool alone only
+					# unhooks the POOL; the binds still fail with a dependency error and
+					# still take local-fs.target down with them, which is byte-for-byte
+					# the field failure recorded on harness-overlay-img below
+					# (/var/lib/harness-rw never mounts -> no sshd -> recreate loop, no
+					# self-heal). VERIFIED by running systemd-fstab-generator over the
+					# realized fstab both ways; cogbox-guest-pool-degradable asserts it.
+					#
+					# It costs nothing that R3 needs: nofail changes only how the mount
+					# is hooked into local-fs.target. The Requires= that
+					# x-systemd.requires= generates is untouched, so a work migration
+					# that refuses still means the bind does not happen and the 9p copy
+					# stays authoritative -- it just no longer takes the boot with it.
+					options = [ "bind" "nofail" ] ++ poolRequires
+						++ lib.concatMap (u: [ "x-systemd.requires=${u}" "x-systemd.after=${u}" ]) (b.requires or [])
+						++ map (u: "x-systemd.before=${u}") (b.before or []);
+				};
+
+				# ...and `nofail` on the pool-backed binds is STILL not enough, because
+				# the cascade does not stop at the units this flake spells out. systemd
+				# MANUFACTURES hard Requires= on a covering mount unit, in places no
+				# fstab line names:
+				#
+				#   src/core/mount.c:270-281  every mount unit implicitly requires the
+				#                             mount covering its own parent directory,
+				#   src/core/mount.c:284-294  ...and the one covering an absolute bind
+				#                             or loop SOURCE,
+				#   src/core/unit.c:1522-1542 and RequiresMountsFor= (which nixpkgs
+				#                             generates from fileSystems.*.overlay's
+				#                             lower/upper/work dirs, overlayfs.nix:116
+				#                             + tasks/filesystems.nix:239-243) becomes
+				#                             UNIT_REQUIRES for EVERY path prefix whose
+				#                             mount unit has a fragment path -- and
+				#                             fstab-generated units always do.
+				#
+				# In the hosted profile that drags in six mounts, none of them pool-backed
+				# in its own right: the four harness OVERLAY mounts, whose
+				# upper/work dirs live under the pool-bound /var/lib/harness-rw, and the
+				# two opencode EPHEMERAL binds, which sit under the pool-bound
+				# /root/.cache and /root/.local AND take their source from
+				# /var/lib/harness-rw. Left as plain entries they land in
+				# local-fs.target.REQUIRES, so an absent pool fails them by dependency
+				# and takes local-fs.target -- and with it sshd -- down anyway. That is
+				# the stuck-in-Booting failure mode arriving through a path `nofail` on
+				# the pool never touched.
+				#
+				# So the flag is DERIVED from the paths each mount actually depends on
+				# rather than pinned per profile: exactly the mounts that can be made to
+				# fail by an absent pool are unhooked from local-fs.target, and nothing
+				# else is. That matters in both directions. Under `workstation` +
+				# `persist` the pool covers only the three home roots, so
+				# /root/.config/opencode (nested under one) becomes nofail while
+				# /root/.claude and /root/.hermes -- which still depend on the loop image,
+				# a genuine precondition whose absence is a bug to surface -- do not. And
+				# under the default profile poolBackedPaths is empty, so every entry is
+				# byte-identical to today.
+				#
+				# cogbox-guest-pool-degradable re-derives this from the realized fstab
+				# using the same three rules, so a mount added later that depends on the
+				# pool fails the build instead of the boot.
+				poolBackedPaths = lib.optionals poolEnabled ([ poolMount ] ++ lib.attrNames poolBinds);
+				underPool = path: lib.any
+					(base: path == base || lib.hasPrefix "${base}/" path)
+					poolBackedPaths;
+				# `paths` is what this mount depends on: its own mount point (whose
+				# PARENT is what the prefix rule keys on -- passing the mount point
+				# itself is the same test one level down and costs nothing), its source,
+				# and any overlay lower/upper/work dir.
+				poolNofail = paths: lib.optionals (lib.any underPool paths) [ "nofail" ];
+				# The same test as an attrset, for a mount whose `options` this flake
+				# does not otherwise define. fileSystems.*.options is nonEmptyListOf and
+				# the check runs PER DEFINITION, so contributing a literal [] is a type
+				# error even though overlayfs.nix supplies the rest of the list.
+				poolNofailOpt = paths: lib.optionalAttrs (poolNofail paths != [])
+					{ options = poolNofail paths; };
+
+				# ...and `nofail` on every affected mount is STILL not the whole
+				# fail-safe, because the third way an absent pool reaches
+				# emergency.target does not run through a mount unit at all. A SERVICE
+				# that hard-Requires= one of those mounts fails with it, and whatever
+				# that service was preparing fails too -- the cascade harness-setup-dirs
+				# records below, where the four harness overlay UPPERDIRS are never
+				# created and the four overlay mounts then fail on a directory that does
+				# not exist. `nofail` cannot reach any of that: it changes only how the
+				# MOUNT is hooked into local-fs.target.
+				#
+				# The rule is therefore a CLASS rule and not two special cases: a service
+				# keeps a hard Requires= on a mount that is a genuine precondition in
+				# EVERY profile, and demotes to Wants= exactly the mounts the hosted
+				# profile moves onto the pool. Wants= still pulls the mount in and After=
+				# still orders against it, so a healthy boot is unchanged; a pool-absent
+				# boot runs the service anyway and degrades it to the pre-pool behaviour
+				# (harness config on the tmpfs root, the brain and the claude stub
+				# materialised into the directory the bind would have covered), which is
+				# a sandbox the user can log into rather than one they cannot.
+				#
+				# Membership is the same three rules poolNofail applies, read off the
+				# same let-bindings, so a mount that becomes pool-backed later moves
+				# every service that requires it without anyone remembering to.
+				# cogbox-guest-pool-degradable re-derives the class from the realized
+				# fstab and scans every realized service unit against it, so a service
+				# added later with a hard Requires= is a build failure rather than a
+				# boot failure.
+				poolDependentMounts = poolBackedPaths
+					++ map (p: p.guest) (lib.filter (p: poolNofail [
+						p.guest
+						(lowerMount p.harness p.pathkey)
+						(upperDir p.harness p.pathkey)
+						(workDir p.harness p.pathkey)
+					] != []) overlayPaths)
+					++ map (p: p.guest) (lib.filter (p: poolNofail [
+						p.guest
+						(ephemeralSrc p.harness p.pathkey)
+					] != []) ephemeralPaths);
+				mountUnitOf = p: "${utils.escapeSystemdPath p}.mount";
+				# The two halves of a service's mount preconditions. Feed BOTH the same
+				# path list: `after` takes all of them (ordering is wanted either way),
+				# `requires` takes hardMounts and `wants` takes softMounts.
+				hardMounts = paths: map mountUnitOf
+					(lib.filter (p: !(lib.elem p poolDependentMounts)) paths);
+				softMounts = paths: map mountUnitOf
+					(lib.filter (p: lib.elem p poolDependentMounts) paths);
+
+				# One-time migrations for an instance that predates the pool, one per
+				# surface the hosted profile REPOINTS: work/ (from the 9p share) and
+				# harness-rw/ (from the loop image on that same share). Both are
+				# guest-side, because on first boot the real data sits at the legacy
+				# source while the pool subdir is EMPTY, and the only place both copies
+				# are simultaneously visible AND the bind can still be prevented is
+				# inside the guest, before the mount. Both are no-ops on a fresh
+				# instance.
+				#
+				# ONE builder rather than two scripts: the copy/verify/switch core is
+				# the riskiest code in the change and it must not be able to drift
+				# between the two callers. `prepare` is the only difference -- it sets
+				# $src, and may decide there is nothing to migrate at all.
+				#
+				# `legacy` is the path ON THE 9P SHARE that the pool copy replaces, and it is
+				# a separate argument from $src because the two differ for harness-rw (there
+				# $src is a loop MOUNTPOINT and `legacy` is the image file behind it). It is
+				# what gets RETIRED -- renamed to <path>.pre-pool -- once the pool copy is
+				# authoritative. Retention by shadowing alone was not enough: a bind hides
+				# the legacy copy only while it is mounted, so any boot on the pre-pool
+				# layout (a rolled-back image, or an accepted degraded boot) presented a
+				# stale-but-complete-looking tree as if it were current, the user worked in
+				# it, and the next healthy boot hid that session again with nothing but an
+				# informational line. Renaming aside makes the legacy path EMPTY on such a
+				# boot instead of subtly stale -- alarming rather than plausible, which is
+				# the whole difference -- and keeps the data for the release the design asks
+				# for, under a name that says what it is.
+				mkPoolMigrate = { name, sub, what, legacy, occupied, prepare }: pkgs.writeShellApplication {
+					inherit name;
+					runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.gawk pkgs.util-linux pkgs.e2fsprogs ];
+					text = ''
+						pool=${poolMount}
+						dst="$pool/${sub}"
+						marker="$pool/machine/.${sub}-migrated"
+						incoming="$pool/${sub}.incoming"
+						legacy=${legacy}
+
+						# Count of regular files + their total apparent bytes, in one
+						# walk. Regular files ONLY, deliberately: `du -s --apparent-size`
+						# also sums DIRECTORY st_size, which differs between the source
+						# filesystem (9p, or ext4 through a loop) and the destination, so
+						# it would compare two numbers that are allowed to disagree.
+						measure() {
+							find "$1" -type f -printf '%s\n' \
+								| awk '{ n += 1; s += $1 } END { print (n + 0) " " (s + 0) }'
+						}
+
+						# "Holds somebody's data", supplied per leg because the two legacy
+						# copies are different SHAPES and only one of them can be judged by
+						# looking at the inode: work/ is a directory on the 9p share, the
+						# harness copy is an ext4 image whose apparent size is a constant.
+						# It gates the fork WARNING and the stash() that follows it, so a
+						# false positive here is not cosmetic -- it fires the loudest alarm
+						# in this design on a non-event and renames a file the operator then
+						# has to reason about.
+						${occupied}
+
+						# Retire the legacy copy: one rename, same filesystem, data kept. Called
+						# only once the pool copy is provably authoritative. A failure here is
+						# LOUD but not fatal -- the migration itself already succeeded, and
+						# refusing the bind at that point would hide the copy the user just
+						# gained in order to protect the one they are done with.
+						stash() {
+							stash_to="$1.pre-pool"
+							stash_n=1
+							# Never overwrite an earlier .pre-pool: it is somebody's data too.
+							while [ -e "$stash_to" ]; do
+								stash_to="$1.pre-pool.$stash_n"
+								stash_n=$((stash_n + 1))
+							done
+							if [ -d "$1" ]; then stash_dir=1; else stash_dir=0; fi
+							if ! mv "$1" "$stash_to"; then
+								echo "${name}: WARNING could not move $1 aside; it stays where it is, and a boot on the pre-pool layout would present it as current" >&2
+								return 0
+							fi
+							echo "${name}: retired the legacy ${what}: $1 -> $stash_to (kept, not deleted)"
+							# The bind mounts OVER a directory, so one has to remain there.
+							# Recreated EMPTY on purpose: that is the loud signal on a pre-pool
+							# boot, and the bind covers it on every hosted boot anyway.
+							if [ "$stash_dir" = 1 ]; then
+								mkdir -p "$1"
+							fi
+						}
+
+						# The pool copy is authoritative whenever it has ANY content: a
+						# previous migration finished, or the instance was created on the
+						# pool and has always lived there. `find -print -quit` rather
+						# than parsing ls -- it stops at the first entry and copes with
+						# names ls would mangle.
+						#
+						# This comparison comes FIRST, before the marker is consulted at
+						# all, and that ordering is the point. The marker is written on
+						# boot 1 of every hosted instance, so a marker-first
+						# short-circuit would skip the comparison forever -- and then an
+						# accepted degraded boot (pool absent, the user works in the 9p
+						# tree for a session) would be silently shadowed by the bind on
+						# the next healthy boot, with no log line. The marker can no
+						# longer suppress the check; it only records that a migration
+						# already happened, which is what makes a REpeat one loud.
+						if [ -n "$(find "$dst" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+							echo "${name}: $dst is already populated; claiming it"
+							# ...but never SILENTLY. A populated pool copy AND an occupied legacy
+							# copy is a fork: the likeliest cause is a boot on the pre-pool layout
+							# after the migration, whose session is about to be hidden by the bind.
+							# The pool copy still wins -- it is what the last hosted boot wrote, and
+							# refusing here would hide weeks of work to protect days of it -- but
+							# the operator gets both trees and both sizes, and the legacy copy is
+							# retired so the same fork cannot form twice. Measuring both trees is
+							# affordable precisely because the stash makes THAT a once-per-instance
+							# path rather than a per-boot one -- note that the occupancy TEST is not
+							# once-per-instance and must stay cheap on its own: the harness leg's
+							# blank-image case deliberately never stashes, so its test repeats on
+							# every hosted boot until a workstation boot reuses the image. One
+							# superblock read plus one loop mount and a single readdir is that
+							# budget; walking the image is not.
+							if occupied "$legacy"; then
+								echo "${name}: WARNING $dst (pool copy, files/bytes $(measure "$dst")) is about to be bound over $legacy (legacy copy, files/bytes $(measure "$legacy")), which is NOT empty -- most likely a boot without the pool wrote there after ${what} was migrated. The pool copy wins; the legacy one is kept but moved aside." >&2
+								stash "$legacy"
+							fi
+							: > "$marker"
+							exit 0
+						fi
+
+						${prepare}
+
+						if [ -z "$(find "$src" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+							echo "${name}: $src is empty or absent; nothing to move"
+							: > "$marker"
+							exit 0
+						fi
+						if [ -e "$marker" ]; then
+							echo "${name}: WARNING $dst is EMPTY but $marker says ${what} was already migrated, and $src is not empty -- a boot without the pool most likely wrote there. Re-migrating rather than binding an empty directory over live data." >&2
+						fi
+
+						# Copy to a SIDE directory and switch with one rename. The mv is
+						# the atomic step and it is the LAST one before the marker, so a
+						# crash anywhere above leaves the legacy copy authoritative --
+						# and the bind, which Requires= this unit, simply does not
+						# happen. That refusal is now survivable rather than fatal: the
+						# bind is `nofail`, so a refused migration degrades this one path
+						# instead of failing local-fs.target and taking sshd with it.
+						rm -rf "$incoming"
+						mkdir -p "$incoming"
+						# ENOSPC on the pool, or a path cp cannot read, lands here as a
+						# refusal and not a half-copy -- EXERCISED, not assumed: a
+						# 128 KiB pool and a 512 KiB source gives exit 1, the incoming
+						# directory removed and NO marker. No marker means the next boot
+						# retries from scratch, so a persistent cause costs boot time
+						# every time; loud in the journal, which now survives the reboot,
+						# and never silent. (`cp -a` does recreate unix sockets and
+						# fifos, so those are not a refusal cause.)
+						if ! cp -a "$src/." "$incoming/"; then
+							echo "${name}: copy failed; keeping ${what} where it is" >&2
+							rm -rf "$incoming"
+							exit 1
+						fi
+
+						# VERIFY by file count and bytes. The failure being defended
+						# against is a PARTIAL copy (ENOSPC, an interrupted boot), which
+						# those two catch exactly. Content hashing is deliberately NOT
+						# done: hashing a 20 GiB tree at boot is itself the hazard --
+						# harness-overlay-img below records a first-boot format that
+						# outran the startup-probe deadline and wedged the guest.
+						if ! src_m=$(measure "$src") || ! dst_m=$(measure "$incoming"); then
+							echo "${name}: could not measure the trees (a file vanished mid-walk?); keeping ${what} where it is" >&2
+							rm -rf "$incoming"
+							exit 1
+						fi
+						if [ "$src_m" != "$dst_m" ]; then
+							echo "${name}: verification FAILED (files/bytes $src_m -> $dst_m); keeping ${what} where it is" >&2
+							rm -rf "$incoming"
+							exit 1
+						fi
+
+						# $dst is provably empty at this point (checked above), so the rm
+						# cannot destroy anything and the mv is a single rename.
+						rm -rf "$dst"
+						mv "$incoming" "$dst"
+						: > "$marker"
+						echo "${name}: migrated ${what} onto the pool (files/bytes $src_m)"
+						# LAST, and after the marker: the migration is complete either way, and
+						# this is the step that stops the copy we just replaced from ever looking
+						# current again on a pre-pool boot.
+						stash "$legacy"
+					'';
+				};
+				guestWorkMigrate = mkPoolMigrate {
+					name = "cogbox-guest-work-migrate";
+					sub = "work";
+					what = "the 9p work tree";
+					# Same path as $src here: work/ is migrated in place off the share.
+					legacy = "/var/lib/cogbox/work";
+					# REGULAR FILES, the same definition of content measure() uses two
+					# screens up -- not "any entry at all", which is what this said and
+					# which is FALSE in the field. The reasoning it replaces was that an
+					# empty directory is what stash() leaves behind, so a directory with
+					# anything in it must be somebody's data. It is not:
+					# cogbox-brain-materialize is wantedBy multi-user.target in EVERY VM
+					# profile and writes THROUGH $WORK=/var/lib/cogbox/work, so any boot
+					# on which the work bind does not happen repopulates that
+					# stashed-empty directory with .cogbox/brain, the .claude/,
+					# .opencode/ and .agents/ link trees and AGENTS.md before anybody
+					# touches it. Every one of those is a directory or a SYMLINK.
+					#
+					# STILL REACHABLE, on two paths, which is why this test stays. One is
+					# a hosted boot whose `nofail` pool mount fails or times out, so the
+					# bind never happens -- deliberately survivable, see the pool mount's
+					# nofail note. The other is an IMAGE ROLLBACK to a rev whose guest is
+					# the workstation profile, which has no work bind at all. (The third
+					# path, a launch-time chooser falling back to the workstation runner
+					# because the carve was refused, is GONE: the GCE image bakes one
+					# profile. It is named here only because it is what this case was
+					# originally written against.)
+					#
+					# Read as occupancy they made the loudest alarm in this design fire
+					# on a non-event -- the fork WARNING naming a legacy tree whose own
+					# `files/bytes` reads 0 0 -- and stash() then renamed it, leaking one
+					# .pre-pool copy onto the STATE disk (which also carries the L7 CA
+					# private key, the secret store and the sshd host key) per such boot,
+					# reclaimed by nothing.
+					#
+					# -type f is also still one cheap walk: it quits at the first regular
+					# file on a populated tree, and on a scaffolded one it walks only the
+					# handful of link directories brain-materialize made.
+					occupied = ''
+						occupied() {
+							[ -n "$(find "$1" -type f -print -quit 2>/dev/null)" ]
+						}
+					'';
+					prepare = ''src=/var/lib/cogbox/work'';
+				};
+				# harness-rw's legacy home is an ext4 loop IMAGE on the 9p share, so
+				# this one has to mount before it can read. The image is never deleted,
+				# only renamed aside once the pool copy is authoritative -- the same
+				# retention work/ gets, and for the same reason.
+				guestHarnessMigrate = mkPoolMigrate {
+					name = "cogbox-guest-harness-migrate";
+					sub = "harness-rw";
+					what = "the harness overlay uppers";
+					# The IMAGE, not the loop mountpoint $src: retiring it is what keeps a
+					# rolled-back pre-pool boot from presenting a stale claude home as
+					# current. That boot then finds no image, and harness-overlay-img.service
+					# recreates a blank one (its `[ ! -f ]` arm), so it still comes up.
+					legacy = "/var/lib/cogbox/harness-overlay.img";
+					# CONTENT, not apparent size. `[ -s ]` on this file is always true and
+					# says nothing: a hosted instance that has already migrated can take
+					# one boot on the WORKSTATION runner, and harness-overlay-img.service's
+					# `[ ! -f "$img" ]` arm then lays a fresh EMPTY 128 MiB ext4 back at
+					# this exact path. The next hosted boot would read st_size=134217728 as
+					# user data: it would fire the fork WARNING (the alarm this design
+					# built to be un-mistakable) on a non-event an operator then chases,
+					# and stash() would rename the blank image to .pre-pool.N -- leaking
+					# 128 MiB of the STATE disk, which also carries the L7 CA private key,
+					# the secret store and the sshd host key, per such boot, and eroding
+					# what a .pre-pool file means.
+					#
+					# HOW a migrated instance takes a workstation boot, now that the GCE
+					# image bakes one profile and there is no launch-time chooser to fall
+					# back: an IMAGE ROLLBACK. Rolling the VM back to a rev that predates
+					# the hosted profile (or forward to one that drops it) boots the
+					# workstation guest against the SAME state disk, and that is the one
+					# mode flip this design cannot remove -- an operator must always be
+					# able to roll an image back. So this test stays exactly as strict as
+					# it is; only its trigger got rarer. cogbox-guest-migrate-behaviour
+					# case 7 is the fixture, and it is seeded through the units that
+					# produce the state rather than by hand, so it does not depend on
+					# which boot produced it.
+					#
+					# So look inside. The two cheap steps prepare already uses, in the same
+					# order and for the same reasons.
+					occupied = ''
+						occupied() {
+							[ -f "$1" ] || return 1
+							# Superblock only. A never-formatted or truncated image holds
+							# nothing to fork over and must not reach the mount below.
+							dumpe2fs -h "$1" >/dev/null 2>&1 || return 1
+							occ_at=/run/cogbox-harness-occupied
+							mkdir -p "$occ_at"
+							# READ-WRITE, for the reason spelled out in prepare: an unclean
+							# power-off leaves a dirty ext4 journal and `-o ro,loop` sets
+							# the LOOP DEVICE read-only, so the kernel cannot replay it and
+							# the mount fails outright. Read-only here would report a
+							# genuinely populated image as empty and LOSE the alarm on
+							# exactly the boxes most likely to have forked. Nothing below
+							# writes to it.
+							#
+							# A mount that fails anyway reads as unoccupied: conservative
+							# toward silence rather than toward a false alarm, and it costs
+							# nothing durable -- no stash means the image stays exactly
+							# where it is, still migratable, and the next boot re-tries.
+							mount -o loop "$1" "$occ_at" || return 1
+							# REGULAR FILES, the same definition of content measure() uses --
+							# not "any top-level entry that is not lost+found", which is what
+							# this said and which never reads a recreated image as blank.
+							# harness-overlay-img.service's `[ ! -f "$img" ]` arm lays the
+							# fresh ext4 down, and then harness-setup-dirs.service
+							# unconditionally mkdirs claude-code/, hermes-agent/ and
+							# opencode/ upper+work trees into it on every workstation boot,
+							# before anything else can look. So the top level of a blank
+							# image is never empty, and the alarm this test gates fired on
+							# the recreate rather than on a fork -- naming a legacy image
+							# whose own `files/bytes` reads 0 0 -- and stash() then leaked
+							# another .pre-pool image onto the state disk per flap.
+							#
+							# lost+found stays PRUNED rather than merely untyped-out: fsck
+							# can recover orphan regular FILES into it, and today's test
+							# never descends there, so pruning keeps that judgement
+							# unchanged instead of quietly widening it.
+							#
+							# Dropping -maxdepth 1 is required, not incidental: real harness
+							# content is nested (claude-code/config/upper/settings.json), so
+							# a depth-limited -type f would read a genuinely populated image
+							# as blank and LOSE the alarm -- the opposite error, and the
+							# worse one. The budget survives: -quit stops at the first
+							# regular file on a populated image, and a blank one only walks
+							# the handful of scaffolded directories.
+							if [ -n "$(find "$occ_at" -path "$occ_at/lost+found" -prune -o -type f -print -quit 2>/dev/null)" ]; then
+								occ_rc=0
+							else
+								occ_rc=1
+							fi
+							umount "$occ_at" || true
+							rmdir "$occ_at" 2>/dev/null || true
+							return "$occ_rc"
+						}
+					'';
+					prepare = ''
+						img=/var/lib/cogbox/harness-overlay.img
+						src=/run/cogbox-harness-migrate
+						if [ ! -f "$img" ]; then
+							echo "cogbox-guest-harness-migrate: no legacy overlay image at $img; nothing to migrate"
+							: > "$marker"
+							exit 0
+						fi
+						# dumpe2fs -h reads ONLY the superblock, so this is the same cheap
+						# validity test harness-overlay-img uses -- and it keeps a
+						# never-formatted or truncated image out of the mount below,
+						# where it would only produce a confusing failure.
+						if ! dumpe2fs -h "$img" >/dev/null 2>&1; then
+							echo "cogbox-guest-harness-migrate: $img holds no valid ext4 superblock; nothing to migrate" >&2
+							: > "$marker"
+							exit 0
+						fi
+						mkdir -p "$src"
+						trap 'umount "$src" 2>/dev/null || true' EXIT
+						# READ-WRITE on purpose, and this is not laxity: a guest that was
+						# powered off uncleanly leaves a dirty ext4 journal, and `mount
+						# -o ro,loop` sets up the loop device read-only, so the kernel
+						# cannot replay it and the mount fails outright. Recovery is also
+						# what makes the user's LAST session visible. Nothing below
+						# writes to it.
+						if ! mount -o loop "$img" "$src"; then
+							echo "cogbox-guest-harness-migrate: could not loop-mount $img; refusing the bind so the image stays migratable on the next boot" >&2
+							exit 1
+						fi
+					'';
+				};
 				# The VM's guest oneshots order after the 9p data mount; the
 				# container has no such mount, so they order after the state-prep
 				# oneshot that symlinks /var/lib/cogbox into the mounted state
@@ -1472,8 +2346,70 @@
 						tag = tag p.harness p.pathkey;
 						source = sentinel p.harness p.pathkey;
 						mountPoint = lowerMount p.harness p.pathkey;
+						# THE security property of the harness layout, in one word, in
+						# both profiles: QEMU exports the host's harness config
+						# read-only, so a compromised agent cannot write back into it.
+						# Every guest write lands in the per-instance overlay upper
+						# instead. Nothing in the storage profiles touches this.
 						readOnly = true;
 					}) overlayPaths;
+					# The user's data pool, plus (hosted only) the writable /nix/store
+					# overlay. microvm.nix wires each volume as virtio-blk with
+					# discard=unmap already set, and generates a fileSystems entry for
+					# each mountPoint carrying only `device` and `fsType` -- never
+					# `options` -- so the pool's mount options and autoResize below
+					# merge onto it with no mkForce.
+					volumes = lib.optionals poolEnabled ([ ({
+						mountPoint = poolMount;
+						fsType = "ext4";
+						label = poolLabel;
+					} // (if hosted then {
+						image = hostedPoolLV;
+						# MUST be explicit, on BOTH hosted volumes. microvm.nix defaults
+						# autoCreate to TRUE and its guard is `[ ! -e "$image" ]` -- an
+						# EXISTENCE check that follows symlinks, not a filesystem check.
+						# Left true, a logical volume that did not get activated (an
+						# unattached disk, a volume group the host refused to touch)
+						# would be touch'ed into a regular FILE under /dev, truncated
+						# and mkfs'd, handing the user a blank pool while their real
+						# disk sat there intact. This disk holds the only copy of their
+						# work tree, so that failure is worse than an over-eager mkfs,
+						# and it is reachable through the dependency rather than through
+						# any cogbox code.
+						#
+						# The cost of false is that microvm.nix applies NO label (it
+						# warns exactly that at eval time), which is why the GCE host
+						# half formats AND labels both logical volumes before the VM is
+						# launched.
+						autoCreate = false;
+						# `size` is deliberately omitted: the submodule gives it no
+						# default, but it is only forced inside the autoCreate branch of
+						# createVolumesScript. VERIFIED BY EVALUATION, not by reading.
+						# The host sizes both volumes -- see cogworx.gce.
+					} else {
+						# ${dataDir} is the /tmp/cogbox/data sentinel cogbox-launch.sh
+						# sed-rewrites to $RUNTIME/data, itself a symlink to the
+						# instance's persistent data dir -- so the image survives
+						# restarts with no launcher change. The rewrite happens inside
+						# bin/microvm-run, which is where createVolumesScript runs.
+						image = "${dataDir}/machine-state.img";
+						autoCreate = true;   # truncate + mkfs.ext4 -L <label>
+						size = storageCfg.sizeMiB;
+					})) ] ++ lib.optional hosted {
+						# See hostedStoreLV above for why this is a second volume and
+						# not a subdirectory of the pool. mountPoint == writableStoreOverlay
+						# is what makes microvm.nix mark it neededForBoot, which is
+						# exactly what the /nix/store overlay needs -- and it is the
+						# whole reason this is a separate logical volume rather than a
+						# directory in the pool, so do not fold it back in.
+						mountPoint = "/nix/.rw-store";
+						fsType = "ext4";
+						label = storeOverlayLabel;
+						image = hostedStoreLV;
+						# Same reasoning as the pool: the host carves and formats this
+						# logical volume, so microvm.nix must neither create nor size it.
+						autoCreate = false;
+					});
 					# A human (HMP) QEMU monitor on a per-instance socket, for
 					# `cogbox monitor`. The microvm module already wires a QMP
 					# control socket (qemu.socket -> -qmp); this is the separate
@@ -1548,22 +2484,53 @@
 						};
 					}
 				) fwCfgPaths)) // {
-					cogbox-brain-materialize = {
+					cogbox-brain-materialize = let
+						# The mount this unit writes THROUGH: hermes skills are linked into
+						# the overlay UPPER, so linking before the mount writes to the
+						# covered rootfs. Named once and fed to all three of after/requires/
+						# wants, because the ordering is wanted in every profile and only
+						# the strength of the dependency differs.
+						hermesMount = lib.optional (isVm && harnesses ? "hermes-agent") "/root/.hermes";
+					in {
 						description = "Materialize the cogbox plugin brain into ~/work";
 						wantedBy = [ "multi-user.target" ];
 						before = [ "multi-user.target" "sshd.service" ];
 						after = [ stateUnit ]
 							++ lib.optional isContainer "cogbox-init.service"
 							++ lib.optional (isVm && harnesses ? "codex") "${utils.escapeSystemdPath "/root/.codex"}.mount"
-							# In the VM, Hermes skills are linked into the overlay upper;
-							# linking before the mount would write to the covered rootfs.
-							++ lib.optional (isVm && harnesses ? "hermes-agent") "${utils.escapeSystemdPath "/root/.hermes"}.mount";
-						requires = [ stateUnit ]
-							++ lib.optional (isVm && harnesses ? "hermes-agent") "${utils.escapeSystemdPath "/root/.hermes"}.mount";
+							++ map mountUnitOf hermesMount;
+						# hardMounts/softMounts, not a flat Requires=: under `hosted` that
+						# overlay's upper and work dirs live under the pool-bound
+						# /var/lib/harness-rw, so a hard Requires= means a pool-absent boot
+						# does not materialise the brain AT ALL -- no .cogbox/brain, no
+						# skills/agents/commands, no AGENTS.md -- when the degradation is
+						# only supposed to cost that boot its harness CONFIG. Wants= keeps
+						# the mount pulled in and the After= above keeps the ordering, so
+						# nothing changes on a healthy boot. In the workstation profile the
+						# same call keeps the Requires=: there the overlay rests on the loop
+						# image, which is a genuine precondition in every case.
+						requires = [ stateUnit ] ++ hardMounts hermesMount;
+						wants = softMounts hermesMount;
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
 							ExecStart = brainMaterializeScript;
+							# The container arm rebuilds the brain with `nix build`, whose
+							# duration is set by the plugin closure the USER installed, so
+							# there is no honest bound: a cap here would turn a slow
+							# first-boot plugin build into a sandbox with no brain. Stated
+							# rather than left to the Type=oneshot default so the unit file
+							# says which of the two it is (systemd.service(5): oneshot
+							# DISABLES the start timeout unless it is set).
+							#
+							# The VM arm is bounded, because there this script only mkdirs
+							# and symlinks under $WORK -- a wedged 9p share or a wedged pool
+							# bind is the only way it can take minutes, and this unit is
+							# Before=sshd.service, so unbounded that is a guest with no sshd
+							# and nothing in `systemctl --failed`. At the bound the unit
+							# fails loudly, sshd proceeds, and the sandbox comes up with the
+							# pre-plugin work tree.
+							TimeoutStartSec = if isContainer then "infinity" else 600;
 						} // lib.optionalAttrs isContainer {
 							# COGBOX_INSTANCE picks which instance's composition flake the
 							# brain rebuilds from; XDG_CONFIG_HOME locates it. systemd does
@@ -1808,7 +2775,10 @@
 					sshd-keygen = lib.mkIf isVm {
 						after = [ "var-lib-cogbox.mount" "cogbox-vm-sshd-prep.service" ];
 					};
-					harness-overlay-img = lib.mkIf isVm {
+					# Gated off in the hosted profile: /var/lib/harness-rw is a plain
+					# directory on the pool there, so there is no image to build and
+					# running this would create a 128 MiB file nothing ever mounts.
+					harness-overlay-img = lib.mkIf (isVm && !hosted) {
 						description = "Create ext4 image for harness overlay";
 						wantedBy = [ "var-lib-harness\\x2drw.mount" ];
 						before = [ "var-lib-harness\\x2drw.mount" ];
@@ -1818,6 +2788,20 @@
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
+							# Bounded. This unit is the recorded precedent for the failure
+							# shape -- its own comment below records a first-boot format
+							# that outran an EXTERNAL deadline -- and the two are not the
+							# same thing: a 10-minute INTERNAL bound is orders of magnitude
+							# above any healthy truncate + mkfs of a 128 MiB file, so it
+							# never fires on the slow-but-progressing case, and it converts
+							# a genuinely wedged 9p share (where the mkfs never returns)
+							# from a silent hang into a failure. It is deliberately the
+							# only unit here whose timeout does NOT degrade: this profile's
+							# harness-rw mount is a hard local-fs.target requirement, so a
+							# failure ends in emergency.target either way. Loud and
+							# diagnosable beats a boot that hangs with nothing in
+							# `systemctl --failed`.
+							TimeoutStartSec = 600;
 							ExecStart = pkgs.writeShellScript "harness-overlay-img" ''
 								img=/var/lib/cogbox/harness-overlay.img
 								old_img=/var/lib/cogbox/claude-overlay.img
@@ -1859,11 +2843,46 @@
 						wantedBy = harnessMountUnits;
 						before = harnessMountUnits;
 						after = [ "var-lib-harness\\x2drw.mount" ];
-						requires = [ "var-lib-harness\\x2drw.mount" ];
+						# Requires= the mount in the WORKSTATION profile only, and that
+						# split is what completes the hosted fail-safe. In hosted the
+						# harness-rw mount is a pool bind, so an absent pool makes it
+						# fail; with a hard Requires= this unit would fail too, the four
+						# harness overlay UPPERDIRS would never be created, and the four
+						# overlay mounts -- which are ordinary local-fs.target.requires
+						# entries with no nofail of their own -- would fail and take the
+						# boot to emergency.target. `nofail` on the pool binds cannot
+						# reach that: the cascade runs through a SERVICE, not through the
+						# generated mount units. Ordered `after` regardless, so the dirs
+						# are never created on the underlying directory and then shadowed
+						# by a mount that arrives late; After= orders on job COMPLETION,
+						# success or failure. Degraded result: the uppers land on the
+						# tmpfs root and harness config is ephemeral for that boot, which
+						# is the pre-pool behaviour and not a wedge.
+						#
+						# Through hardMounts/softMounts rather than a local `hosted`
+						# test, because this is one member of a CLASS -- see their
+						# definition above and the scan in cogbox-guest-pool-degradable.
+						# It resolves to exactly the split spelled out here: harness-rw is
+						# pool-backed under hosted and the loop image otherwise.
+						requires = hardMounts [ "/var/lib/harness-rw" ];
+						wants = softMounts [ "/var/lib/harness-rw" ];
 						unitConfig.DefaultDependencies = false;
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
+							# Bounded, and the bound is what makes the degradation above
+							# reachable rather than theoretical: every path this unit
+							# mkdirs is on the harness-rw mount, so a mount that hangs
+							# instead of failing -- a wedged pool bind, a wedged loop image
+							# -- leaves it in `activating` forever. The four harness
+							# overlay mounts are ordered after it and
+							# cogbox-brain-materialize is ordered after those, and that
+							# unit is Before=sshd.service: unbounded, a hung mkdir is a
+							# guest with no sshd and nothing in `systemctl --failed`. At
+							# the bound the unit fails, the overlays fail with it, and the
+							# guest comes up with ephemeral harness config -- the same
+							# degraded shape the Wants= split produces.
+							TimeoutStartSec = 120;
 							ExecStart = pkgs.writeShellScript "harness-setup-dirs" ''
 								base=/var/lib/harness-rw
 
@@ -1887,7 +2906,18 @@
 						};
 					};
 
-					resize-store-overlay = lib.mkIf isVm {
+					# Gated off in the hosted profile, and that gate is load-bearing
+					# rather than tidy-up. This unit remounts /nix/.rw-store to whatever
+					# /var/lib/cogbox/.config/store-overlay-size holds, and
+					# cogbox-launch.sh has always written "16G" there (and baked
+					# storeOverlaySize: "16G" into every instance's config.json). Every
+					# hosted instance in the field therefore carries that file already,
+					# so without this gate the boot would try `mount -o remount,size=16G`
+					# against an EXT4 filesystem -- and on the workstation side the
+					# explicit tmpfs fraction above would be remounted straight back to
+					# 16G, making the sizing fix inert. The launcher's matching half
+					# stops writing a default for NEW instances.
+					resize-store-overlay = lib.mkIf (isVm && !hosted) {
 						description = "Resize writable nix store overlay from config";
 						wantedBy = [ "multi-user.target" ];
 						after = [ "var-lib-cogbox.mount" ];
@@ -1895,6 +2925,14 @@
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
+							# Bounded. Nothing is ordered after this unit, so a hang here
+							# cannot hold sshd -- but it reads a file off the 9p share,
+							# which CAN block indefinitely, and multi-user.target's job
+							# does not complete while a unit it wants is still activating.
+							# 60s is far above a stat + a remount; at the bound the unit
+							# fails, the store overlay keeps the size the Nix-declared
+							# tmpfs fraction gave it, and the failure is visible.
+							TimeoutStartSec = 60;
 							ExecStart = pkgs.writeShellScript "resize-store-overlay" ''
 								sizefile=/var/lib/cogbox/.config/store-overlay-size
 								if [ -f "$sizefile" ]; then
@@ -1902,6 +2940,148 @@
 									${pkgs.util-linux}/bin/mount -o "remount,size=$size" /nix/.rw-store
 								fi
 							'';
+						};
+					};
+
+					# Create the pool's per-class subdirectories. Clone of
+					# harness-setup-dirs above: DefaultDependencies = false, oneshot +
+					# RemainAfterExit, wantedBy/before the module-generated bind mount
+					# units, after/requires the pool mount. This is ORDERING, not
+					# housekeeping: a bind whose SOURCE does not exist either fails or --
+					# worse, for work/ -- mounts an empty directory over live data. Every
+					# bind also carries x-systemd.requires= on this unit, so a failure
+					# here stops the binds rather than letting them run half-prepared.
+					cogbox-guest-dirs = lib.mkIf poolEnabled {
+						description = "Create per-class subdirs in the guest storage pool";
+						wantedBy = poolBindUnits;
+						before = poolBindUnits;
+						after = [ poolUnit ];
+						requires = [ poolUnit ];
+						unitConfig.DefaultDependencies = false;
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							# Bounded. Every path here is ON the pool, so a filesystem that
+							# hangs rather than fails -- a stalled virtio-blk, an ext4 that
+							# never finishes recovery -- makes these mkdirs block in
+							# D-state. Every pool bind carries x-systemd.requires= on this
+							# unit and the work bind is ordered before
+							# cogbox-brain-materialize, which is Before=sshd.service: with
+							# no bound that is a guest with no login and nothing in
+							# `systemctl --failed`. Seven mkdirs and a chmod finish in
+							# milliseconds on any pool that works at all, so 120s is
+							# entirely fault, not slow progress. At the bound the unit
+							# fails, the binds it gates do not happen, and `nofail` on
+							# every one of them means the guest degrades to the pre-pool
+							# layout instead of failing local-fs.target.
+							TimeoutStartSec = 120;
+							ExecStart = pkgs.writeShellScript "cogbox-guest-dirs" ''
+								set -eu
+								${lib.concatMapStringsSep "\n"
+									(sub: "mkdir -p ${poolMount}/${sub}")
+									(lib.mapAttrsToList (_: b: b.sub) poolBinds)}
+								# root's home lives at 0700; the pool-backed replacements
+								# must not be laxer than what they cover. Wrapped in an
+								# optionalString so dropping every /root bind cannot leave a
+								# bare `chmod 0700` behind -- that would fail under set -eu
+								# and take the whole pool-prep unit down.
+								${let rootDirs = map (b: "${poolMount}/${b.sub}")
+									(lib.attrValues (lib.filterAttrs
+										(guest: _: lib.hasPrefix "/root/" guest) poolBinds));
+								in lib.optionalString (rootDirs != [])
+									"chmod 0700 ${lib.concatStringsSep " " rootDirs}"}
+							'';
+						};
+					};
+
+					# ONE-TIME work migration for an instance that predates the pool.
+					# Deliberately NOT wantedBy anything: the /var/lib/cogbox/work bind
+					# pulls it in via x-systemd.requires, which is the gce/state-disk.nix
+					# idiom -- it runs exactly when the bind is about to happen and not
+					# at all on an instance that has no such bind. Because the bind
+					# Requires= it, a nonzero exit means the bind does not happen and the
+					# guest keeps using the 9p copy: fail-safe on the one leg of this
+					# change that touches irreplaceable user data.
+					cogbox-guest-work-migrate = lib.mkIf (isVm && hosted) {
+						description = "One-time copy of work/ from the 9p state dir onto the guest pool";
+						after = [ poolUnit cogboxUnit "cogbox-guest-dirs.service" ];
+						requires = [ poolUnit cogboxUnit "cogbox-guest-dirs.service" ];
+						unitConfig.DefaultDependencies = false;
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							# EXPLICIT, because the default for Type=oneshot is NO TIMEOUT
+							# AT ALL (systemd.service(5): "except when Type=oneshot is
+							# used, in which case the timeout is DISABLED by default").
+							# This unit is an UNBOUNDED DATA COPY that now sits in front of
+							# sshd: the /var/lib/cogbox/work bind Requires= it, and that
+							# bind is ordered Before=cogbox-brain-materialize.service,
+							# which is itself Before=sshd.service. A copy that wedges --
+							# a 9p share that stops answering mid-walk is the realistic
+							# way -- therefore holds the guest's login forever, with the
+							# unit stuck in `activating` and NOTHING in `systemctl
+							# --failed`. That is the exact shape this design is written
+							# against, and only this line rules it out.
+							#
+							# 15 minutes, and the number is chosen from the RETRY cost
+							# rather than from the copy cost. At the bound systemd SIGTERMs
+							# the script: it leaves no marker, so the next boot re-runs the
+							# whole migration from scratch (`rm -rf "$incoming"` at the top
+							# of the copy path clears the partial), and the bind -- which
+							# Requires= this unit -- does not happen, so the 9p copy stays
+							# authoritative and visible. `nofail` on that bind is what
+							# makes the failure degrade the one path instead of failing
+							# local-fs.target. The cost of a bound that is too TIGHT is
+							# therefore not a lost migration but a permanent one: a tree
+							# that cannot be copied in the budget charges the full budget
+							# in front of sshd on EVERY boot and never completes. 15
+							# minutes clears a many-GiB tree over 9p with room to spare
+							# while still being a bound; a tree that needs longer needs an
+							# operator, not a bigger number.
+							TimeoutStartSec = 900;
+							ExecStart = "${guestWorkMigrate}/bin/cogbox-guest-work-migrate";
+						};
+					};
+
+					# The same one-time migration for the OTHER surface the hosted
+					# profile repoints: /var/lib/harness-rw, whose legacy home is the
+					# ext4 loop image on the 9p share. Without this, switching an
+					# existing instance to hosted would present all four harness overlay
+					# uppers -- claude's settings/history/credentials, the hermes home,
+					# opencode's config and data -- as empty on the first hosted boot,
+					# because the bind would land on a freshly-created pool directory
+					# and the read-only 9p lower supplies only the baked defaults. Same
+					# shape as the work leg: pulled in by the bind via
+					# x-systemd.requires, refuses rather than half-copies, and the
+					# refusal now degrades one path instead of the boot.
+					cogbox-guest-harness-migrate = lib.mkIf (isVm && hosted) {
+						description = "One-time copy of the harness overlay image onto the guest pool";
+						after = [ poolUnit cogboxUnit "cogbox-guest-dirs.service" ];
+						requires = [ poolUnit cogboxUnit "cogbox-guest-dirs.service" ];
+						unitConfig.DefaultDependencies = false;
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							# Same reasoning as the work leg above -- an unbounded oneshot
+							# in front of sshd, with the Type=oneshot default being no
+							# timeout at all -- but a fifth of the budget, because the
+							# input is bounded in a way work/ is not: the legacy source is
+							# a single 128 MiB ext4 image on the 9p share (the size
+							# harness-overlay-img has always created), not a tree the user
+							# grows. 5 minutes is two orders of magnitude above a healthy
+							# loop-mount plus copy of that image.
+							#
+							# At the bound: no marker, so the next boot retries; the bind
+							# Requires= this unit, so it does not happen and the harness
+							# overlays keep resolving through the legacy loop image. One
+							# leak worth naming -- bash does NOT run an EXIT trap on an
+							# untrapped SIGTERM, so the `umount` this script arms for
+							# /run/cogbox-harness-migrate does not run and the loop mount
+							# survives until the guest reboots. Harmless: nothing else
+							# reads that path, and a same-boot retry would stack a second
+							# mount of the same image over it and read identical content.
+							TimeoutStartSec = 300;
+							ExecStart = "${guestHarnessMigrate}/bin/cogbox-guest-harness-migrate";
 						};
 					};
 
@@ -1917,9 +3097,29 @@
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
+							# Bounded, now that this unit reaches further into the PVC than
+							# it used to: the three machine-state legs below mkdir and
+							# symlink under ${stateRoot}/machine, so a PVC that hangs
+							# rather than fails blocks here. Everything downstream is
+							# ordered after it -- cogbox-init Requires= it, and
+							# cogbox-brain-materialize Requires= it through stateUnit --
+							# and the readiness probe gates on brain-materialize, so an
+							# unbounded hang is a pod that never becomes Ready with nothing
+							# in `systemctl --failed`. This does not degrade and is not
+							# meant to: the unit owns the /var/lib/cogbox symlink and
+							# sshd's persisted host key, so its failure is fail-CLOSED by
+							# design. The bound only changes an invisible hang into a
+							# failure an operator can see. 180s against a script whose slow
+							# path is a handful of mkdirs.
+							TimeoutStartSec = 180;
 							ExecStart = pkgs.writeShellScript "cogbox-container-state" ''
 								set -e
-								mkdir -p ${cogboxData} ${stateRoot}/config ${stateRoot}/ssh /run/cogbox
+								# ${stateRoot}/machine is the machine-state parent. It has to
+								# exist BEFORE the legs below: the helper creates its
+								# persistent home with a bare `mkdir` (no -p), so a missing
+								# parent turns every leg into a failure. hermes-home needs no
+								# such line -- it sits directly under the mount point.
+								mkdir -p ${cogboxData} ${stateRoot}/config ${stateRoot}/ssh ${stateRoot}/machine /run/cogbox
 								# sshd writes the persisted host key here (0700 so the
 								# private key is not group/world readable).
 								chmod 700 ${stateRoot}/ssh
@@ -1927,6 +3127,38 @@
 								${lib.optionalString (harnesses ? "hermes-agent") ''
 									${hermesHomeHelper}/bin/cogbox-hermes-home ${stateRoot}/hermes-home /root/.hermes
 								''}
+								# Machine-state on the PVC, through the SAME validated-symlink
+								# helper the hermes home uses: it refuses a symlinked or
+								# non-directory persistent target, refuses a link path that is
+								# a NONEMPTY directory (so a real directory with content is
+								# never blindly replaced), adopts an already-populated
+								# persistent directory as-is, and no-ops when the link is
+								# already correct -- which is what makes this unit idempotent
+								# across the every-boot re-run.
+								#
+								# Nothing pre-creates these three on this target (the image
+								# bakes /root empty at 0700, the only tmpfiles rule under /root
+								# is the .nix-channels FILE, and the pre-systemd
+								# `nix-store --realise` in agent-init writes no ~/.cache), so
+								# the normal boot takes the create-or-adopt path. There is
+								# deliberately no content MIGRATION leg: the container's /root
+								# lives on the ephemeral writable layer, so by the time this
+								# unit runs on a restart the previous boot's content is already
+								# gone -- there is never anything to migrate, only a persistent
+								# copy to adopt.
+								#
+								# Each leg is INDIVIDUALLY tolerant, and that is load-bearing
+								# rather than lax: this script runs under `set -e`, so an
+								# untolerated failure would take the whole unit down -- and with
+								# it the /var/lib/cogbox symlink, the seeded instance config and
+								# sshd's persisted host key -- wedging the sandbox over a cache
+								# directory. A failed leg degrades that ONE path to today's
+								# ephemeral behaviour and says so in the journal. The hermes leg
+								# above keeps its fail-closed semantics: it carries credentials.
+								${lib.concatMapStringsSep "\n" (p: ''
+									${hermesHomeHelper}/bin/cogbox-hermes-home ${stateRoot}/machine/${p.sub} ${p.guest} \
+										|| echo "cogbox-container-state: ${p.guest} is not persisted (see above); continuing on the ephemeral container layer" >&2
+								'') containerMachineState}
 							'';
 						};
 					};
@@ -1963,7 +3195,9 @@
 					# brain-trust writes ~/.claude.json and before a terminal opens.
 					# Re-run on connect/disconnect by cogworx (systemctl restart) and at
 					# every boot (restart persistence from the PVC marker).
-					cogbox-claude-stub = lib.mkIf (isContainer || isVm) {
+					cogbox-claude-stub = lib.mkIf (isContainer || isVm) (let
+						claudeMount = lib.optional (isVm && harnesses ? "claude-code") "/root/.claude";
+					in {
 						description = "Stage/remove the redacted Claude stub credential"
 							+ lib.optionalString isContainer " (container backend)";
 						wantedBy = [ "multi-user.target" ];
@@ -1972,13 +3206,28 @@
 						# var-lib-cogbox.mount). On the VM the verb writes
 						# .credentials.json into the /root/.claude OVERLAY, so that mount
 						# must be up first (a write before it lands on the covered rootfs).
-						after = [ stateUnit ]
-							++ lib.optional (isVm && harnesses ? "claude-code") "${utils.escapeSystemdPath "/root/.claude"}.mount";
-						requires = [ stateUnit ]
-							++ lib.optional (isVm && harnesses ? "claude-code") "${utils.escapeSystemdPath "/root/.claude"}.mount";
+						after = [ stateUnit ] ++ map mountUnitOf claudeMount;
+						# Same split as cogbox-brain-materialize, and for the same reason:
+						# under `hosted` that overlay's upper lives under the pool-bound
+						# /var/lib/harness-rw, so a hard Requires= means a pool-absent boot
+						# never reconciles the stub -- which is how a user ends up looking
+						# at a stale credential the control plane believes it removed. The
+						# After= above still keeps the write off the covered rootfs when
+						# the mount DOES arrive, and the workstation profile keeps its
+						# Requires= (there the overlay rests on the loop image).
+						requires = [ stateUnit ] ++ hardMounts claudeMount;
+						wants = softMounts claudeMount;
 						serviceConfig = {
 							Type = "oneshot";
 							RemainAfterExit = true;
+							# Bounded: both variants are a marker test plus one short
+							# `cogbox __claude-stub` run against files on the state mount,
+							# and this unit is Before=sshd.service, so a wedged state mount
+							# would otherwise hold the login prompt forever with nothing in
+							# `systemctl --failed`. At the bound the unit fails loudly and
+							# the boot continues with the stub unreconciled -- exactly what
+							# a pool-absent boot already degrades to.
+							TimeoutStartSec = 120;
 							# The container verb resolves XDG/HOME/COGBOX_DATA to locate
 							# the state root; the VM variant takes explicit path args and
 							# needs only HOME.
@@ -1991,7 +3240,7 @@
 							];
 							ExecStart = if isContainer then claudeStubScript else claudeStubScriptVm;
 						};
-					};
+					});
 
 					# Container backend: install the SSH user-CA trust anchor and this
 					# instance's authorized-principals file BEFORE sshd starts. The
@@ -2038,34 +3287,309 @@
 							'';
 						};
 					};
-				};
+				} // lib.optionalAttrs poolEnabled (lib.listToAttrs (map (p: lib.nameValuePair
+					# nixpkgs' OWN overlay pre-mount units (tasks/filesystems/overlayfs.nix
+					# names them rw-<escaped mountPoint>), bounded here for the same reason
+					# harness-setup-dirs is: each runs `mkdir -p <upper> <work>` under
+					# /var/lib/harness-rw -- a pool bind in this profile -- and each is
+					# Before= its overlay mount. cogbox-brain-materialize is After= the
+					# hermes overlay and Before=sshd.service, so an unbounded mkdir sitting
+					# in D-state on a pool that stalled AFTER mounting is once again a guest
+					# with no login and an EMPTY `systemctl --failed`. That 120s bound on
+					# harness-setup-dirs does not rescue this: nothing orders these two
+					# against each other, and they mkdir the same directories independently.
+					#
+					# cogbox-guest-pool-degradable exempts rw-* from its hard-dependency
+					# scan; that exemption is about FAILURE (theirs fails only the matching
+					# `nofail` overlay mount) and is untouched here. This is about a HANG,
+					# which `nofail` does not bound.
+					#
+					# Merged into nixpkgs' definition rather than added as a drop-in,
+					# because systemd.services already renders these into systemd.units and
+					# a second systemd.units definition of the same name is a `text`
+					# conflict, not an override. The cost of merging is that a nixpkgs
+					# rename would leave a stray timeout-only unit behind instead of an
+					# error -- so cogbox-guest-pool-boot-bounded asserts each of these
+					# still carries an ExecStart alongside the bound.
+					"rw-${utils.escapeSystemdPath p.guest}"
+					{ serviceConfig.TimeoutStartSec = 120; }) overlayPaths));
 
 				virtualisation.docker.enable = lib.mkIf isVm true;
 
+				# Cap the journal now that it can outlive a reboot. journald's
+				# SystemMaxUse defaults to 10% of the containing filesystem and
+				# SystemKeepFree to 15%; with /var/log/journal on the pool, and docker's
+				# log driver in this guest being journald, container stdout could
+				# otherwise claim a tenth of the user's single data pool. One line, or
+				# the observability half eats the storage half.
+				#
+				# Gated on poolEnabled -- i.e. applied only where the journal actually
+				# HAS a mount of its own -- because these are ABSOLUTE sizes and
+				# journald's own defaults are FRACTIONS of the containing filesystem.
+				# On the default profile the journal lives on the root tmpfs, sized at
+				# half of guest RAM, and `mem` is a per-instance knob: on a 2048 MiB
+				# guest that filesystem is 1 GiB, where SystemKeepFree=1G would demand
+				# the whole of it and journald would vacuum the journal to nothing --
+				# breaking `journalctl -b -1` on precisely the profile with no journal
+				# mount to fall back on -- while SystemMaxUse=512M would RAISE the cap
+				# from the 100 MiB the 10% default gives. The percentage defaults
+				# self-scale with `mem` and are already the right answer there.
+				#
+				# Joined from a list rather than written as an indented '' block: Nix
+				# strips only SPACE indentation and this file is tab-indented, so a ''
+				# block emits tab-prefixed directives into journald.conf and leans on
+				# systemd's parser stripping them.
+				services.journald.extraConfig = lib.mkIf poolEnabled (lib.concatStringsSep "\n" [
+					"SystemMaxUse=512M"
+					"SystemKeepFree=1G"
+				]);
+
+				# Bounds for the jobs on the pool's boot path that this change does not
+				# author. `nofail` on the pool line bounds FAILURE; only a timeout bounds
+				# a HANG, and the fault this design is written against -- a provider disk
+				# that ANSWERS the device probe and then stalls on reads -- produces a
+				# hang, not a failure. The 30s x-systemd.device-timeout covers "the
+				# device never appears"; everything below covers "the device appeared and
+				# then stopped answering", which is the stuck-in-Booting shape.
+				#
+				# Rendered as DROP-INS (overrideStrategy = "asDropin") and via
+				# systemd.units rather than systemd.services, and both choices are
+				# load-bearing:
+				#
+				#   asDropinIfExists -- the DEFAULT -- would look for
+				#   systemd-fsck@dev-...-guest.service in the unit tree, not find it
+				#   (only the TEMPLATE systemd-fsck@.service is there) and install this
+				#   as a FULL unit shadowing the template: no ExecStart, so the instance
+				#   would "succeed" instantly and the pool would never be checked at all.
+				#   Silently. cogbox-guest-pool-boot-bounded asserts the drop-in shape.
+				#
+				#   systemd.services would render the NixOS service scaffolding into the
+				#   drop-in too -- in particular Environment=PATH=, built from this
+				#   unit's own (empty) `path`. Drop-ins are applied after the template's,
+				#   and a later Environment= for the same variable WINS, so that PATH
+				#   would replace the one nixpkgs' filesystems module gives
+				#   systemd-fsck@.service and take e2fsprogs off fsck's PATH. A raw
+				#   `text` emits the two settings and nothing else.
+				systemd.units = lib.mkIf poolEnabled {
+					# 10 minutes. `fsck -a` on a journalled ext4 replays and returns in
+					# well under a second in the ordinary case, including after an
+					# unclean guest shutdown; only a filesystem systemd decides to check
+					# in full runs long, and that scales with the pool's size, which is
+					# operator-set and unbounded. So the number is chosen the same way
+					# the migration budgets were: far above any healthy run, and a
+					# filesystem that genuinely needs longer needs an operator rather
+					# than a bigger constant.
+					#
+					# Hitting it DEGRADES, in the direction S3 already chose: the pool
+					# .mount Requires= this unit, so the mount does not happen, and the
+					# mount is `nofail`, so local-fs.target still activates and every
+					# pool bind simply does not run. The guest comes up on the pre-pool
+					# layout with sshd, and the failure is named in `systemctl --failed`
+					# instead of being an invisible `activating` job.
+					${poolFsckUnit} = {
+						overrideStrategy = "asDropin";
+						text = poolJobTimeout 600;
+					};
+					# Same bound, different degradation: the pool .mount only Wants= this
+					# one, so a timeout leaves the pool MOUNTED AT ITS OLD SIZE and the
+					# guest otherwise intact -- the correct outcome for a grow that could
+					# not finish, and it retries on the next boot because x-systemd.growfs
+					# runs every boot. Unbounded it is worse than the fsck: an online
+					# resize2fs that D-states holds local-fs.target through the
+					# generator's own ordering drop-in, and local-fs.target gates
+					# systemd-tmpfiles-setup, hence sysinit.target, hence sshd.
+					${poolGrowfsUnit} = {
+						overrideStrategy = "asDropin";
+						text = poolJobTimeout 600;
+					};
+					# NOT generated and not upstream-unbounded by accident:
+					# systemd-tmpfiles-setup.service is Type=oneshot with no TimeoutSec at
+					# all, and systemd.service(5) DISABLES the start timeout for oneshot,
+					# so it is unbounded. It is After=local-fs.target and
+					# Before=sysinit.target, and this change is what first puts a
+					# provider-disk-backed path under it: systemd's own tmpfiles.d chowns
+					# and chmods /var/log/journal, which is a pool bind here and was a
+					# directory on the RAM-backed root before. A pool that stalls AFTER
+					# mounting therefore parks tmpfiles in D-state and wedges sysinit with
+					# nothing in `systemctl --failed` -- finding 1's shape, reached
+					# through a unit nobody in this repo writes.
+					#
+					# 5 minutes rather than 10: unlike fsck this work does not scale with
+					# the pool, it is a fixed set of rules that finishes in seconds on any
+					# guest that works. sysinit.target only Wants= it, so the bound
+					# degrades (some tmpfiles rules unapplied, loudly) rather than wedging.
+					"systemd-tmpfiles-setup.service" = {
+						overrideStrategy = "asDropin";
+						text = poolJobTimeout 300;
+					};
+				};
+
 				fileSystems = lib.mkIf isVm ({
-					"/nix/.rw-store" = {
+					# microvm.nix declares the WHOLE "/" attrset under ONE
+					# lib.mkDefault, so a partial override DISCARDS device, fsType and
+					# neededForBoot: `fileSystems."/".options = [...]` alone fails eval
+					# with `fileSystems."/".fsType was accessed but has no value
+					# defined`. Restate the whole attrset. 50% is the value microvm.nix
+					# already defaults to -- this states the rootfs size deliberately
+					# rather than inheriting it, which is the point of the change.
+					"/" = {
+						device = "rootfs";
 						fsType = "tmpfs";
-						options = [ "size=16G" "mode=0755" ];
+						options = [ "size=${rootTmpfsSize}" "mode=0755" ];
 						neededForBoot = true;
 					};
-
+				} // lib.optionalAttrs (!hosted) {
+					# Workstation: the writable /nix/store overlay stays a tmpfs, but
+					# sized as a FRACTION OF RAM instead of a fixed size=16G that is
+					# larger than the guest's entire memory -- a runaway `nix build`
+					# then fails with ENOSPC instead of OOM-killing the guest. NOTE the
+					# runtime half: resize-store-overlay.service remounts this from
+					# /var/lib/cogbox/.config/store-overlay-size, so cogbox-launch.sh
+					# must stop defaulting that file to "16G" or the size here is inert.
+					#
+					# Hosted has NO entry here on purpose: the volume above generates
+					# device + fsType + neededForBoot for /nix/.rw-store, and declaring
+					# fsType = "tmpfs" alongside an ext4 volume is a definition
+					# conflict, not an override.
+					"/nix/.rw-store" = {
+						fsType = "tmpfs";
+						options = [ "size=${storeOverlayTmpfs}" "mode=0755" ];
+						neededForBoot = true;
+					};
+				} // lib.optionalAttrs hosted {
+					"/nix/.rw-store" = {
+						options = [
+							# ext4 mounts nodiscard by DEFAULT. discard=unmap on the QEMU
+							# drive is necessary but not sufficient; without this the
+							# freed blocks never return through device-mapper to the
+							# provider disk and the sparse ratchet the design is fixing
+							# just moves one layer down.
+							"discard"
+						];
+						# Skip fsck. The host lays this filesystem down fresh on every
+						# host boot before the guest launches, so there is never a dirty
+						# filesystem to repair -- and this mount is neededForBoot, so a
+						# failing fsck would wedge stage 1 over a disposable cache. The
+						# pool deliberately keeps its fsck: that one holds real data.
+						# Keeps it BOUNDED, too -- see the systemd.units drop-ins above,
+						# which give that fsck the finite TimeoutSec upstream denies it.
+						#
+						# NO autoResize here, and the absence is a finding rather than an
+						# omission: NixOS renders autoResize as nothing but the
+						# x-systemd.growfs mount option, and systemd-growfs@.service is a
+						# STAGE-2 upstream unit (nixpkgs system/boot/systemd.nix) with no
+						# stage-1 counterpart in this nixpkgs at all. Setting it on a
+						# neededForBoot mount would assert a growth path that cannot run.
+						# This volume grows because the host re-creates its filesystem at
+						# the logical volume's current size on every host boot.
+						noCheck = true;
+					};
+				} // lib.optionalAttrs poolEnabled {
+					# The pool itself. microvm.nix generates only device + fsType for a
+					# volume's mountPoint and NEVER sets `options` or `autoResize`, so
+					# both merge with no mkForce -- verified by evaluation.
+					${poolMount} = {
+						# Restart-to-grow: NixOS turns autoResize into x-systemd.growfs
+						# and ext4 is resizable, so growing an instance is `resize the
+						# disk, restart the guest` and nothing more. This works ONLY
+						# because the pool is stage 2 (neededForBoot false) --
+						# systemd-growfs@.service does not exist in the initrd, and a
+						# filesystem already mounted by stage 1 never runs its Wants= in
+						# stage 2 either. That is the whole reason the store overlay got
+						# its own volume instead of a subdirectory here.
+						autoResize = true;
+						options = [
+							# `nofail` STAYS, and NOT because it was already here.
+							# The reason it was written with is dead: "the guest
+							# degrades to today's LAYOUT, reading and writing the
+							# legacy 9p paths", extended on GCE by a launch-time
+							# chooser that fell back to the workstation runner
+							# whenever the host would not carve. The chooser is gone
+							# -- one baked profile, because state persisting across
+							# that flip was the root of four blocker rounds -- and
+							# the old comment's own parenthetical already conceded
+							# that after the migration those legacy paths hold the
+							# EMPTY directory stash() left behind. "Today's layout"
+							# was never "today's data".
+							#
+							# What earns it now is VISIBILITY, and this is the one
+							# fault on the whole path that the HOST cannot see.
+							# Everything the host refuses lands in its own `systemctl
+							# --failed` and is named on serial by supervise.sh leg
+							# (e2). But a pool the host carved, formatted and labelled
+							# SUCCESSFULLY, which the guest then cannot mount --
+							# corruption, an fsck that fails, a label that stopped
+							# resolving, a first mkfs interrupted between the two --
+							# gives the host nothing to report. Fail-closed here makes
+							# that local-fs.target -> emergency.target -> a guest with
+							# no sshd: a sandbox that is down for a reason neither
+							# side can read. With `nofail` the guest reaches
+							# multi-user, sshd answers, and the failed mount sits in
+							# the guest's own `systemctl --failed` where a person can
+							# actually find it.
+							#
+							# The two objections, both CLOSED rather than accepted:
+							#
+							#   "the user works in the empty tree and the next healthy
+							#   boot hides it." No: cogbox-guest-{work,harness}-migrate
+							#   test the POPULATED-POOL case first, before the
+							#   migration marker is consulted at all, precisely so a
+							#   marker cannot suppress the check. Such a boot fires
+							#   the fork WARNING naming both trees with both sizes and
+							#   retires the legacy copy to a numbered .pre-pool.
+							#
+							#   "nofail bounds FAILURE, not a HANG." Correct, which is
+							#   why the hang is bounded separately and explicitly:
+							#   x-systemd.device-timeout below, plus the finite
+							#   TimeoutStartSec/TimeoutStopSec drop-ins this module
+							#   renders onto the GENERATED systemd-fsck@ and
+							#   systemd-growfs@ instances for this mount (poolJobTimeout
+							#   above). cogbox-guest-pool-boot-bounded asserts every
+							#   one of them.
+							"nofail"
+							"x-systemd.device-timeout=30s"
+							# See the hosted /nix/.rw-store note above; the weekly
+							# fstrim timer is the belt to this brace.
+							"discard"
+						];
+					};
+				} // lib.optionalAttrs poolEnabled (lib.mapAttrs mkPoolBind poolBinds)
+				// lib.optionalAttrs (!hosted) {
+					# Workstation keeps the loop image. Hosted gets /var/lib/harness-rw
+					# as a plain pool directory instead (it is in poolBinds), retiring
+					# the 128 MiB ext4-in-a-file-on-ext4 image -- and with it the
+					# overlay-size knob's effect, since the launcher keeps writing the
+					# size file but harness-overlay-img, the only unit that read it, is
+					# gated off below. Existing workstation instances are unaffected.
 					"/var/lib/harness-rw" = {
 						device = "/var/lib/cogbox/harness-overlay.img";
 						fsType = "ext4";
 						options = [ "loop" ];
 					};
 				} // lib.listToAttrs (
-					(map (p: lib.nameValuePair p.guest {
+					# poolNofail on both kinds: see its definition above for WHY a
+					# harness mount that names no pool path anywhere still fails when the
+					# pool is absent. `options` on an overlay entry MERGES with the
+					# lowerdir=/upperdir=/workdir= list overlayfs.nix generates (they are
+					# separate definitions of one list option), so this adds a flag rather
+					# than replacing anything.
+					(map (p: lib.nameValuePair p.guest ({
 						overlay = {
 							lowerdir = [ (lowerMount p.harness p.pathkey) ];
 							upperdir = upperDir p.harness p.pathkey;
 							workdir = workDir p.harness p.pathkey;
 						};
-					}) overlayPaths)
+					} // poolNofailOpt [
+						p.guest
+						(lowerMount p.harness p.pathkey)
+						(upperDir p.harness p.pathkey)
+						(workDir p.harness p.pathkey)
+					])) overlayPaths)
 					++ (map (p: lib.nameValuePair p.guest {
 						device = ephemeralSrc p.harness p.pathkey;
 						fsType = "none";
-						options = [ "bind" ];
+						options = [ "bind" ]
+							++ poolNofail [ p.guest (ephemeralSrc p.harness p.pathkey) ];
 					}) ephemeralPaths)
 				));
 			})
@@ -2089,6 +3613,10 @@
 		packages = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
+			# The HOSTED-storage-profile guest runner. Same module tree, same
+			# vcpu/mem, cogbox.storage.profile = "hosted"; consumed only by
+			# packages.cogbox-hosted below, which only the GCE host image consumes.
+			runnerHosted = self.nixosConfigurations."${configName system}-hosted".config.microvm.declaredRunner;
 			# Container-native agent system (see mkContainer): the SAME guest
 			# module tree with target = "container". Its toplevel/init boots
 			# systemd PID1 in the agent-image below.
@@ -2204,7 +3732,29 @@
 			# substituted bash launch script at $out/libexec/cogbox-launch.sh.
 			# bin/cogbox is wrapped to expose runtime deps on PATH and to
 			# point COGBOX_LAUNCH_SCRIPT at its sibling libexec script.
-			mkCogbox = runner': pkgs.runCommand "cogbox" {
+			#
+			# `reexecAttr` is the flake PACKAGE ATTRIBUTE this cogbox re-execs
+			# itself through when an instance has plugins or a customized
+			# per-instance flake (`nix run path:@flakeSource@#@reexecPackage@`),
+			# and it has to be baked because that re-exec is what rebuilds the
+			# guest. The re-exec used to be attribute-LESS -- `nix run
+			# path:<flake>` -- which resolves packages.default, i.e. plain
+			# `cogbox`, i.e. the WORKSTATION guest. Byte-identical behaviour for
+			# `cogbox` itself, since default IS cogbox; load-bearing for
+			# cogbox-hosted below, where an attribute-less re-exec would have
+			# silently swapped the hosted guest for the workstation one on the
+			# first plugin add -- unmounting the user's data pool and showing them
+			# the stale retained 9p work tree, with no error anywhere.
+			#
+			# It is ALSO exported as COGBOX_REEXEC_PACKAGE, because the launcher's
+			# runner.path record is keyed on "<flakeSource>#<reexecPackage>" (see
+			# cogbox-launch.sh) and the Zig plugin verb pre-writes that same record
+			# from the worker pod. Both writers have to spell the key identically
+			# or the pre-write is silently rejected on every boot and a fresh
+			# instance pays a full eval it had already been spared. The Zig side
+			# defaults to "cogbox" when the variable is absent, which is what an
+			# unwrapped binary and every pre-existing image mean.
+			mkCogboxAttr = reexecAttr: runner': pkgs.runCommand "cogbox" {
 				nativeBuildInputs = [ pkgs.makeWrapper ];
 				meta = { mainProgram = "cogbox"; };
 			} ''
@@ -2226,7 +3776,9 @@
 					--replace-fail "@mitmdump@" "${pkgs.mitmproxy}/bin/mitmdump" \
 					--replace-fail "@l7addon@" "$out/libexec/l7-mitm-addon.py" \
 					--replace-fail "@flock@" "${pkgs.util-linux}/bin/flock" \
+					--replace-fail "@dumpe2fs@" "${pkgs.e2fsprogs}/bin/dumpe2fs" \
 					--replace-fail "@flakeSource@" "${self}" \
+					--replace-fail "@reexecPackage@" "${reexecAttr}" \
 					--replace-fail "@nixpkgsSource@" "${nixpkgs}"
 				chmod +x $out/libexec/cogbox-launch.sh
 				
@@ -2251,6 +3803,7 @@
 					--set COGBOX_ENFORCE_SCRIPT $out/libexec/cogbox-enforce.sh \
 					--set-default COGBOX_FLAKE_SOURCE "${self}" \
 					--set-default COGBOX_NIXPKGS_SOURCE "${nixpkgs}" \
+					--set-default COGBOX_REEXEC_PACKAGE "${reexecAttr}" \
 					--prefix PATH : "${lib.makeBinPath (with pkgs; [
 						coreutils gnused gnugrep jq diffutils nix bashInteractive openssh
 					] ++ [ self.packages.${system}.passt-cc ])}"
@@ -2260,6 +3813,9 @@
 				# ignores argv[0], so the symlink behaves identically.
 				ln -s cogbox $out/bin/cbx
 			'';
+			# Partial application, so every existing `mkCogbox <runner>` call site
+			# stays exactly as it was and keeps re-execing through `cogbox`.
+			mkCogbox = mkCogboxAttr "cogbox";
 		in rec {
 			cogbox-tools = pkgs.stdenv.mkDerivation {
 				pname = "cogbox-tools";
@@ -2289,6 +3845,24 @@
 			});
 			cogbox = mkCogbox runner;
 			default = cogbox;
+
+			# cogbox baked against the HOSTED-storage-profile guest, for the GCE
+			# backend image (gce/cogbox-host.nix's cogboxHosted wrapper is the sole
+			# consumer). Identical Zig binary and launch script; the only
+			# differences are which runner's store path is substituted for
+			# @runner@ and which package the launcher re-execs through.
+			#
+			# It has to be a separate PACKAGE, not a host module option or a
+			# launch-time flag, because the guest closure is baked at this point:
+			# mkCogbox substitutes a runner store path into cogbox-launch.sh, and
+			# `nixosConfigurations.cogbox-<arch>-hosted` is where the storage
+			# profile is set. mkGceHost's extraModules configure the HOST system
+			# and cannot reach the guest config at all.
+			#
+			# LOCAL USERS ARE UNTOUCHED: `cogbox`, `default` and every existing
+			# consumer above still resolve the workstation runner, and the
+			# workstation nixosConfiguration is unchanged.
+			cogbox-hosted = mkCogboxAttr "cogbox-hosted" runnerHosted;
 
 			# cogbox CLI for the container-native agent image: identical Zig
 			# binary + launch script, but baked against a NON-store placeholder
@@ -2660,6 +4234,125 @@
 			pkgs = nixpkgs.legacyPackages.${system};
 			hermesHomeHelper = mkHermesHomeHelper pkgs;
 			containerStateScript = self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-container-state.serviceConfig.ExecStart;
+			# Machine-state anti-shadow evidence for container-state-unit below. The
+			# three PVC-backed symlinks replace DIRECTORIES in root's home, and four
+			# harness mounts are nested under those same directories on the VM target
+			# -- so the whole safety argument for using a symlink here is "the
+			# container target declares no fileSystems at all". Read that off the
+			# realized configs instead of trusting the prose: if the container ever
+			# grows a mount, or the VM ever loses one of the nested harness mounts,
+			# this fails at eval rather than at runtime in a user's sandbox.
+			containerMountPoints = lib.attrNames self.nixosConfigurations."${configName system}-container".config.fileSystems;
+			vmMountPoints = lib.attrNames self.nixosConfigurations.${configName system}.config.fileSystems;
+			# Derived from the harness definition, not restated, so a harness that
+			# adds or moves a path is covered without editing the check.
+			opencodeGuestPaths = lib.optionals (enabledHarnesses ? "opencode")
+				(lib.mapAttrsToList (_: p: p.guest) enabledHarnesses.opencode.paths);
+			# Guest storage-profile evidence for cogbox-guest-volume-hosted and
+			# cogbox-guest-binds-ordered below. The realized /etc/fstab is the whole
+			# assertion surface: it is what stage 1 and systemd-fstab-generator actually
+			# read, so it captures the volume-generated device, the merged options and the
+			# x-initrd.mount / neededForBoot split in one artifact. environment.etc.fstab
+			# rather than `${toplevel}/etc/fstab` (the gce-image-* idiom) on purpose:
+			# byte-identical content for a few kilobytes of build instead of a whole guest
+			# system, and these two checks are meant to be cheap enough to always run.
+			hostedFstab = self.nixosConfigurations."${configName system}-hosted".config.environment.etc.fstab.source;
+			workstationFstab = self.nixosConfigurations.${configName system}.config.environment.etc.fstab.source;
+			hostedCfg = self.nixosConfigurations."${configName system}-hosted".config;
+			hostedGuestDirsScript = hostedCfg.systemd.services.cogbox-guest-dirs.serviceConfig.ExecStart;
+			hostedWorkMigrateScript = hostedCfg.systemd.services.cogbox-guest-work-migrate.serviceConfig.ExecStart;
+			hostedHarnessMigrateScript = hostedCfg.systemd.services.cogbox-guest-harness-migrate.serviceConfig.ExecStart;
+			# The two units that SCAFFOLD, for cogbox-guest-migrate-behaviour. Both
+			# write into a legacy surface unconditionally, on every boot, before any
+			# migration can look at it -- which is exactly the sequence the occupancy
+			# cases have to reproduce and used not to. The REALIZED ExecStarts rather
+			# than a hand-copy of their mkdirs and symlinks: a harness added or renamed,
+			# or a brain layout change, then moves the scaffolding in the fixture too,
+			# instead of leaving it asserting a shape the system has stopped producing.
+			# Cheap -- both closures are bash plus the brain, ~38 MiB total.
+			hostedHarnessDirsScript = hostedCfg.systemd.services.harness-setup-dirs.serviceConfig.ExecStart;
+			hostedBrainMaterializeScript = hostedCfg.systemd.services.cogbox-brain-materialize.serviceConfig.ExecStart;
+			# The harness lowers that MUST stay read-only 9p shares in the hosted
+			# profile. Derived from the realized microvm config, so a share that loses
+			# readOnly shows up here as a false and not as a silently weakened sandbox.
+			hostedHarnessLowers = lib.filter (s: lib.hasPrefix "/var/lib/harness-lower/" s.mountPoint)
+				hostedCfg.microvm.shares;
+			# The REALIZED harness-setup-dirs unit files, both profiles, for
+			# cogbox-guest-pool-degradable. Read as files rather than as the
+			# systemd.services.*.requires option, because it is the [Unit] section
+			# systemd actually acts on and the option is only one of several inputs to
+			# it.
+			hostedHarnessDirsUnit = "${hostedCfg.systemd.units."harness-setup-dirs.service".unit}/harness-setup-dirs.service";
+			workstationUnit = n: "${self.nixosConfigurations.${configName system}.config.systemd.units.${n}.unit}/${n}";
+			workstationHarnessDirsUnit = workstationUnit "harness-setup-dirs.service";
+			# EVERY profile in which the data pool sits on the guest's boot path, for
+			# cogbox-guest-pool-boot-bounded. The pool is NOT hosted-only: `workstation`
+			# + machineState = "persist" declares the same volume with the same label,
+			# and its realized fstab carries the same pass-2 pool line -- so the same
+			# generated fsck gates the same sshd there. That combination has no
+			# nixosConfigurations entry of its own (it is an opt-in on the default
+			# guest), so it is extended here rather than added to the flake's output
+			# set: this check is its only consumer, and an fstab plus a handful of unit
+			# files is all it costs.
+			poolBootProfiles = {
+				hosted = hostedCfg;
+				workstation-persist = (self.nixosConfigurations.${configName system}.extendModules {
+					modules = [ { cogbox.storage.machineState = "persist"; } ];
+				}).config;
+			};
+			# The pool's mount point, DERIVED from the realized fileSystems instead of
+			# spelled: it is the sole autoResize entry in either profile. The check
+			# asserts that there is exactly one, so a second growable filesystem --
+			# which would come with a second unbounded systemd-growfs@ instance -- forces
+			# a look here rather than quietly going unbounded.
+			poolAutoResized = cfg: lib.attrNames (lib.filterAttrs (_: f: f.autoResize) cfg.fileSystems);
+			# The bounds this change renders, in one directory keyed by unit name, so the
+			# check can look one up by the name the GENERATOR produced. Selected by
+			# override strategy rather than by a list: a bound added later is covered
+			# without editing this, and -- the point -- a bound rendered as a FULL unit
+			# instead of a drop-in is NOT here. That distinction is not pedantic: the
+			# default strategy (asDropinIfExists) finds no
+			# systemd-fsck@<instance>.service to extend, installs the bound as a whole
+			# unit shadowing systemd-fsck@.service, and the pool then never gets checked
+			# at all -- a unit with no ExecStart succeeds instantly.
+			poolBoundDropins = name: cfg: pkgs.runCommand name { } (''
+				mkdir -p $out
+			'' + lib.concatMapStringsSep "\n"
+				(n: ''cp -L '${cfg.systemd.units.${n}.unit}/${n}' "$out/${n}"'')
+				(lib.attrNames (lib.filterAttrs
+					(_: u: (u.overrideStrategy or "") == "asDropin") cfg.systemd.units)));
+			# EVERY realized service unit of the hosted guest, in one directory, so
+			# cogbox-guest-pool-degradable can scan the whole set instead of the units
+			# somebody remembered to name. Built out of systemd.units rather than out of
+			# ${toplevel}/etc/systemd/system to keep that check cheap: 76 tiny
+			# derivations instead of a whole guest system.
+			#
+			# The honest limit of that surface, stated because the check reads stronger
+			# than it is otherwise: systemd.units holds only what NixOS RENDERS. Units
+			# shipped by upstream systemd itself never appear, and one of them is a
+			# member of exactly the class scanned there --
+			# systemd-journal-flush.service carries RequiresMountsFor=/var/log/journal
+			# upstream, so an absent pool fails it. That one is the accepted
+			# volatile-journal degradation: the journal stays in /run/log/journal
+			# exactly as it did before this change, and sysinit.target only WANTS the
+			# unit. The scan exists for cogbox-authored units, and every one of those
+			# lands here.
+			serviceUnitsOf = name: cfg: pkgs.runCommand name { } (''
+				mkdir -p $out
+			'' + lib.concatMapStringsSep "\n"
+				(n: ''cp -L '${cfg.systemd.units.${n}.unit}/${n}' "$out/${n}"'')
+				(lib.attrNames (lib.filterAttrs (n: _: lib.hasSuffix ".service" n)
+					cfg.systemd.units)));
+			hostedServiceUnits = serviceUnitsOf "hosted-service-units" hostedCfg;
+			# The STAGE-2 overlay mounts, per profile: nixpkgs' overlayfs module gives
+			# each one a `rw-<escaped mountPoint>.service` that mkdirs its upper and work
+			# dirs before the mount, and under `hosted` those dirs are on the pool.
+			# x-initrd.mount is the same split the module makes (fsNeededForBoot ->
+			# boot.initrd.systemd.services), so this excludes the /nix/store overlay,
+			# whose pre-mount unit is in the initrd and never sees the pool.
+			stage2Overlays = cfg: lib.attrNames (lib.filterAttrs
+				(_: f: (f.overlay.lowerdir or null) != null && !(lib.elem "x-initrd.mount" f.options))
+				cfg.fileSystems);
 			# The two realized harness-config reconcile scripts, one per backend, for
 			# harness-firstrun-flags below. Forcing the two small scripts rather than
 			# a toplevel keeps that check cheap.
@@ -2702,8 +4395,49 @@
 			gceFloorInstall = gceCfg.systemd.services.cogworx-floor.serviceConfig.ExecStart;
 			gceSuperviseScript = gceCfg.systemd.services.cogworx-supervisor.serviceConfig.ExecStart;
 			gceStateDiskScript = gceCfg.systemd.services.cogworx-state-disk.serviceConfig.ExecStart;
+			gceGuestDiskScript = gceCfg.systemd.services.cogworx-guest-disk.serviceConfig.ExecStart;
+			# The HOST half of the boot-boundedness evidence, for
+			# gce-image-host-boot-bounded. Same three artifacts the guest check uses,
+			# fed the GCE host configuration instead of a guest profile: its realized
+			# fstab (what systemd-fstab-generator actually reads), the drop-ins this
+			# configuration renders with overrideStrategy = "asDropin" (where a bound on
+			# a GENERATED unit has to live), and every service unit it renders in full
+			# (where a bound on an AUTHORED unit lives instead).
+			gceFstab = gceCfg.environment.etc.fstab.source;
+			gceBoundDropins = poolBoundDropins "gce-host-bound-dropins" gceCfg;
+			gceHostServiceUnits = serviceUnitsOf "gce-host-service-units" gceCfg;
+			# The SAME module realized with a small store-overlay size, for
+			# gce-image-guest-disk-behaviour. That check runs the script against real
+			# block devices, and the shipped one carves a 16 GiB logical volume --
+			# which in a vmTools VM means a multi-gigabyte tmpfs and a minutes-long
+			# mkfs for a property that has nothing to do with the number.
+			#
+			# It is a re-REALIZATION, not a copy: same file, same code path, one
+			# option value different. gce-image-guest-disk-format proves that claim
+			# rather than asserting it in prose -- it diffs the two realized scripts
+			# with the two size lines normalised out and fails if anything else
+			# differs, so a behaviour test that drifted away from what ships is a
+			# build failure.
+			gceGuestDiskScriptSmall = (mkGceHost "x86_64-linux" {
+				extraModules = [ { cogworx.gce.storeOverlaySizeMiB = 32; } ];
+			}).config.systemd.services.cogworx-guest-disk.serviceConfig.ExecStart;
 			gceResolverDeadlineScript = gceCfg.systemd.services.cogworx-resolver-deadline.serviceConfig.ExecStart;
 			gceCogboxWrapper = gceCfg.cogworx.gce.cogboxPackage;
+			# The delivery seam of the hosted guest, in the pieces
+			# gce-image-hosted-guest-profile walks: the package the image bakes, the
+			# workstation package it must NOT be able to reach, both runners (the
+			# workstation one is still needed -- for the vacuity guard and for the
+			# not-in-closure assertion), and the volume device paths -- re-derived HERE
+			# from the hosted guest configuration so the check compares the supervisor's
+			# env against the volumes the runner actually declares rather than against a
+			# copy of the same literals.
+			gceHostedCogbox = self.packages.x86_64-linux.cogbox-hosted;
+			gceWorkstationCogbox = self.packages.x86_64-linux.cogbox;
+			gceHostedRunner = self.nixosConfigurations."cogbox-x86_64-hosted".config.microvm.declaredRunner;
+			gceWorkstationRunner = self.nixosConfigurations.cogbox-x86_64.config.microvm.declaredRunner;
+			gceHostedVolumeDevices = map (v: v.image)
+				(lib.filter (v: !v.autoCreate)
+					self.nixosConfigurations."cogbox-x86_64-hosted".config.microvm.volumes);
 			# Stands in for the real cogbox binary so gce-cogbox-wrapper-env can
 			# observe what the wrapper actually exported, without running a verb.
 			gceWrapperEnvStub = pkgs.writeShellScript "cogbox-env-stub" ''
@@ -2858,6 +4592,95 @@
 				test "$(grep -c 'ln -sT --' "$helper")" = 2
 
 				grep -qF '${hermesHomeHelper}/bin/cogbox-hermes-home /var/lib/cogbox-state/hermes-home /root/.hermes' ${containerStateScript}
+
+				# The machine-state legs (PVC-backed ~/.cache, ~/.local, ~/.config).
+				# Restated literally here rather than shared with the module's
+				# let-binding on purpose: an independent restatement catches a drift,
+				# a shared binding would co-vary with it and assert nothing.
+				for leg in \
+					'/var/lib/cogbox-state/machine/cache /root/.cache' \
+					'/var/lib/cogbox-state/machine/local /root/.local' \
+					'/var/lib/cogbox-state/machine/config /root/.config'
+				do
+					grep -qF "$helper $leg" ${containerStateScript} || {
+						echo "FAIL: the container state unit no longer persists: $leg" >&2
+						exit 1
+					}
+				done
+
+				# EVERY machine-state leg must stay individually tolerant. The unit runs
+				# under `set -e`, so an untolerated failure takes the whole unit down --
+				# and with it the /var/lib/cogbox symlink, the seeded instance config and
+				# sshd's persisted host key -- wedging the sandbox over a cache
+				# directory. Counted RELATIVE to the number of legs rather than pinned at
+				# three, so adding a fourth machine-state path stays the one-line edit the
+				# module claims it is, while dropping a fallback still goes red.
+				# `|| true` on both counts: grep exits 1 on ZERO matches, which under the
+				# builder's set -e aborts before the diagnostics below can say why.
+				legs=$(grep -c "$helper /var/lib/cogbox-state/machine/" ${containerStateScript} || true)
+				tolerated=$(grep -c 'continuing on the ephemeral container layer' ${containerStateScript} || true)
+				test "$legs" -ge 3 || {
+					echo "FAIL: only $legs machine-state legs in the container state unit; expected at least the three PVC-backed home directories" >&2
+					exit 1
+				}
+				test "$legs" = "$tolerated" || {
+					echo "FAIL: $legs machine-state legs but $tolerated '|| echo ...' fallbacks; under set -e an untolerated leg takes the whole state unit -- and with it /var/lib/cogbox, the seeded config and sshd's host key -- down" >&2
+					exit 1
+				}
+
+				# The persistent parent must be pre-created: the helper's own mkdir has
+				# no -p, so /var/lib/cogbox-state/machine/<sub> is uncreatable -- and
+				# every leg fails -- unless the parent already exists.
+				grep -qE 'mkdir -p .*/var/lib/cogbox-state/machine([[:space:]]|$)' ${containerStateScript} || {
+					echo "FAIL: the container state unit no longer pre-creates /var/lib/cogbox-state/machine; the helper's mkdir has no -p, so every machine-state leg would fail" >&2
+					exit 1
+				}
+
+				# ANTI-SHADOW, part 1: /root itself must NEVER be a link path. It
+				# carries the harness overlay/bind mounts, the runtime /root/work
+				# symlink, the fw_cfg-written /root/.claude.json and the
+				# tmpfiles-managed /root/.nix-channels; a symlink over /root shadows
+				# all of them at once.
+				if grep -qE 'cogbox-hermes-home [^ ]+ /root([[:space:]]|$)' ${containerStateScript}; then
+					echo "FAIL: the container state unit links /root itself; that shadows the harness mounts, /root/work, .claude.json and .nix-channels" >&2
+					exit 1
+				fi
+
+				# ANTI-SHADOW, part 2: the container target must keep declaring NO
+				# filesystems. That is the entire reason a symlink over the ~/.cache,
+				# ~/.local and ~/.config DIRECTORIES is safe here -- a mount at or under
+				# any of them would be silently orphaned by the link, and only at
+				# runtime.
+				container_mounts='${lib.concatStringsSep " " containerMountPoints}'
+				if [ -n "$container_mounts" ]; then
+					echo "FAIL: the container target now declares mounts ($container_mounts); a machine-state symlink can orphan them -- re-check the strategy before adding one" >&2
+					exit 1
+				fi
+
+				# ANTI-SHADOW, part 3: the VM target is deliberately NOT changed by
+				# this, and still owns the harness mounts nested under those same three
+				# directories. These are precisely what a future edit would orphan if
+				# the machine-state links were ever extended to the VM, so pin them --
+				# and pin that none of the three link roots (nor /root) is itself a VM
+				# mount point.
+				vm_mounts=' ${lib.concatStringsSep " " vmMountPoints} '
+				for m in ${lib.concatStringsSep " " opencodeGuestPaths}; do
+					case "$vm_mounts" in
+					*" $m "*) ;;
+					*)
+						echo "FAIL: the VM target no longer mounts $m; the container machine-state links assume the VM keeps owning the nested harness paths" >&2
+						exit 1
+						;;
+					esac
+				done
+				for m in /root /root/.cache /root/.local /root/.config; do
+					case "$vm_mounts" in
+					*" $m "*)
+						echo "FAIL: the VM target mounts $m; that shadows the nested harness mounts" >&2
+						exit 1
+						;;
+					esac
+				done
 				touch $out
 			'';
 		} // lib.optionalAttrs (builtins.hasAttr system inputs.llm-agents.packages) {
@@ -3511,6 +5334,1120 @@
 			# guard is the load-bearing half: an unconditional mkfs on a resumed
 			# instance destroys the L7 CA private key, the secret store and the VM
 			# host key on every Start.
+			# The hosted guest's storage layout, read off the realized fstab. Two
+			# properties carry the whole design and the rest of the change hangs off
+			# them:
+			#
+			#   1. The POOL is stage 2 (no x-initrd.mount) and carries
+			#      x-systemd.growfs. That IS restart-to-grow -- resize the disk,
+			#      restart the guest -- and it only works in stage 2, because
+			#      systemd-growfs@.service does not exist in the initrd's unit set and
+			#      a filesystem already mounted by stage 1 never runs its Wants= in
+			#      stage 2 either. `nofail` is the other half: a pool that fails to
+			#      mount must let the guest reach multi-user with sshd -- not as a
+			#      supported second layout, but because that mount is the ONE fault
+			#      on this path the host cannot see, so the guest has to come up far
+			#      enough to report it (see the pool mount's own nofail note).
+			#
+			#   2. The /nix/store overlay upper IS stage 1, on its own volume. That is
+			#      not a preference: microvm.nix marks a volume neededForBoot only
+			#      when its mountPoint is microvm.writableStoreOverlay, and the
+			#      overlay's pre-mount unit RequiresMountsFor= that path. Making it a
+			#      subdirectory of the pool would have dragged the pool onto the
+			#      initrd path and cost property 1 outright.
+			cogbox-guest-volume-hosted = pkgs.runCommand "cogbox-guest-volume-hosted" { } ''
+				fails=0
+				fstab=${hostedFstab}
+
+				pool=$(grep ' /var/lib/cogbox-guest ' "$fstab" || true)
+				if [ -z "$pool" ]; then
+					echo "FAIL: the hosted guest declares no /var/lib/cogbox-guest pool" >&2
+					fails=$((fails + 1))
+				fi
+				case "$pool" in
+					'/dev/disk/by-label/cogworx-guest '*) ;;
+					*)
+						echo "FAIL: the pool is not resolved by LABEL: $pool" >&2
+						echo "  a /dev/vd<letter> device is assigned by volume list position, so a second volume silently renames the user's data pool" >&2
+						fails=$((fails + 1))
+						;;
+				esac
+				for opt in x-systemd.growfs nofail discard; do
+					case "$pool" in
+						*"$opt"*) ;;
+						*) echo "FAIL: the pool mount has no $opt: $pool" >&2; fails=$((fails + 1)) ;;
+					esac
+				done
+				# The non-vacuous half of the growfs assertion. x-systemd.growfs above is
+				# satisfiable only outside the initrd, so asserting it without also
+				# asserting the pool is NOT an initrd mount would pass on a
+				# configuration where restart-to-grow silently never happens.
+				case "$pool" in
+					*x-initrd.mount*)
+						echo "FAIL: the pool is an INITRD mount; x-systemd.growfs cannot run there (systemd-growfs@.service is absent from the initrd) and stage 2 will not grow an already-mounted filesystem, so restart-to-grow is dead" >&2
+						fails=$((fails + 1))
+						;;
+				esac
+
+				rw=$(grep ' /nix/.rw-store ' "$fstab" || true)
+				case "$rw" in
+					'/dev/disk/by-label/cogworx-store-rw '*ext4*) ;;
+					*)
+						echo "FAIL: the hosted /nix/.rw-store is not an ext4 volume resolved by label: $rw" >&2
+						echo "  a tmpfs here is what OOM-kills the guest on a large in-guest nix build" >&2
+						fails=$((fails + 1))
+						;;
+				esac
+				# Must be in the initrd: /nix/store is an overlay whose upperdir lives
+				# under this mount and is itself neededForBoot.
+				case "$rw" in
+					*x-initrd.mount*) ;;
+					*)
+						echo "FAIL: the hosted /nix/.rw-store is not an initrd mount; the /nix/store overlay upper lives under it and stage 1 needs it" >&2
+						fails=$((fails + 1))
+						;;
+				esac
+				case "$rw" in
+					*discard*) ;;
+					*) echo "FAIL: the hosted /nix/.rw-store has no discard; ext4 mounts nodiscard by default so freed store paths never shrink the provider disk" >&2; fails=$((fails + 1)) ;;
+				esac
+				# ...and NOT autoResize, which would be a lie rather than a nicety. NixOS
+				# renders autoResize as nothing but the x-systemd.growfs mount option,
+				# and systemd-growfs@.service is a STAGE-2 upstream unit with no stage-1
+				# counterpart in this nixpkgs -- so on an initrd mount the option asserts
+				# a growth path that cannot run. This volume grows because the host lays
+				# its filesystem down fresh at the logical volume's current size on every
+				# host boot (gce-image-guest-disk-behaviour case 3 measures exactly that).
+				case "$rw" in
+					*x-systemd.growfs*)
+						echo "FAIL: the hosted /nix/.rw-store carries x-systemd.growfs; it is an INITRD mount, where systemd-growfs@.service does not exist, so that option can only mislead" >&2
+						fails=$((fails + 1))
+						;;
+				esac
+
+				# THE GUEST IS NOT TOLD ABOUT LVM, and this is what that claim reduces
+				# to in the artifact systemd actually reads. Both volumes are logical
+				# volumes the HOST carves out of one dedicated disk, and the guest
+				# resolves them by filesystem LABEL -- so no fstab line may name a
+				# volume group, a logical volume or a device-mapper node. A guest that
+				# addressed /dev/cogworx-guest/pool or /dev/mapper/... would need lvm2
+				# and a volume-group activation on its own boot path, which is the
+				# complexity this layout exists to keep out of the guest.
+				for f in "$fstab" ${workstationFstab}; do
+					if grep -qE '^(/dev/mapper/|/dev/cogworx-guest/)' "$f"; then
+						echo "FAIL: $f addresses a device-mapper/LVM path; the guest must resolve its volumes by label and know nothing about the host's volume group" >&2
+						grep -E '^(/dev/mapper/|/dev/cogworx-guest/)' "$f" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# THE local security property, unchanged by either profile: the host's
+				# harness config is exported read-only, so a compromised agent cannot
+				# write back into it. Enforced host-side by QEMU, which is why it is
+				# asserted against the share list and not the guest's mount options.
+				${lib.concatMapStringsSep "\n\t" (s: ''
+					${lib.optionalString (!s.readOnly) ''
+						echo "FAIL: harness lower ${s.mountPoint} is no longer a read-only 9p share; that is the load-bearing local security property" >&2
+						fails=$((fails + 1))
+					''}
+				'') hostedHarnessLowers}
+				${lib.optionalString (hostedHarnessLowers == []) ''
+					echo "FAIL: the hosted guest declares no /var/lib/harness-lower/* shares at all; the read-only assertion above would be vacuous" >&2
+					fails=$((fails + 1))
+				''}
+
+				# The WORKSTATION default must be untouched apart from the two tmpfs
+				# sizes: no pool, no volume, and the harness overlay still on its loop
+				# image. This is what makes the change safe to ship to local users.
+				wfstab=${workstationFstab}
+				if grep -q ' /var/lib/cogbox-guest ' "$wfstab"; then
+					echo "FAIL: the default (workstation) profile declares a guest pool; it must stay opt-in" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -q '^/var/lib/cogbox/harness-overlay.img /var/lib/harness-rw ext4 loop ' "$wfstab"; then
+					echo "FAIL: the workstation profile no longer mounts the harness overlay loop image" >&2
+					fails=$((fails + 1))
+				fi
+				# The fixed size=16G is the bug: it exceeds the guest's entire RAM, so a
+				# large nix build OOMs the guest instead of failing with ENOSPC.
+				wrw=$(grep ' /nix/.rw-store ' "$wfstab" || true)
+				case "$wrw" in
+					*size=16G*)
+						echo "FAIL: the workstation /nix/.rw-store is still a fixed 16G tmpfs: $wrw" >&2
+						fails=$((fails + 1))
+						;;
+				esac
+				case "$wrw" in
+					'tmpfs /nix/.rw-store tmpfs '*size=50%*) ;;
+					*) echo "FAIL: the workstation /nix/.rw-store is not a RAM-fraction tmpfs: $wrw" >&2; fails=$((fails + 1)) ;;
+				esac
+				# Inert-fix guard: resize-store-overlay.service remounts /nix/.rw-store
+				# from a launcher-written size file on every boot, so the declared size
+				# above means nothing unless the launcher stops defaulting it to 16G.
+				if grep -qF 'storeOverlaySize: "16G"' ${./cogbox-launch.sh}; then
+					echo "FAIL: cogbox-launch.sh still seeds storeOverlaySize: \"16G\" into new instance configs; resize-store-overlay would remount the tmpfs straight back to 16G and the sizing fix would be inert" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -qF ".storeOverlaySize // \"16G\"" ${./cogbox-launch.sh}; then
+					echo "FAIL: cogbox-launch.sh still falls back to a 16G store-overlay size for instances whose config omits the key" >&2
+					fails=$((fails + 1))
+				fi
+
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The machine-state binds: ordering, and the anti-shadow invariant.
+			#
+			# Binding root's home DIRECTORIES is safe only because nothing that
+			# matters lives under them: the harness overlays' lowerdirs are the
+			# read-only 9p mounts under /var/lib/harness-lower and their uppers live
+			# under /var/lib/harness-rw, so a bind at /root/.config lands first (systemd
+			# orders a mount after its path-prefix parents) and the overlay mounts on
+			# top of it. Binding /root ITSELF would break all of that at once -- it
+			# carries four harness mounts, the runtime /root/work symlink, the
+			# fw_cfg-written /root/.claude.json and a tmpfiles-managed
+			# /root/.nix-channels -- so that is asserted as an explicit prohibition
+			# rather than left to review.
+			cogbox-guest-binds-ordered = pkgs.runCommand "cogbox-guest-binds-ordered" { } ''
+				fails=0
+				fstab=${hostedFstab}
+
+				# Every pool-backed bind must Require= BOTH the pool mount and the
+				# subdir creator. Without the pool requirement a bind over an unmounted
+				# pool directory shows the user an EMPTY work tree; without the dirs
+				# requirement the bind source may not exist yet.
+				while read -r src mnt _type opts _rest; do
+					case "$src" in
+						/var/lib/cogbox-guest/*) ;;
+						*) continue ;;
+					esac
+					for dep in 'x-systemd.requires=var-lib-cogbox\x2dguest.mount' \
+						'x-systemd.requires=cogbox-guest-dirs.service'; do
+						case "$opts" in
+							*"$dep"*) ;;
+							*)
+								echo "FAIL: pool bind $mnt does not carry $dep: $opts" >&2
+								fails=$((fails + 1))
+								;;
+						esac
+					done
+				done < "$fstab"
+
+				# Count the pool binds so the loop above cannot pass by matching nothing.
+				binds=$(grep -c '^/var/lib/cogbox-guest/' "$fstab" || true)
+				if [ "$binds" -lt 7 ]; then
+					echo "FAIL: only $binds pool-backed binds in the hosted fstab; expected at least the three home roots, /var/lib/docker, /var/log/journal, work/ and harness-rw/" >&2
+					fails=$((fails + 1))
+				fi
+
+				# work/ is the one leg that touches irreplaceable data. The migration
+				# unit exits nonzero on any verification failure, and this Requires= is
+				# what converts that into "the bind does not happen and the 9p copy
+				# stays authoritative" instead of "the user's work tree looks empty".
+				work=$(grep ' /var/lib/cogbox/work ' "$fstab" || true)
+				for dep in 'x-systemd.requires=cogbox-guest-work-migrate.service' \
+					'x-systemd.requires=var-lib-cogbox.mount'; do
+					case "$work" in
+						*"$dep"*) ;;
+						*) echo "FAIL: the work bind does not carry $dep: $work" >&2; fails=$((fails + 1)) ;;
+					esac
+				done
+				# Bound ONTO the 9p path, not a repointed WORK: brainMaterializeScript
+				# hardcodes WORK=/var/lib/cogbox/work and claude's trust key is that
+				# literal string, and shadowing rather than moving is what retains the
+				# old copy for a release.
+				case "$work" in
+					'/var/lib/cogbox-guest/work /var/lib/cogbox/work none bind,'*) ;;
+					*) echo "FAIL: work/ is not bound from the pool onto /var/lib/cogbox/work: $work" >&2; fails=$((fails + 1)) ;;
+				esac
+
+				# The journal must be ordered before the flush, or the first boot's
+				# ring buffer lands on the tmpfs root and the evidence is lost again.
+				journal=$(grep ' /var/log/journal ' "$fstab" || true)
+				case "$journal" in
+					*x-systemd.before=systemd-journal-flush.service*) ;;
+					*) echo "FAIL: the journal bind is not ordered before systemd-journal-flush.service: $journal" >&2; fails=$((fails + 1)) ;;
+				esac
+
+				# ANTI-SHADOW. /root must never itself be a mount point, and the four
+				# harness mounts nested under the bound home roots must still be there --
+				# otherwise the "binding the parents is harmless" argument is untested.
+				if awk '{ print $2 }' "$fstab" | grep -qx '/root'; then
+					echo "FAIL: the hosted guest mounts /root itself; that shadows the harness overlays, /root/work, .claude.json and .nix-channels at once" >&2
+					fails=$((fails + 1))
+				fi
+				for m in ${lib.concatStringsSep " " opencodeGuestPaths} /root/.claude; do
+					if ! awk '{ print $2 }' "$fstab" | grep -qx "$m"; then
+						echo "FAIL: the hosted guest no longer mounts $m; the machine-state binds are only safe while the nested harness mounts still own these paths" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				# The overlays' lowers and uppers must stay OUTSIDE the bound home roots.
+				# A lower or upper under /root/.config would be shadowed by the bind, and
+				# it would be shadowed silently, at runtime, in a user's sandbox.
+				if grep -E '^overlay ' "$fstab" | grep -E '(lowerdir|upperdir|workdir)=/root/' >/dev/null; then
+					echo "FAIL: a harness overlay has a lower/upper/work dir under /root; the machine-state bind over its parent would shadow it" >&2
+					grep -E '^overlay ' "$fstab" | grep -E '(lowerdir|upperdir|workdir)=/root/' >&2
+					fails=$((fails + 1))
+				fi
+
+				# The subdir creator must create EVERY bind source, and the migration
+				# must be able to refuse. Both are read off the realized scripts.
+				dirs=${hostedGuestDirsScript}
+				for sub in machine/root/.cache machine/root/.local machine/root/.config \
+					machine/var/lib/docker machine/log/journal work harness-rw; do
+					if ! grep -qF "mkdir -p /var/lib/cogbox-guest/$sub" "$dirs"; then
+						echo "FAIL: cogbox-guest-dirs does not create /var/lib/cogbox-guest/$sub; the bind over it would fail, or worse mount an empty directory over live data" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				migrate=${hostedWorkMigrateScript}
+				for token in '.work-migrated' 'work.incoming' 'exit 1'; do
+					if ! grep -qF "$token" "$migrate"; then
+						echo "FAIL: the work migration has no '$token'; it must be idempotent, stage into a side directory and FAIL rather than switch a partial copy" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				# The marker must NOT be able to short-circuit the "pool copy empty?"
+				# comparison: the marker is written on boot 1 of every hosted instance,
+				# so a marker-first exit would let an accepted degraded boot's work be
+				# silently shadowed on the next healthy one. Assert the ORDER in the
+				# realized script -- the $dst emptiness test has to appear before the
+				# first read of $marker.
+				for m in "$migrate" ${hostedHarnessMigrateScript}; do
+					dst_line=$(grep -n 'find "$dst" -mindepth 1 -print -quit' "$m" | head -1 | cut -d: -f1)
+					marker_line=$(grep -n '\[ -e "\$marker" \]' "$m" | head -1 | cut -d: -f1)
+					if [ -z "$dst_line" ]; then
+						echo "FAIL: $m never tests whether the pool copy is already populated; that test is what stops a bind from hiding live data" >&2
+						fails=$((fails + 1))
+					elif [ -n "$marker_line" ] && [ "$marker_line" -lt "$dst_line" ]; then
+						echo "FAIL: $m reads \$marker (line $marker_line) BEFORE testing whether the pool copy is empty (line $dst_line); the marker exists from boot 1, so that ordering skips the comparison forever" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# harness-rw is the OTHER repointed surface, and it carries the four
+				# harness overlay uppers -- claude's settings/history/credentials, the
+				# hermes home, opencode's config and data. Without a migration the first
+				# hosted boot binds an empty pool directory over all of them and the old
+				# loop image is orphaned on the state disk with nothing saying so.
+				hrw=$(grep ' /var/lib/harness-rw ' "$fstab" || true)
+				for dep in 'x-systemd.requires=cogbox-guest-harness-migrate.service' \
+					'x-systemd.requires=var-lib-cogbox.mount'; do
+					case "$hrw" in
+						*"$dep"*) ;;
+						*) echo "FAIL: the harness-rw bind does not carry $dep: $hrw" >&2; fails=$((fails + 1)) ;;
+					esac
+				done
+				hmigrate=${hostedHarnessMigrateScript}
+				for token in '.harness-rw-migrated' 'harness-rw.incoming' \
+					'/var/lib/cogbox/harness-overlay.img' 'dumpe2fs -h' 'mount -o loop' 'exit 1'; do
+					if ! grep -qF "$token" "$hmigrate"; then
+						echo "FAIL: the harness-rw migration has no '$token'; it must read the LEGACY loop image, stage into a side directory and FAIL rather than orphan the uppers" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# POOL-ABSENT DEGRADATION, proved with the real generator rather than
+			# argued. This is the property S3/R4 and the README rest on -- "a pool that
+			# fails to appear degrades the guest to the pre-pool layout" -- and it is
+			# NOT implied by `nofail` on the pool mount alone. Concrete triggers: a
+			# legacy instance whose third disk was never attached, a failed
+			# create/attach leg, or a disk the host-side format never labelled, so
+			# /dev/disk/by-label/... times out.
+			#
+			# Two mechanisms can each turn that into emergency.target, and neither is
+			# visible by reading the fstab:
+			#
+			#   1. systemd-fstab-generator emits a non-`nofail` entry into
+			#      local-fs.target.REQUIRES; local-fs.target ships
+			#      OnFailure=emergency.target with
+			#      OnFailureJobMode=replace-irreversibly, so one failed bind replaces
+			#      the whole queued multi-user.target transaction -> no sshd.
+			#   2. harness-setup-dirs Requires= the harness-rw mount. If that fails the
+			#      four overlay UPPERDIRS are never created and the four overlay mounts
+			#      fail too. That cascade runs through a SERVICE, so no amount of nofail
+			#      on the binds reaches it.
+			#   3. systemd MANUFACTURES a hard Requires= on the mount unit covering a
+			#      mount's parent directory (src/core/mount.c:270-281), the one covering
+			#      an absolute bind or loop SOURCE (:284-294), and the one covering every
+			#      path prefix named in RequiresMountsFor= (src/core/unit.c:1522-1542:
+			#      UNIT_MOUNT_REQUIRES becomes UNIT_REQUIRES for any covering unit that
+			#      has a fragment path, which fstab-generated units always have). In
+			#      hosted that reaches SIX mounts whose own fstab lines name no pool path
+			#      at all: the four harness overlays, through the upper/work dirs nixpkgs
+			#      renders as RequiresMountsFor=, and the two opencode ephemeral binds,
+			#      through both their parent and their source. A first version of this
+			#      check enumerated only lines whose SOURCE was on the pool, so it passed
+			#      while all six sat in local-fs.target.requires -- VACUOUS with respect
+			#      to the one property it exists to prove. Hence the three rules are
+			#      re-implemented below instead of the affected mounts being listed.
+			#
+			# Running the generator is what makes this non-vacuous: dropping `nofail` from
+			# mkPoolBind moves all seven binds from .wants to .requires, and dropping
+			# poolNofail moves the six dependents; this check goes red on either.
+			cogbox-guest-pool-degradable = pkgs.runCommand "cogbox-guest-pool-degradable" {
+				nativeBuildInputs = [ pkgs.systemd ];
+			} ''
+				fails=0
+				mkdir -p gen
+				# SYSTEMD_FSTAB is the generator's own test hook; SYSTEMD_IN_INITRD=0
+				# keeps it out of the initrd code path, which mounts under /sysroot.
+				SYSTEMD_FSTAB=${hostedFstab} SYSTEMD_IN_INITRD=0 \
+					${pkgs.systemd}/lib/systemd/system-generators/systemd-fstab-generator gen gen gen
+
+				# Every mount an absent pool can fail -- the pool, every bind ON it, and
+				# every mount that DEPENDS on one of those -- must be WANTED by
+				# local-fs.target, never REQUIRED by it. All three sets are DERIVED from the
+				# realized fstab by re-implementing systemd's own three rules, so a mount
+				# added later that happens to depend on the pool is covered without an edit,
+				# while one that does NOT depend on it keeps its fail-closed requirement (the
+				# /nix/store overlay, the read-only 9p shares).
+				pool_points=$(awk '$1 == "/dev/disk/by-label/cogworx-guest" || $1 ~ "^/var/lib/cogbox-guest/" { print $2 }' ${hostedFstab})
+				dependents=$(awk -v pools="$pool_points" '
+					BEGIN { np = split(pools, P, " ") }
+					# At or under any pool-backed mount point.
+					function under(p) {
+						for (i = 1; i <= np; i++)
+							if (p == P[i] || index(p, P[i] "/") == 1) return 1
+						return 0
+					}
+					function opt(o, pfx) {
+						if (index(o, pfx) != 1) return 0
+						return under(substr(o, length(pfx) + 1))
+					}
+					/^[ \t]*(#|$)/ { next }
+					{
+						dep = 0
+						# mount.c:270-281, the parent-prefix rule. Testing the mount point
+						# itself is the same test one level down and costs nothing.
+						if (under($2)) dep = 1
+						# mount.c:284-294, an absolute bind or loop source.
+						if (!dep && $1 ~ /^\// && under($1)) dep = 1
+						# unit.c:1522-1542, via the options overlayfs.nix and
+						# tasks/filesystems.nix render from overlay.* and depends.
+						if (!dep) {
+							no = split($4, O, ",")
+							for (j = 1; j <= no && !dep; j++) {
+								if (index(O[j], "lowerdir=") == 1) {
+									nl = split(substr(O[j], 10), L, ":")
+									for (k = 1; k <= nl && !dep; k++) if (under(L[k])) dep = 1
+								}
+								else if (opt(O[j], "upperdir=")) dep = 1
+								else if (opt(O[j], "workdir=")) dep = 1
+								else if (opt(O[j], "x-systemd.requires-mounts-for=")) dep = 1
+							}
+						}
+						if (dep) print $2
+					}
+				' ${hostedFstab})
+				# The pool is not "under" itself by those rules, so union it in; sort -u
+				# because one bind can qualify under several rules at once.
+				pool_units=$(printf '%s\n%s\n' "$pool_points" "$dependents" | sort -u \
+					| while read -r mnt; do
+						[ -n "$mnt" ] || continue
+						systemd-escape -p --suffix=mount "$mnt"
+					done)
+				n=0
+				for unit in $pool_units; do
+					n=$((n + 1))
+					if [ -e "gen/local-fs.target.requires/$unit" ]; then
+						echo "FAIL: $unit is in local-fs.target.requires; a pool that fails to mount then fails local-fs.target, whose OnFailure=emergency.target replaces the multi-user job -- the guest comes up with NO sshd instead of degrading to the pre-pool layout" >&2
+						fails=$((fails + 1))
+					fi
+					# The other half, so the loop cannot pass by asserting nothing: the
+					# unit must still exist and still be pulled in when the pool IS there.
+					if [ ! -e "gen/local-fs.target.wants/$unit" ]; then
+						echo "FAIL: $unit is not wanted by local-fs.target at all; it would never be mounted" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				# ...and the derivation must have found something to assert on. Two floors,
+				# because the second set is the one a naive rewrite loses: 8 covers the pool
+				# plus its seven binds, and the INDIRECT count covers the four harness
+				# overlays and the two opencode binds that only rule 3 finds.
+				if [ "$n" -lt 14 ]; then
+					echo "FAIL: only $n pool-dependent mounts derived from the fstab; expected the pool, its seven binds, the four harness overlays and the two opencode binds" >&2
+					fails=$((fails + 1))
+				fi
+				indirect=$(comm -13 <(printf '%s\n' "$pool_points" | sort -u) \
+					<(printf '%s\n' "$dependents" | sort -u) | grep -c . || true)
+				if [ "$indirect" -lt 6 ]; then
+					echo "FAIL: only $indirect mounts were found to depend on the pool INDIRECTLY; the harness overlays and the opencode binds are the ones an absent pool fails through systemd's implicit rules, and finding none of them is how this check was vacuous before" >&2
+					fails=$((fails + 1))
+				fi
+
+				# nofail must not have cost R3 its refusal: the generated work mount
+				# still has to REQUIRE the migration, so a migration that declines still
+				# means the bind does not happen and the legacy copy stays authoritative.
+				for pair in 'var-lib-cogbox-work.mount:cogbox-guest-work-migrate.service' \
+					'var-lib-harness\x2drw.mount:cogbox-guest-harness-migrate.service'
+				do
+					unit=''${pair%%:*}
+					dep=''${pair#*:}
+					if ! grep -q "^Requires=.*$dep" "gen/$unit"; then
+						echo "FAIL: gen/$unit does not Requires= $dep; a refused migration would let the bind hide the legacy copy" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# THE COMPENSATING HALF, and without it everything above CERTIFIES a
+				# regression. The loop that opens this check asserts that no
+				# pool-dependent mount is in local-fs.target.requires -- but the very
+				# thing that achieves that, `nofail`, is also what strips
+				# Before=local-fs.target from these units (systemd.mount(5)). So having
+				# passed, this file has PROVED that nothing outside the explicitly
+				# ordered set waits for these binds. Any unit that writes THROUGH a
+				# pool-bound path must therefore say so itself, and the two below are
+				# the ones that do it silently when they do not:
+				#
+				#   brain-materialize writes $WORK=/var/lib/cogbox/work directly, and
+				#   unordered it materialises the brain into the legacy 9p directory
+				#   that stash() is about to rename aside -- a work tree with no
+				#   .cogbox/brain, no skills/agents/commands, no AGENTS.md, no error.
+				#
+				#   docker.service creates its data root itself and nixpkgs' module
+				#   declares no ordering on /var/lib/docker, so unordered dockerd
+				#   initialises on the tmpfs root and writes to shadowed inodes for the
+				#   whole session -- the RAM exhaustion this profile removes.
+				#
+				# Asserted on the GENERATED unit, not on the fstab line, so it covers
+				# the option actually reaching systemd.
+				for pair in 'var-lib-cogbox-work.mount:cogbox-brain-materialize.service' \
+					'var-lib-docker.mount:docker.service' \
+					'var-log-journal.mount:systemd-journal-flush.service'
+				do
+					unit=''${pair%%:*}
+					dep=''${pair#*:}
+					if ! grep -q "^Before=.*$dep" "gen/$unit"; then
+						echo "FAIL: gen/$unit is not ordered Before= $dep. nofail removed this unit's Before=local-fs.target, so nothing waits for the bind unless it says so here: $dep would write to the directory the bind is about to cover and lose it under the mount, silently" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# Mechanism 2. In hosted, harness-setup-dirs must only WANT the
+				# pool-backed harness-rw mount; in workstation it must keep REQUIRING the
+				# loop mount, because there the mount really is a precondition and a
+				# missing overlay image is a bug to surface, not to work around.
+				if grep -qE '^Requires=.*var-lib-harness' ${hostedHarnessDirsUnit}; then
+					echo "FAIL: the hosted harness-setup-dirs Requires= the harness-rw mount; an absent pool then fails it, the overlay upperdirs are never created, and the four harness overlay mounts take local-fs.target -- and sshd -- down with them" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qE '^After=.*var-lib-harness' ${hostedHarnessDirsUnit}; then
+					echo "FAIL: the hosted harness-setup-dirs is not ordered After= the harness-rw mount; it would create the upperdirs on the underlying directory and a late mount would shadow them" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qE '^Requires=.*var-lib-harness' ${workstationHarnessDirsUnit}; then
+					echo "FAIL: the workstation harness-setup-dirs no longer Requires= the harness-rw loop mount; that profile has no pool to degrade to and the requirement is what surfaces a corrupt overlay image" >&2
+					fails=$((fails + 1))
+				fi
+
+				# Mechanism 2 AS A CLASS, which is what the three assertions above are
+				# only one member of. harness-setup-dirs was fixed on its own once and the
+				# same defect was still sitting in cogbox-brain-materialize (Requires= the
+				# hermes overlay mount) and cogbox-claude-stub (Requires= the claude
+				# overlay mount) -- both of them mounts that are perfectly ordinary
+				# preconditions under `workstation` and pool-backed only under `hosted`,
+				# which is exactly why naming units one at a time does not close it.
+				#
+				# So every REALIZED service unit of the hosted guest is scanned against
+				# the pool-dependent mount set derived at the top of this check. Two
+				# spellings of the same hard dependency, because they reach systemd
+				# differently and only one of them is visible in the flake:
+				#   Requires=<unit>          what a service writes itself.
+				#   RequiresMountsFor=<path> which unit.c:1522-1542 turns into UNIT_REQUIRES
+				#                            on whichever mount unit COVERS that path.
+				#
+				# Two exemptions, both deliberate and both narrow:
+				#   the pool-prep units       cogbox-guest-dirs and the two migrations
+				#                             exist only to prepare the pool. Requiring it
+				#                             is their whole point: with no pool there is
+				#                             nothing for them to do and running them
+				#                             anyway is what a bind over an empty
+				#                             directory looks like.
+				#   rw-*.service              nixpkgs' own overlay pre-mount units
+				#                             (overlayfs.nix), which RequiresMountsFor=
+				#                             their upper/work dirs on /var/lib/harness-rw.
+				#                             They are not ours to write, and their failure
+				#                             fails only the matching overlay mount -- which
+				#                             is `nofail` here, so it degrades that one
+				#                             harness to ephemeral config rather than
+				#                             reaching local-fs.target.
+				pool_prep_units='cogbox-guest-dirs.service cogbox-guest-work-migrate.service cogbox-guest-harness-migrate.service'
+				scanned=0
+				for f in ${hostedServiceUnits}/*.service; do
+					svc=$(basename "$f")
+					scanned=$((scanned + 1))
+					case " $pool_prep_units " in *" $svc "*) continue ;; esac
+					case "$svc" in rw-*) continue ;; esac
+					for req in $(sed -n 's/^Requires=//p' "$f"); do
+						for unit in $pool_units; do
+							if [ "$req" = "$unit" ]; then
+								echo "FAIL: $svc has a hard Requires=$unit. That mount is pool-backed in this profile, so an absent pool does not merely skip the mount -- it stops this service from running at all, and whatever it was preparing fails with it. Demote it with softMounts (Wants=) and keep the After=" >&2
+								fails=$((fails + 1))
+							fi
+						done
+					done
+					for p in $(sed -n 's/^RequiresMountsFor=//p' "$f"); do
+						for base in $pool_points; do
+							case "$p" in
+								"$base"|"$base"/*)
+									echo "FAIL: $svc has RequiresMountsFor=$p, which systemd turns into a hard Requires= on the mount covering $base -- a pool-backed mount in this profile. Same failure as a literal Requires=, arriving through a path nothing in the flake spells" >&2
+									fails=$((fails + 1))
+									;;
+							esac
+						done
+					done
+				done
+				# Floors, because a glob that matched nothing would pass every loop above.
+				if [ "$scanned" -lt 40 ]; then
+					echo "FAIL: only $scanned service units were scanned; the hosted guest renders far more than that, so the class scan above asserted nothing" >&2
+					fails=$((fails + 1))
+				fi
+				for svc in cogbox-brain-materialize.service cogbox-claude-stub.service harness-setup-dirs.service; do
+					if [ ! -e "${hostedServiceUnits}/$svc" ]; then
+						echo "FAIL: $svc is not in the scanned set at all; the three units this class rule was written for must be covered by it" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# ...and the OTHER direction, which no scan for a forbidden token can
+				# reach: a demotion must not become a DELETION. Dropping the Requires= AND
+				# the Wants= AND the After= passes every assertion above while letting
+				# these units run before the overlay they write through is mounted -- the
+				# shadowed-write failure this whole file exists to prevent, arriving from
+				# the opposite side. Pinned by name for the two known pairs (hosted keeps
+				# Wants= + After=, workstation keeps its Requires=)...
+				for pair in 'cogbox-brain-materialize.service:root-.hermes.mount' \
+					'cogbox-claude-stub.service:root-.claude.mount'
+				do
+					svc=''${pair%%:*}
+					mnt=''${pair#*:}
+					if ! grep -qE "^Wants=.*$mnt" "${hostedServiceUnits}/$svc"; then
+						echo "FAIL: the hosted $svc does not Wants= $mnt; demoting a hard dependency must keep pulling the mount in, not delete it" >&2
+						fails=$((fails + 1))
+					fi
+					if ! grep -qE "^After=.*$mnt" "${hostedServiceUnits}/$svc"; then
+						echo "FAIL: the hosted $svc is not ordered After= $mnt; it writes THROUGH that overlay, so unordered it writes to the covered rootfs and the user's harness state vanishes under the mount" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				for pair in "${workstationUnit "cogbox-brain-materialize.service"}:root-.hermes.mount" \
+					"${workstationUnit "cogbox-claude-stub.service"}:root-.claude.mount"
+				do
+					unit=''${pair%%:*}
+					mnt=''${pair#*:}
+					if ! grep -qE "^Requires=.*$mnt" "$unit"; then
+						echo "FAIL: the workstation $(basename "$unit") no longer Requires= $mnt; that profile has no pool to degrade to, and there the overlay rests on the loop image, whose absence is a bug to surface rather than to work around" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				# ...and derived for everything else, so a unit demoted later inherits the
+				# same rule without being added here.
+				for f in ${hostedServiceUnits}/*.service; do
+					svc=$(basename "$f")
+					for w in $(sed -n 's/^Wants=//p' "$f"); do
+						for unit in $pool_units; do
+							if [ "$w" = "$unit" ]; then
+								ordered=0
+								for a in $(sed -n 's/^After=//p' "$f"); do
+									if [ "$a" = "$unit" ]; then ordered=1; fi
+								done
+								if [ "$ordered" = 0 ]; then
+									echo "FAIL: $svc Wants= $unit but is not ordered After= it; a demoted dependency keeps the degradation only while the ordering survives, or the service runs before the mount and writes under it" >&2
+									fails=$((fails + 1))
+								fi
+							fi
+						done
+					done
+				done
+
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The sibling of cogbox-guest-pool-degradable, and the distinction between
+			# them is the whole reason this file exists: that one proves a pool that
+			# FAILS degrades instead of wedging; this one proves a pool that HANGS is
+			# eventually let go of. `nofail` bounds failure and nothing else -- a job
+			# whose process sits in uninterruptible D-state on a stalled device is not
+			# failed, it is `activating` forever, which is why the shape it
+			# produces is an unbounded "Booting" with an EMPTY `systemctl --failed`.
+			#
+			# The scope that matters, and the one a previous audit got wrong: the jobs
+			# on this path are mostly not written here. systemd-fstab-generator
+			# SYNTHESISES them from the realized fstab -- a pass-2 pool line becomes a
+			# hard Requires= on systemd-fsck@<device>.service, x-systemd.growfs (which
+			# is all autoResize renders) becomes systemd-growfs@<mount>.service plus a
+			# local-fs.target drop-in ordering the target after it -- and BOTH of those
+			# upstream units ship TimeoutSec=infinity. An audit of "every unit this
+			# change adds" cannot see either of them. So the unit names here are read
+			# out of the GENERATOR'S OUTPUT and matched against the rendered
+			# configuration, which also makes this the only thing that can catch a
+			# systemd-escape mistake or a label rename orphaning a drop-in.
+			cogbox-guest-pool-boot-bounded = pkgs.runCommand "cogbox-guest-pool-boot-bounded" {
+				# util-linux and e2fsprogs are NOT decoration, and leaving them out made
+				# the first draft of this check silently vacuous about the very unit it
+				# was written for. systemd-fstab-generator emits the fsck dependency for
+				# a pass-2 line only when BOTH `fsck` (util-linux's driver) and
+				# `fsck.<fstype>` are findable on PATH -- generator.c's
+				# generator_write_fsck_deps calls fsck_exists_for_fstype, which probes
+				# for both and treats "nothing to run" as nothing to order against. With
+				# a bare builder PATH the generator produced no fsck unit at all and the
+				# loop below asserted nothing about it; only the floor caught that, which
+				# is why the floor is there. Both of these are on the GUEST's PATH too
+				# (systemd.settings.Manager.ManagerEnvironment carries util-linux-minimal
+				# and e2fsprogs), so the fsck really is generated where it boots -- that
+				# is what makes the bound necessary rather than theoretical.
+				nativeBuildInputs = [ pkgs.systemd pkgs.util-linux pkgs.e2fsprogs ];
+			} (''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+			'' + lib.concatStrings (lib.mapAttrsToList (pname: cfg: ''
+
+				echo "== profile ${pname} =="
+				# The pool, derived: exactly one growable filesystem, and its mount point
+				# is what every escaped unit name below is built from.
+				autoresized="${lib.concatStringsSep " " (poolAutoResized cfg)}"
+				n_ar=$(printf '%s\n' $autoresized | grep -c . || true)
+				if [ "$n_ar" != 1 ]; then
+					bad "${pname}: expected exactly one autoResize filesystem (the pool); found $n_ar: $autoresized. Each one gets its own unbounded systemd-growfs@ instance, so a new one needs a new bound"
+				fi
+				pool_point=$(printf '%s\n' $autoresized | head -1)
+
+				rm -rf gen-${pname}
+				mkdir -p gen-${pname}
+				# SYSTEMD_FSTAB is the generator's own test hook; SYSTEMD_IN_INITRD=0
+				# keeps it out of the initrd code path, which mounts under /sysroot.
+				SYSTEMD_FSTAB=${cfg.environment.etc.fstab.source} SYSTEMD_IN_INITRD=0 \
+					${pkgs.systemd}/lib/systemd/system-generators/systemd-fstab-generator \
+					gen-${pname} gen-${pname} gen-${pname}
+				mount_unit=$(systemd-escape -p --suffix=mount "$pool_point")
+				if [ ! -e "gen-${pname}/$mount_unit" ]; then
+					bad "${pname}: the generator produced no $mount_unit; the pool is not on this profile's boot path at all and everything below asserts nothing"
+				fi
+
+				# Every .service job systemd interposes between the pool's device and
+				# local-fs.target, by the three edges that put one there:
+				#   the pool .mount's own hard/soft/ordering dependencies   -> the fsck
+				#   the .wants directory the generator writes beside it     -> the growfs
+				#   an After= in a local-fs.target drop-in                  -> the growfs
+				#       again, by the edge that is the REASON it blocks: without this
+				#       one a hung growfs would only delay the mount it grows.
+				jobs=$( {
+					sed -nE 's/^(Requires|Wants|After|BindsTo)=//p' "gen-${pname}/$mount_unit"
+					ls "gen-${pname}/$mount_unit.wants" 2>/dev/null || true
+					cat gen-${pname}/local-fs.target.d/*.conf 2>/dev/null | sed -nE 's/^After=//p' || true
+				} | tr ' ' '\n' | grep '\.service$' | sort -u )
+
+				n_jobs=0
+				for svc in $jobs; do
+					n_jobs=$((n_jobs + 1))
+					dropin="${poolBoundDropins "pool-bound-dropins-${pname}" cfg}/$svc"
+					if [ ! -e "$dropin" ]; then
+						# No bound of ours. Acceptable only if the unit systemd would
+						# actually load is already bounded -- read the TEMPLATE out of the
+						# guest's OWN systemd, not this builder's, because the version
+						# that boots is the one whose default applies.
+						tmpl=$(printf '%s' "$svc" | sed -E 's/@.*\.service$/@.service/')
+						up="${cfg.systemd.package}/example/systemd/system/$tmpl"
+						if [ -e "$up" ] && grep -qE '^Timeout(Start)?Sec=[0-9]' "$up"; then
+							echo "  $svc: upstream bound, no drop-in needed"
+							continue
+						fi
+						bad "${pname}: $svc is a job on the pool's boot path with NO finite start timeout -- $tmpl ships $(grep -E '^Timeout(Start)?Sec=' "$up" 2>/dev/null || echo 'no TimeoutSec at all, which for Type=oneshot means the timeout is DISABLED') and nothing here overrides it. A device that answers its probe and then stalls leaves this in D-state, the pool mount job never completes, and the guest sits in Booting with no sshd and an EMPTY systemctl --failed"
+						continue
+					fi
+					# The bound exists. Now the three ways it can be present and still
+					# not work.
+					if ! grep -qE '^Timeout(Start)?Sec=[0-9]' "$dropin"; then
+						bad "${pname}: $dropin sets no finite start timeout (TimeoutSec=infinity is not a bound)"
+					fi
+					# The stop half, which is the one that is easy to leave out and fatal
+					# to leave out: upstream says TimeoutSec=infinity, which sets START
+					# AND STOP. Bounding only the start fires SIGTERM at a process wedged
+					# in D-state on the device that stalled and then waits forever for it
+					# to die -- the unit parks in `deactivating`, the job still never
+					# completes, and the guest is wedged one state further along.
+					if ! grep -qE '^TimeoutStopSec=[0-9]' "$dropin"; then
+						bad "${pname}: $dropin bounds the start but not the stop; upstream's TimeoutSec=infinity still applies to the stop, so the unit hangs in deactivating instead of reaching failed"
+					fi
+					# ...and it has to be a DROP-IN. overrideStrategy defaults to
+					# asDropinIfExists, which for a template INSTANCE finds nothing to
+					# extend and installs this as a whole unit shadowing the template. A
+					# systemd-fsck@<instance>.service with no ExecStart succeeds
+					# instantly and the pool is never checked again -- silently, and in
+					# the direction of data loss rather than of a wedge.
+					if grep -q '^ExecStart=' "$dropin"; then
+						bad "${pname}: $dropin carries an ExecStart=, so it is a full unit and not a drop-in; it SHADOWS the upstream template instead of extending it, and the job it replaces stops happening"
+					fi
+					echo "  $svc: bounded by a drop-in"
+				done
+				if [ "$n_jobs" -lt 2 ]; then
+					bad "${pname}: only $n_jobs services derived from the pool mount unit; expected at least the generated fsck and growfs, so the loop above asserted nothing"
+				fi
+
+				# systemd-tmpfiles-setup.service, asserted BY NAME because it is the one
+				# member of this class that cannot be derived: its edge to the pool is a
+				# runtime path walk, not a declared dependency, so no unit file anywhere
+				# states it. systemd's own tmpfiles.d chowns and chmods /var/log/journal,
+				# which this change turns from a directory on the RAM-backed root into a
+				# pool bind; the unit is Type=oneshot with no TimeoutSec (so unbounded by
+				# systemd.service(5)'s oneshot rule), After=local-fs.target and
+				# Before=sysinit.target. A pool that stalls AFTER mounting therefore
+				# wedges sysinit, hence basic.target, hence sshd -- finding 1's shape
+				# reached through a unit nobody in this repo writes.
+				tmpfiles="${poolBoundDropins "pool-bound-dropins-${pname}" cfg}/systemd-tmpfiles-setup.service"
+				if ! grep -qE '^TimeoutStartSec=[0-9]' "$tmpfiles" 2>/dev/null; then
+					bad "${pname}: systemd-tmpfiles-setup.service has no finite start bound. It walks /var/log/journal, which is pool-backed in this profile, and it gates sysinit.target"
+				fi
+
+				# ...and nixpkgs' overlay pre-mount units, the other class whose edge to
+				# the pool no unit file states: each runs `mkdir -p <upper> <work>` under
+				# /var/lib/harness-rw and is Before= its overlay mount, and
+				# cogbox-brain-materialize is After= the hermes overlay and
+				# Before=sshd.service. The COUNT is derived from the realized fileSystems
+				# so that a nixpkgs rename of the rw- prefix shows up here as a mismatch
+				# rather than as a bound that silently stopped applying, and the ExecStart
+				# assertion is the other half of that: the bound is merged into nixpkgs'
+				# own definition, so a rename would leave a timeout-only unit behind.
+				n_rw=0
+				for f in ${serviceUnitsOf "service-units-${pname}" cfg}/rw-*.service; do
+					[ -e "$f" ] || continue
+					n_rw=$((n_rw + 1))
+					rw=$(basename "$f")
+					if ! grep -qE '^TimeoutStartSec=[0-9]' "$f"; then
+						bad "${pname}: $rw has no finite start bound; its mkdir on a stalled pool sits in D-state, its overlay mount job never completes, and cogbox-brain-materialize -- Before=sshd.service -- never starts"
+					fi
+					if ! grep -q '^ExecStart=' "$f"; then
+						bad "${pname}: $rw has a bound but no ExecStart, so it is a stray unit this flake invented: nixpkgs' overlayfs naming moved and the bound is no longer reaching the real pre-mount unit"
+					fi
+				done
+				if [ "$n_rw" != ${toString (builtins.length (stage2Overlays cfg))} ]; then
+					bad "${pname}: found $n_rw rw-*.service units for ${toString (builtins.length (stage2Overlays cfg))} stage-2 overlay mounts; the pre-mount units this profile actually renders are not the ones being bounded"
+				fi
+			'') poolBootProfiles) + ''
+
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'');
+
+			# The two pool migrations, RUN rather than read. Everything else about this
+			# change can be asserted off a realized fstab or unit file; these two
+			# scripts are the only code in it that moves data the user cannot get back,
+			# and their whole contract is behavioural -- what they do when the pool copy
+			# is empty but the marker says otherwise, and whether a failed copy leaves
+			# the original authoritative. The eval checks above can only see that the
+			# tokens are present.
+			#
+			# It needs a VM because it needs real root: the scripts address /var/lib/...
+			# absolutely (correctly -- an overridable path in a data-moving unit is a
+			# hazard, not a feature), a mkfs'd loop image is the harness migration's
+			# actual input, and a small tmpfs is the only honest way to produce the
+			# ENOSPC that the refusal path exists for. `loop` is added to the VM's root
+			# modules for that image; the stock vmTools list has no loop support.
+			cogbox-guest-migrate-behaviour = (pkgs.vmTools.override {
+				# vmTools' own default list plus `loop`. Restated because the default is
+				# an argument default and nixpkgs does not expose it, so a bump that
+				# renames a module here is a build error rather than a silent loss.
+				rootModules = [
+					"virtio_pci" "virtio_mmio" "virtio_blk" "virtio_balloon" "virtio_rng"
+					"ext4" "virtiofs" "crc32c" "loop"
+				];
+			}).runInLinuxVM (pkgs.runCommand "cogbox-guest-migrate-behaviour" {
+				nativeBuildInputs = [ pkgs.util-linux pkgs.e2fsprogs pkgs.coreutils ];
+			} ''
+				fails=0
+				work=${hostedWorkMigrateScript}
+				harness=${hostedHarnessMigrateScript}
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+
+				# A fresh pool + a fresh 9p-equivalent state dir per case. The size
+				# argument is what case 4 uses to force ENOSPC on the pool.
+				reset() {
+					umount /var/lib/cogbox-guest 2>/dev/null || true
+					rm -rf /var/lib/cogbox /var/lib/cogbox-guest
+					mkdir -p /var/lib/cogbox-guest /var/lib/cogbox
+					if [ -n "''${1:-}" ]; then
+						mount -t tmpfs -o "size=$1" tmpfs /var/lib/cogbox-guest
+					fi
+					mkdir -p /var/lib/cogbox-guest/machine /var/lib/cogbox-guest/work \
+						/var/lib/cogbox-guest/harness-rw
+				}
+
+				# THE WORKSTATION BOOT, which the occupancy cases below are about and
+				# which they used to skip entirely. harness-overlay-img.service's
+				# `[ ! -f "$img" ]` arm lays a fresh 128 MiB ext4 at the legacy path, and
+				# then harness-setup-dirs.service unconditionally mkdirs every harness's
+				# overlay upper+work tree into it -- on EVERY workstation boot, before
+				# anything else can look. mkfs'ing an image and running the migration
+				# immediately, which is what these cases did, reproduces a state the
+				# system is never in for more than the few milliseconds between those two
+				# units.
+				#
+				# The REALIZED harness-setup-dirs ExecStart, not a copy of its mkdirs: a
+				# harness added or renamed moves the scaffolding here too, rather than
+				# leaving the fixture asserting a shape that has stopped being produced.
+				# It writes to the absolute /var/lib/harness-rw, so that is where the
+				# image has to be mounted.
+				scaffold_image() {
+					mkdir -p /var/lib/harness-rw
+					mount -o loop "$1" /var/lib/harness-rw
+					${hostedHarnessDirsScript} \
+						|| bad "harness-setup-dirs failed against $1; the workstation boot was not reproduced"
+					# The fixture has to PROVE it reached the state it names. Without
+					# these two, a scaffolding step that silently stopped writing would
+					# leave every case below asserting what it asserted before -- that a
+					# blank image is quiet -- which is the unreachable state the whole
+					# reseed is here to remove.
+					[ -n "$(find /var/lib/harness-rw -mindepth 1 -not -name lost+found -print -quit)" ] \
+						|| bad "harness-setup-dirs scaffolded NOTHING into $1; the cases below are back to testing an empty image"
+					# ...and that what it wrote is scaffolding and not content. The
+					# occupancy test keys on REGULAR FILES, so a fixture whose scaffolding
+					# included one would stop distinguishing the two.
+					[ -z "$(find /var/lib/harness-rw -type f -print -quit)" ] \
+						|| bad "harness-setup-dirs wrote a REGULAR FILE into $1; this fixture no longer separates scaffolding from user data"
+					umount /var/lib/harness-rw
+				}
+
+				echo "== case 1: fresh instance, nothing to move =="
+				reset
+				mkdir -p /var/lib/cogbox/work
+				"$work" || bad "the migration failed on a fresh instance with an empty work tree"
+				[ -e /var/lib/cogbox-guest/machine/.work-migrated ] \
+					|| bad "case 1 did not record the marker; every later boot would re-walk both trees"
+
+				echo "== case 2: marker present, pool copy EMPTY, legacy copy NOT (the degraded-boot case) =="
+				# This is the one the marker must not be able to short-circuit: the
+				# marker is written on boot 1 of every hosted instance, so a boot that
+				# came up WITHOUT the pool leaves the user's session in the legacy tree
+				# with the marker already set. Binding an empty directory over it is the
+				# data-loss outcome; re-migrating is the correct one.
+				mkdir -p /var/lib/cogbox/work/repo
+				echo hello > /var/lib/cogbox/work/repo/a.txt
+				ln -s a.txt /var/lib/cogbox/work/repo/link
+				"$work" 2> case2.err || bad "the migration failed on the degraded-boot case"
+				grep -q 'WARNING' case2.err \
+					|| bad "case 2 re-migrated silently; a marker that disagrees with the trees must be loud"
+				[ "$(cat /var/lib/cogbox-guest/work/repo/a.txt)" = hello ] \
+					|| bad "case 2 did not copy the legacy work tree onto the pool"
+				[ -L /var/lib/cogbox-guest/work/repo/link ] \
+					|| bad "case 2 did not preserve a symlink; cp -a must copy the tree as-is"
+				# Retention, and its SHAPE. The legacy tree is moved aside rather than
+				# left in place: shadowing alone let a boot on the pre-pool layout
+				# present the stale copy as current, the user work in it, and the next
+				# hosted boot hide that session again. Renamed, the same boot finds an
+				# EMPTY work tree -- wrong in a way nobody mistakes for right -- and the
+				# data is still on the share.
+				[ -e /var/lib/cogbox/work.pre-pool/repo/a.txt ] \
+					|| bad "case 2 did not RETAIN the legacy copy at work.pre-pool; that rename is the whole retention policy"
+				[ -d /var/lib/cogbox/work ] \
+					|| bad "case 2 left no /var/lib/cogbox/work directory behind; the bind would have no mount point"
+				[ -z "$(find /var/lib/cogbox/work -mindepth 1 -print -quit)" ] \
+					|| bad "case 2 left content at the legacy path; a pre-pool boot would present it as current"
+
+				echo "== case 3: idempotent -- a populated pool copy is claimed, not re-copied =="
+				echo changed > /var/lib/cogbox-guest/work/repo/a.txt
+				"$work" 2> case3.err || bad "the migration failed on an already-populated pool"
+				[ "$(cat /var/lib/cogbox-guest/work/repo/a.txt)" = changed ] \
+					|| bad "case 3 overwrote the pool copy from the stale legacy tree"
+				# Case 2 retired the legacy tree, so there is no fork to report. This is
+				# the steady state of every hosted boot after the first, and it has to
+				# stay quiet AND cheap -- the tree-measuring warning in case 3b is only
+				# affordable because the stash stops it recurring.
+				grep -q WARNING case3.err \
+					&& bad "case 3 warned on the steady-state path, which every hosted boot after the first takes"
+
+				echo "== case 3b: NEGATIVE -- a fork must be LOUD and must be broken, not just claimed =="
+				# The review finding this exists for. After the migration, a boot on the
+				# pre-pool layout -- a rolled-back image, or an accepted degraded boot --
+				# writes into the legacy path. The next hosted boot binds the pool copy
+				# over it. The pool copy is right to win (it is what the last hosted boot
+				# wrote), but the hidden session must not vanish silently, and the same
+				# fork must not be able to form a second time.
+				mkdir -p /var/lib/cogbox/work/repo
+				echo written-while-degraded > /var/lib/cogbox/work/repo/degraded.txt
+				"$work" 2> case3b.err || bad "the migration failed on the fork case"
+				grep -q WARNING case3b.err \
+					|| bad "case 3b shadowed a NON-EMPTY legacy tree silently; that is the silent-fork finding itself"
+				grep -q /var/lib/cogbox/work case3b.err \
+					|| bad "case 3b did not name the legacy path in the warning; an operator cannot find the hidden copy"
+				[ "$(cat /var/lib/cogbox-guest/work/repo/a.txt)" = changed ] \
+					|| bad "case 3b let the stale legacy tree overwrite the pool copy"
+				[ -e /var/lib/cogbox/work.pre-pool.1/repo/degraded.txt ] \
+					|| bad "case 3b did not retain the degraded-boot session; it is kept, only moved out of the way"
+				[ -z "$(find /var/lib/cogbox/work -mindepth 1 -print -quit)" ] \
+					|| bad "case 3b left the fork at the legacy path, so the next pre-pool boot forks again"
+				[ -e /var/lib/cogbox/work.pre-pool/repo/a.txt ] \
+					|| bad "case 3b overwrote the EARLIER .pre-pool copy; every retained copy is somebody data"
+
+				echo "== case 3c: NEGATIVE -- brain-materialize's SCAFFOLDING is not a fork =="
+				# The work leg's twin of case 7, and the reason its occupancy test could
+				# not stay "any entry at all". stash() leaves the legacy path an EMPTY
+				# directory, and the old comment reasoned from that: anything in it
+				# afterwards must be somebody's data. It is not.
+				# cogbox-brain-materialize is wantedBy multi-user.target in every VM
+				# profile and writes THROUGH $WORK=/var/lib/cogbox/work, so ANY boot on
+				# which the work bind does not happen -- a hosted boot whose `nofail`
+				# pool mount fails or times out, or an image rollback to a rev whose
+				# guest is the workstation profile -- repopulates that directory with
+				# .cogbox/brain, the .claude/ and .opencode/ link trees and AGENTS.md
+				# before the user or anything else touches it. Every one is a directory
+				# or a symlink; the tree's own files/bytes reads 0 0. (Both triggers are
+				# live; a third, a launch-time chooser falling back to the workstation
+				# runner, is gone with the chooser -- the GCE image bakes one profile.)
+				#
+				# Seeded by RUNNING the realized unit, for the same reason case 7 is: the
+				# state has to be produced by the thing that produces it in the field.
+				mkdir -p /root
+				${hostedBrainMaterializeScript} \
+					|| bad "case 3c could not reproduce the degraded boot: brain-materialize failed"
+				[ -L /var/lib/cogbox/work/.cogbox/brain ] \
+					|| bad "case 3c reproduced nothing: brain-materialize left no .cogbox/brain link at the legacy path"
+				# ...and the premise, asserted rather than assumed: if this leg ever
+				# writes a regular file, case 3c stops being the scaffolding case and
+				# silently becomes a second copy of case 3b.
+				[ -z "$(find /var/lib/cogbox/work -type f -print -quit)" ] \
+					|| bad "case 3c seeded a REGULAR FILE at the legacy path, so it is testing a genuine fork and not scaffolding"
+				"$work" 2> case3c.err || bad "the migration failed on the scaffolded-legacy case"
+				grep -q WARNING case3c.err \
+					&& bad "case 3c fired the fork WARNING for a tree holding nothing but brain-materialize's own directories and symlinks; that alarm has to stay un-mistakable, so it must key on content and not on a readdir"
+				[ -e /var/lib/cogbox/work.pre-pool.2 ] \
+					&& bad "case 3c stashed the scaffolding; every hosted<->workstation flap would leak another copy onto the STATE disk, which also carries the L7 CA key, the secret store and the sshd host key, and nothing ever reclaims one"
+				[ -L /var/lib/cogbox/work/.cogbox/brain ] \
+					|| bad "case 3c moved the scaffolded tree aside anyway"
+				[ "$(cat /var/lib/cogbox-guest/work/repo/a.txt)" = changed ] \
+					|| bad "case 3c touched the pool copy"
+
+				echo "== case 4: a copy that cannot finish must REFUSE, not half-switch =="
+				reset 128k
+				mkdir -p /var/lib/cogbox/work
+				dd if=/dev/zero of=/var/lib/cogbox/work/big.bin bs=1024 count=512 status=none
+				if "$work" 2>/dev/null; then
+					bad "the migration SUCCEEDED with a pool too small to hold the tree; a partial copy would then be bound over the real one"
+				fi
+				[ -e /var/lib/cogbox-guest/machine/.work-migrated ] \
+					&& bad "case 4 wrote the marker after failing; the next boot would treat the partial state as migrated"
+				[ -e /var/lib/cogbox-guest/work.incoming ] \
+					&& bad "case 4 left the partial copy behind, wasting the pool it just ran out of"
+				[ -z "$(find /var/lib/cogbox-guest/work -mindepth 1 -print -quit)" ] \
+					|| bad "case 4 put something in the pool work tree; the bind would then hide the real one"
+				[ -e /var/lib/cogbox/work/big.bin ] \
+					|| bad "case 4 damaged the source tree"
+
+				echo "== case 5: harness-rw comes off the LEGACY LOOP IMAGE =="
+				# Without this leg, switching an existing instance to hosted presents
+				# claude's settings/history/credentials, the hermes home and opencode's
+				# config+data as gone, because the bind lands on an empty pool directory
+				# and the read-only 9p lower has only the baked defaults.
+				reset
+				truncate -s 8M /var/lib/cogbox/harness-overlay.img
+				mkfs.ext4 -q -F /var/lib/cogbox/harness-overlay.img
+				# A real legacy image ALWAYS carries the scaffolding: nothing ever
+				# reaches one that harness-setup-dirs has not already written into. So
+				# the positive case is seeded that way too -- which is also what proves
+				# a tree measure() does not count (directories) does not break the
+				# copy-and-verify.
+				scaffold_image /var/lib/cogbox/harness-overlay.img
+				mkdir -p seed
+				mount -o loop /var/lib/cogbox/harness-overlay.img seed
+				mkdir -p seed/claude-code/config/upper seed/hermes-agent/home/upper
+				echo '{"theme":"dark"}' > seed/claude-code/config/upper/settings.json
+				echo present > seed/hermes-agent/home/upper/state
+				umount seed
+				"$harness" || bad "the harness migration failed on a valid legacy overlay image"
+				[ "$(cat /var/lib/cogbox-guest/harness-rw/claude-code/config/upper/settings.json)" = '{"theme":"dark"}' ] \
+					|| bad "case 5 did not carry the claude overlay upper onto the pool"
+				[ -e /var/lib/cogbox-guest/harness-rw/hermes-agent/home/upper/state ] \
+					|| bad "case 5 did not carry the hermes overlay upper onto the pool"
+				# Same retention shape as work/, and it matters more here: left in
+				# place, a rolled-back pre-pool boot would loop-mount this image and
+				# present a stale claude home -- settings, history, a hand-placed
+				# credential -- as current. Renamed, that boot finds no image and
+				# harness-overlay-img recreates a blank one, so it still comes up.
+				[ -e /var/lib/cogbox/harness-overlay.img.pre-pool ] \
+					|| bad "case 5 did not retain the legacy overlay image at .pre-pool"
+				[ -e /var/lib/cogbox/harness-overlay.img ] \
+					&& bad "case 5 left the legacy overlay image where a pre-pool boot would mount it as current"
+				if mountpoint -q /run/cogbox-harness-migrate; then
+					bad "case 5 left the legacy image loop-mounted; the EXIT trap must unmount it"
+				fi
+
+				echo "== case 6: an image with no valid superblock is skipped, never mounted =="
+				# The interrupted-first-mkfs image. Reading it as a filesystem would only
+				# produce a confusing failure, and there is nothing in it to migrate.
+				reset
+				head -c 4096 /dev/urandom > /var/lib/cogbox/harness-overlay.img
+				"$harness" 2>/dev/null || bad "the harness migration failed instead of skipping an unformatted image"
+				[ -z "$(find /var/lib/cogbox-guest/harness-rw -mindepth 1 -print -quit)" ] \
+					|| bad "case 6 put something in the pool from an image with no filesystem"
+
+				echo "== case 7: a RECREATED legacy image is NOT user data (size lies, and so does a readdir) =="
+				# The hosted<->workstation flap. An instance that already migrated takes
+				# one boot on the workstation runner -- now reachable only by an IMAGE
+				# ROLLBACK, since the GCE image bakes one profile and there is no
+				# launch-time chooser to fall back, but rollback is a mode flip no design
+				# gets to remove -- and harness-overlay-img.service's
+				# `[ ! -f ]` arm lays a fresh ext4 back at the legacy path, which
+				# harness-setup-dirs then scaffolds. Judging that by st_size fired the
+				# fork WARNING on a non-event an operator then chases, and stashed the
+				# image, leaking it onto the STATE disk on every flap. Judging it by "any
+				# top-level entry that is not lost+found" did exactly the same thing, for
+				# the same reason, one round later -- because the image is NEVER empty by
+				# the time anything looks at it. This is the case that must stay QUIET,
+				# and it only says so if it is seeded through the units that make the
+				# state.
+				reset
+				truncate -s 8M /var/lib/cogbox/harness-overlay.img
+				mkfs.ext4 -q -F /var/lib/cogbox/harness-overlay.img
+				scaffold_image /var/lib/cogbox/harness-overlay.img
+				mkdir -p /var/lib/cogbox-guest/harness-rw/claude-code/config/upper
+				echo pooled > /var/lib/cogbox-guest/harness-rw/claude-code/config/upper/settings.json
+				"$harness" 2> case7.err \
+					|| bad "the harness migration failed with a populated pool and a blank legacy image"
+				grep -q WARNING case7.err \
+					&& bad "case 7 fired the fork WARNING for a RECREATED image holding nothing but harness-setup-dirs' own overlay directories; that alarm has to stay un-mistakable, so it must key on regular files -- neither apparent size nor a top-level readdir can tell this image from a used one"
+				[ -e /var/lib/cogbox/harness-overlay.img.pre-pool ] \
+					&& bad "case 7 stashed a recreated image; every flap would leak another one onto the STATE disk, which also carries the L7 CA key, the secret store and the sshd host key, and .pre-pool would stop meaning somebody data"
+				[ -e /var/lib/cogbox/harness-overlay.img ] \
+					|| bad "case 7 moved the recreated image aside anyway"
+				[ "$(cat /var/lib/cogbox-guest/harness-rw/claude-code/config/upper/settings.json)" = pooled ] \
+					|| bad "case 7 touched the pool copy"
+
+				echo "== case 8: a POPULATED legacy image still forks LOUDLY and is retired =="
+				# The other half, and the half a naive "never stash an image" fix loses
+				# silently: a pre-pool boot that actually WROTE to the legacy overlay --
+				# a claude login, a settings change -- is a real fork and must still be
+				# named and moved aside. Same image as case 7, now with content in it.
+				mkdir -p seed8
+				mount -o loop /var/lib/cogbox/harness-overlay.img seed8
+				mkdir -p seed8/claude-code/config/upper
+				echo '{"theme":"light"}' > seed8/claude-code/config/upper/settings.json
+				umount seed8
+				"$harness" 2> case8.err || bad "the harness migration failed on the fork case"
+				grep -q WARNING case8.err \
+					|| bad "case 8 shadowed a POPULATED legacy image silently; that is the silent-fork finding, arriving through the occupancy test instead of through the branch"
+				grep -q /var/lib/cogbox/harness-overlay.img case8.err \
+					|| bad "case 8 did not name the legacy image in the warning; an operator cannot find the hidden copy"
+				[ -e /var/lib/cogbox/harness-overlay.img.pre-pool ] \
+					|| bad "case 8 did not retire the populated legacy image"
+				[ -e /var/lib/cogbox/harness-overlay.img ] \
+					&& bad "case 8 left the populated image where a pre-pool boot would mount it as current"
+				[ "$(cat /var/lib/cogbox-guest/harness-rw/claude-code/config/upper/settings.json)" = pooled ] \
+					|| bad "case 8 let the legacy image overwrite the pool copy"
+				if mountpoint -q /run/cogbox-harness-occupied; then
+					bad "case 8 left the occupancy probe loop-mounted; it runs on every hosted boot until the image is reused, so a leak here stacks"
+				fi
+
+				[ "$fails" -eq 0 ] || exit 1
+				mkdir -p $out
+				touch $out/ok
+			'');
 			gce-image-state-disk-ordering = pkgs.runCommand "gce-image-state-disk-ordering" { } ''
 				fails=0
 				fstab=${gceToplevel}/etc/fstab
@@ -3538,6 +6475,1344 @@
 				fi
 				if ! grep -qF 'mkfs.ext4' "$mkfs"; then
 					echo "FAIL: the state-disk unit never formats anything" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The HOST half of cogbox-guest-pool-boot-bounded, and it exists because
+			# three rounds of "audit every unit this change adds" kept missing the same
+			# class -- units nobody in either repository WRITES. The guest check was
+			# scoped to the guest; the GCE host runs the same shape and had it worse.
+			#
+			# The state mount's fstab line carries x-systemd.before=sshd.service AND
+			# x-systemd.before=cogworx-supervisor.service, so every job systemd
+			# interposes on that mount's start path holds BOTH the host's sshd and the
+			# VM launcher. Two of them were unbounded: cogworx-state-disk.service is
+			# Type=oneshot, for which systemd DISABLES the start timeout by default,
+			# and systemd-fstab-generator synthesises a
+			# systemd-fsck@<escaped device>.service from the pass-2 line whose upstream
+			# template says TimeoutSec=infinity. A state PD that answers its 30s device
+			# probe and then stalls on reads parks blkid or e2fsck in D-state, neither
+			# start job ever completes, the VM sits in Booting forever with an EMPTY
+			# `systemctl --failed` (the units are `activating`, not failed), and with
+			# the supervisor gone there is no `ssh <vm> cogbox <verb>` control channel
+			# left to recover through. `nofail` does not touch any of that: it unhooks
+			# the mount from local-fs.target and leaves the explicit x-systemd.before=
+			# edges exactly where they are. nofail bounds FAILURE; only a timeout
+			# bounds a HANG.
+			#
+			# So the unit names are read out of the GENERATOR'S OUTPUT, exactly as on
+			# the guest side, rather than out of anything this repository declares --
+			# which is also what makes an escaping mistake or a stateDevice override
+			# orphaning its drop-in a build failure instead of a wedged host.
+			gce-image-host-boot-bounded = pkgs.runCommand "gce-image-host-boot-bounded" {
+				# Not decoration: systemd-fstab-generator emits the fsck dependency for
+				# a pass-2 line only when BOTH `fsck` and `fsck.<fstype>` are findable
+				# on PATH (generator.c's generator_write_fsck_deps ->
+				# fsck_exists_for_fstype), so with a bare builder PATH it emits no fsck
+				# unit at all and this check would assert nothing about the very unit it
+				# was written for. Both are on the HOST's PATH too, which is what makes
+				# the bound necessary rather than theoretical.
+				nativeBuildInputs = [ pkgs.systemd pkgs.util-linux pkgs.e2fsprogs ];
+			} ''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+
+				rm -rf gen
+				mkdir -p gen
+				# SYSTEMD_FSTAB is the generator's own test hook; SYSTEMD_IN_INITRD=0
+				# keeps it out of the initrd code path, which mounts under /sysroot.
+				SYSTEMD_FSTAB=${gceFstab} SYSTEMD_IN_INITRD=0 \
+					${pkgs.systemd}/lib/systemd/system-generators/systemd-fstab-generator \
+					gen gen gen
+
+				n_mounts=0
+				n_jobs=0
+				for m in gen/*.mount; do
+					[ -e "$m" ] || continue
+					unit=$(basename "$m")
+					# The ROOT filesystem is EXEMPT, by name and with the reason stated
+					# rather than by scoping the loop until it happens to pass. Its
+					# x-systemd.growfs renders an unbounded systemd-growfs-root.service
+					# that local-fs.target is ordered after, so the class is genuinely
+					# present there too -- but a bound buys nothing: every ExecStart on
+					# this host reads the boot disk, so a root PD that stalls has no
+					# recoverable state to time out INTO. That is a different problem
+					# from a data disk whose failure the host is written to survive, and
+					# it is deliberately not fixed here. Reported as a residual instead.
+					if [ "$unit" = "-.mount" ]; then
+						echo "  $unit: root filesystem, exempt (see comment)"
+						continue
+					fi
+					n_mounts=$((n_mounts + 1))
+					echo "== $unit =="
+					# Every .service job systemd interposes between this mount's device
+					# and the mount itself: its own hard/soft/ordering dependencies, plus
+					# the .wants directory the generator writes beside it (where a
+					# per-mount growfs would land).
+					jobs=$( {
+						sed -nE 's/^(Requires|Wants|After|BindsTo)=//p' "$m"
+						ls "$m.wants" 2>/dev/null || true
+					} | tr ' ' '\n' | grep '\.service$' | sort -u )
+
+					for svc in $jobs; do
+						n_jobs=$((n_jobs + 1))
+						dropin="${gceBoundDropins}/$svc"
+						rendered="${gceHostServiceUnits}/$svc"
+						if [ -e "$dropin" ]; then
+							# A bound on a unit this configuration does not render in full
+							# -- i.e. on a generated or upstream one. Three ways it can be
+							# present and still not work.
+							if ! grep -qE '^Timeout(Start)?Sec=[0-9]' "$dropin"; then
+								bad "$dropin sets no finite start timeout (TimeoutSec=infinity is not a bound)"
+							fi
+							# The stop half, easy to leave out and fatal to leave out:
+							# upstream's TimeoutSec=infinity sets START AND STOP. Bounding
+							# only the start fires SIGTERM at a process wedged in D-state on
+							# the device that stalled and then waits forever for it to die --
+							# the unit parks in `deactivating`, the job still never
+							# completes, and the host is wedged one state further along.
+							if ! grep -qE '^TimeoutStopSec=[0-9]' "$dropin"; then
+								bad "$dropin bounds the start but not the stop; upstream's TimeoutSec=infinity still applies to the stop, so the unit hangs in deactivating instead of reaching failed"
+							fi
+							# ...and it has to be a DROP-IN. overrideStrategy defaults to
+							# asDropinIfExists, which for a template INSTANCE finds nothing
+							# to extend and installs this as a whole unit SHADOWING the
+							# template. A systemd-fsck@<instance>.service with no ExecStart
+							# succeeds instantly and the state disk is never checked again --
+							# silently, and in the direction of data loss rather than of a
+							# wedge.
+							if grep -q '^ExecStart=' "$dropin"; then
+								bad "$dropin carries an ExecStart=, so it is a full unit and not a drop-in; it SHADOWS the upstream template instead of extending it, and the fsck it replaces stops happening"
+							fi
+							echo "  $svc: bounded by a drop-in"
+						elif [ -e "$rendered" ]; then
+							# An AUTHORED unit: the bound lives in the unit body.
+							#
+							# ...but first, the way this arm gets reached BY MISTAKE, which
+							# is not hypothetical -- it was measured while proving this
+							# check can fail. A bound intended as a drop-in whose
+							# overrideStrategy is left at the default (asDropinIfExists)
+							# finds no systemd-fsck@<instance>.service to extend and is
+							# installed as a WHOLE unit instead, carrying nothing but a
+							# [Service] section of timeouts. It shadows the upstream
+							# template, has no ExecStart, succeeds instantly -- and every
+							# timeout assertion in this arm passes it. The state disk would
+							# then silently never be fsck'd again, a failure in the
+							# direction of data loss rather than of a wedge. So an
+							# ExecStart is REQUIRED here: a unit on a mount's start path
+							# that runs nothing is not an authored job, it is a shadow.
+							if ! grep -q '^ExecStart=' "$rendered"; then
+								bad "$svc is on $unit's start path and this configuration renders it as a FULL unit with no ExecStart. That is a drop-in that lost overrideStrategy = \"asDropin\": it shadows the upstream template instead of extending it, succeeds instantly, and the job it replaced -- an fsck, here -- stops happening silently"
+							fi
+							# Only the start half is asserted for an authored unit, and that
+							# asymmetry is correct rather than lax: a NixOS-rendered service
+							# inherits the manager's finite DefaultTimeoutStopSec (nothing on
+							# this host overrides it), so SIGKILL escalation still gets it to
+							# `failed`. It is only the units whose own text says
+							# TimeoutSec=infinity that lose the stop half too.
+							if ! grep -qE '^TimeoutStartSec=[0-9]' "$rendered"; then
+								bad "$svc is a job on $unit's start path and the unit this configuration renders sets no finite TimeoutStartSec. For Type=oneshot systemd DISABLES the start timeout by default, so a probe that parks in D-state on a stalled device holds this mount's job forever -- and $unit is ordered before sshd and the VM launcher, so the host comes up with neither and an EMPTY systemctl --failed"
+							fi
+							echo "  $svc: bounded in the unit it renders"
+						else
+							# Neither: acceptable only if the unit systemd would actually
+							# load is already bounded upstream. Read the TEMPLATE out of the
+							# HOST's own systemd, not this builder's, because the version
+							# that boots is the one whose default applies.
+							tmpl=$(printf '%s' "$svc" | sed -E 's/@.*\.service$/@.service/')
+							up="${gceCfg.systemd.package}/example/systemd/system/$tmpl"
+							if [ -e "$up" ] && grep -qE '^Timeout(Start)?Sec=[0-9]' "$up"; then
+								echo "  $svc: upstream bound, no drop-in needed"
+								continue
+							fi
+							bad "$svc is a job on $unit's start path with NO finite start timeout -- $tmpl ships $(grep -E '^Timeout(Start)?Sec=' "$up" 2>/dev/null || echo 'no TimeoutSec at all, which for Type=oneshot means the timeout is DISABLED') and nothing here overrides it. A device that answers its probe and then stalls leaves this in D-state, $unit's job never completes, and the host sits in Booting with no sshd, no VM launcher and an EMPTY systemctl --failed"
+						fi
+					done
+				done
+
+				# Floors, because every assertion above is inside two loops and an empty
+				# loop asserts nothing. The host has exactly one non-root fstab mount
+				# today (the state disk) and it carries exactly two jobs -- the authored
+				# format oneshot and the generated fsck -- so anything less means the
+				# generator produced nothing to look at and this check is vacuous.
+				if [ "$n_mounts" -lt 1 ]; then
+					bad "the generator produced no non-root .mount units from the host fstab; nothing above asserted anything"
+				fi
+				if [ "$n_jobs" -lt 2 ]; then
+					bad "only $n_jobs service jobs derived across $n_mounts non-root host mounts; expected at least the state disk's format oneshot and its generated fsck, so the loop above asserted nothing"
+				fi
+
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The guest disk's first-boot carve. Sibling of the state-disk check
+			# above, and the assertions diverge in exactly the two places the
+			# modules do: this disk is NEVER MOUNTED BY THE HOST, and its guard
+			# chain is deliberately stricter, because it holds the user's only copy
+			# of their work tree rather than a re-mintable host key.
+			gce-image-guest-disk-format = pkgs.runCommand "gce-image-guest-disk-format" { } ''
+				fails=0
+
+				# 1. The host must not mount the guest's pool -- that is the trust
+				#    boundary the whole hosted design rests on. Assert it three ways:
+				#    no entry for the raw device, none for either logical volume, and
+				#    none for the guest's mount point (a fileSystems block added under
+				#    any of those names would show up in one of them). The host DOES
+				#    open these block devices and write filesystem metadata; what it
+				#    must never do is mount a guest filesystem and read the user's
+				#    files, and an fstab entry is exactly that.
+				fstab=${gceToplevel}/etc/fstab
+				if grep -q 'google-cogworx-guest' "$fstab"; then
+					echo "FAIL: the HOST fstab has an entry for the guest disk; this host must carve it and never mount it" >&2
+					grep 'google-cogworx-guest' "$fstab" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -q '/dev/cogworx-guest/' "$fstab"; then
+					echo "FAIL: the HOST fstab mounts a logical volume off the guest disk; those two volumes belong to the GUEST" >&2
+					grep '/dev/cogworx-guest/' "$fstab" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -q ' /var/lib/cogbox-guest ' "$fstab"; then
+					echo "FAIL: the HOST fstab mounts /var/lib/cogbox-guest; that path belongs to the GUEST" >&2
+					fails=$((fails + 1))
+				fi
+
+				mkfs=${gceGuestDiskScript}
+
+				# 2. The guards, in the order the safety argument needs them. A
+				#    "simplification" that drops any one of these is unrecoverable user
+				#    data loss on a resumed instance, so each is named individually
+				#    rather than being covered by one grep. These are TOKEN assertions
+				#    and they cannot see control flow -- gce-image-guest-disk-behaviour
+				#    below is what actually runs the script.
+				if ! grep -qF '[ ! -b "$dev" ]' "$mkfs"; then
+					echo "FAIL: the carve leg does not assert a real BLOCK DEVICE; a missing or renamed device node would be treated as a disk" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'blkid -p -o value -s TYPE' "$mkfs"; then
+					echo "FAIL: the carve leg has no blkid filesystem guard; every Start would reformat the user's work tree" >&2
+					fails=$((fails + 1))
+				fi
+				# The fail-SAFE polarity, not merely the presence of blkid. Only
+				# blkid exit 2 (nothing found) may reach a write: exit 0 means a
+				# signature was identified and exit 8 is its ambivalent
+				# two-signatures result. state-disk.nix tests the exit status alone
+				# and so formats on ANY nonzero, which is the wrong direction for
+				# this disk -- this assertion is what stops that shape being copied
+				# back in.
+				if ! grep -qF '[ "$rc" -ne 2 ]' "$mkfs"; then
+					echo "FAIL: the carve leg does not treat 'blkid could not tell' as already-initialised; only exit 2 may be read as provably blank" >&2
+					fails=$((fails + 1))
+				fi
+				# ...and no signature probe can supply the POSITIVE half, which is the
+				# other half of the same finding. blkid returns exit 2 with empty stdout
+				# both for a blank device and for one it failed to READ, and wipefs
+				# returns exit 0 with no signatures for the same unreadable device (both
+				# measured against a dm `error` target). Only a read that had to succeed
+				# proves the device answered at all, so assert that read is there too.
+				if ! grep -qF 'dd if="$d"' "$mkfs"; then
+					echo "FAIL: the carve leg never READS the device; blkid exit 2 and wipefs exit 0 both also mean \"could not read this disk\", so a device that errors on read would be written to" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'wipefs --no-act' "$mkfs"; then
+					echo "FAIL: the carve leg has no second, positively-proving probe; blkid exit 2 alone also means \"could not read this device\", so a disk that errors on read would be written to" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF '[ "$wrc" -ne 0 ]' "$mkfs"; then
+					echo "FAIL: the carve leg does not require the second probe to SUCCEED; running it and ignoring its exit status proves nothing" >&2
+					fails=$((fails + 1))
+				fi
+				# The three-probe test must be applied TWICE -- to the raw disk before
+				# the volume group, and to the POOL VOLUME before its mkfs. The second
+				# application is what makes an interrupted first mkfs self-heal without
+				# ever putting a populated pool at risk, and it is the one a refactor
+				# that "already checked the disk" would drop.
+				for target in '"$dev"' '"$pooldev"'; do
+					if ! grep -qF "probe_blank $target" "$mkfs"; then
+						echo "FAIL: the carve leg does not run the three-probe blankness test against $target" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				# The LVM case table. "already carries LVM metadata" must be a
+				# RECOGNISED state that creates nothing, not an unhandled one that
+				# falls through to a create.
+				if ! grep -qF 'LVM2_member' "$mkfs"; then
+					echo "FAIL: the carve leg does not recognise an existing LVM physical volume; a resumed instance would not be identified as already-initialised" >&2
+					fails=$((fails + 1))
+				fi
+				# Every lvm call scoped to this one disk, so a same-named volume group
+				# on another device cannot be activated, renamed or resized from here.
+				if ! grep -qF 'lvm "$sub" --devices "$dev"' "$mkfs"; then
+					echo "FAIL: the carve leg's lvm calls are not scoped with --devices to the guest disk; a name-scoped command could reach a volume group on another disk" >&2
+					fails=$((fails + 1))
+				fi
+				for verb in pvcreate vgcreate lvcreate; do
+					if ! grep -qF "lvmc $verb" "$mkfs"; then
+						echo "FAIL: the carve leg never calls $verb; the guest disk would carry no volume group and QEMU would have no volume to open" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				# Restart-to-grow, host half. pvresize teaches the physical volume
+				# about a disk the operator grew; the two lvextends are what let EITHER
+				# volume take the new extents -- the whole reason this is LVM and not
+				# two fixed partitions.
+				if ! grep -qF 'lvmc pvresize "$dev"' "$mkfs"; then
+					echo "FAIL: the carve leg never calls pvresize; growing the provider disk would never reach the volume group and restart-to-grow would be dead" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'lvmc lvextend -L "$storesize" "$vg/$storelv"' "$mkfs"; then
+					echo "FAIL: the carve leg never extends the store overlay volume to its configured size" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'lvmc lvextend -l +100%FREE "$vg/$poollv"' "$mkfs"; then
+					echo "FAIL: the carve leg never extends the data pool volume into the free extents; the pool is the half that takes the remainder" >&2
+					fails=$((fails + 1))
+				fi
+				# The SIZING POLICY is an ORDER, not just two commands: the store takes
+				# its configured size and the pool takes what is left, so every store
+				# sizing call has to come before the pool's 100%FREE. Reversed, the pool
+				# would swallow the group and the store could never grow.
+				store_line=$(grep -nF 'lvmc lvextend -L "$storesize"' "$mkfs" | tail -1 | cut -d: -f1)
+				pool_line=$(grep -nF 'lvcreate --yes -l 100%FREE' "$mkfs" | head -1 | cut -d: -f1)
+				if [ -n "$store_line" ] && [ -n "$pool_line" ] && [ "$store_line" -gt "$pool_line" ]; then
+					echo "FAIL: the carve leg sizes the data pool (line $pool_line) BEFORE the store overlay (line $store_line); 100%FREE would leave the store nothing to grow into" >&2
+					fails=$((fails + 1))
+				fi
+				# The two mkfs calls, and the asymmetry between them IS the design.
+				# The pool is formatted only behind the guard above; the store volume
+				# is formatted unconditionally on every host boot, which is what keeps
+				# the writable /nix/store overlay as ephemeral as the tmpfs it replaced
+				# AND what grows it (x-systemd.growfs cannot run for a neededForBoot
+				# mount, so nothing in the guest can).
+				if ! grep -qF 'mkfs.ext4 -q -L cogworx-guest "$pooldev"' "$mkfs"; then
+					echo "FAIL: the carve leg does not create an ext4 labelled cogworx-guest on the pool volume; the guest resolves it BY LABEL and would never find it" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'mkfs.ext4 -q -F -L cogworx-store-rw "$storedev"' "$mkfs"; then
+					echo "FAIL: the carve leg does not (re)create an ext4 labelled cogworx-store-rw on the store volume; that mkfs is how the overlay stays ephemeral and how it grows" >&2
+					fails=$((fails + 1))
+				fi
+				# ...and that unconditional mkfs is bounded to ONCE PER HOST BOOT by a
+				# /run marker. RemainAfterExit below suppresses a re-run only while the
+				# unit is `active`, and the pool probe is allowed to leave it `failed`
+				# with both volumes carved and a guest already launched on them (Wants=,
+				# not Requires=), so the obvious operator retry of a failed unit would
+				# otherwise remake the filesystem under a live guest. The marker has to
+				# live on a tmpfs the HOST clears at boot, and it has to be set on the
+				# script's FIRST lines -- above the device check, above every probe and
+				# above the vgchange.
+				#
+				# That last part is the one an operator-plausible "tidy-up" undoes, and it
+				# is asserted by LINE NUMBER for exactly that reason. Setting the latch
+				# next to the mkfs it guards reads better and is WRONG: lvm2's own udev
+				# rule activates the volume group independently of this unit (see the
+				# blind-spot note on the behaviour check), so both volume device nodes --
+				# the entire test supervise.sh leg (e2) applies before launching a guest
+				# -- can exist before this script runs a line. Any exit before the latch
+				# then leaves the marker absent with a guest live on the store volume.
+				# Asserted as tokens and by position here, and exercised for real by cases
+				# 11, 12, 13 and 14 of the behaviour check.
+				if ! grep -qF 'storeflag=/run/' "$mkfs"; then
+					echo "FAIL: the carve leg's store-format latch is not under /run; anywhere persistent would survive a host boot and stop the overlay from ever being recreated, and anywhere the unit owns (RuntimeDirectory=) is removed when the unit fails -- which is exactly the state the latch exists for" >&2
+					fails=$((fails + 1))
+				fi
+				# `|| true` on both, because the ABSENCE of either line is a case this
+				# has to REPORT and not die on: the buildCommand runs under
+				# `set -e -o pipefail`, so a grep that matches nothing aborts the whole
+				# check with nothing but a builder exit code. MEASURED -- removing the
+				# latch-set line failed this derivation without ever printing the
+				# message below, which is a check that catches the regression and then
+				# refuses to say what it was.
+				flag_set=$(grep -nF ': > "$storeflag"' "$mkfs" | head -1 | cut -d: -f1 || true)
+				store_mkfs=$(grep -nF 'mkfs.ext4 -q -F -L cogworx-store-rw' "$mkfs" | head -1 | cut -d: -f1 || true)
+				# The FIRST line at which this script can exit, and therefore the line the
+				# latch has to precede for "marker absent" to mean "no start job of this
+				# unit completed this host boot". Everything before it is literal
+				# assignments and function definitions, which cannot fail.
+				first_exit=$(grep -nF '[ ! -b "$dev" ]' "$mkfs" | head -1 | cut -d: -f1 || true)
+				if [ -z "$flag_set" ]; then
+					echo "FAIL: the carve leg never SETS the store-format latch, so it can be re-entered in the same host boot and mkfs the store volume under a live guest" >&2
+					fails=$((fails + 1))
+				elif [ "$flag_set" -gt "$store_mkfs" ]; then
+					echo "FAIL: the carve leg sets the store-format latch (line $flag_set) AFTER the mkfs (line $store_mkfs); a run killed at TimeoutStartSec mid-format then leaves no marker while the supervisor has already launched a guest, and the retry mkfs's underneath it" >&2
+					fails=$((fails + 1))
+				elif [ -n "$first_exit" ] && [ "$flag_set" -gt "$first_exit" ]; then
+					echo "FAIL: the carve leg sets the store-format latch (line $flag_set) BELOW its first exit path, the device check at line $first_exit; lvm2's udev rule activates the volume group independently of this unit, so both volume nodes -- all supervise.sh leg (e2) tests before launching a guest -- can already exist, and every refusal above the latch then leaves the marker absent with a guest live on the store volume" >&2
+					fails=$((fails + 1))
+				fi
+				# The shipped size. gce-image-guest-disk-behaviour runs a re-realization
+				# of this module with a small store volume, so the number that actually
+				# ships is asserted here instead.
+				if ! grep -qF 'storesize=16384m' "$mkfs"; then
+					echo "FAIL: the shipped carve leg does not bake a 16384 MiB store overlay volume" >&2
+					fails=$((fails + 1))
+				fi
+				# ...and that the behaviour check's fixture really is the same code.
+				# Normalise only the two baked size lines; anything else that differs
+				# means the tested script and the shipped script have diverged.
+				sed -e 's/^\(\t*storesize=\).*/\1SIZE/' -e 's/^\(\t*storebytes=\).*/\1SIZE/' "$mkfs" > shipped.norm
+				sed -e 's/^\(\t*storesize=\).*/\1SIZE/' -e 's/^\(\t*storebytes=\).*/\1SIZE/' ${gceGuestDiskScriptSmall} > tested.norm
+				if ! diff -u shipped.norm tested.norm; then
+					echo "FAIL: the script gce-image-guest-disk-behaviour runs differs from the shipped one by more than the store-overlay size; the behaviour evidence does not describe what ships" >&2
+					fails=$((fails + 1))
+				fi
+
+				# 3. Ordering. With no host mount unit there is no
+				#    x-systemd.before= seam, so the only thing keeping mkfs off a
+				#    disk QEMU already has open is the supervisor's own After=.
+				sup=${gceUnits}/cogworx-supervisor.service
+				if ! grep -Eq '^After=.*cogworx-guest-disk\.service' "$sup"; then
+					echo "FAIL: cogworx-supervisor is not ordered After= cogworx-guest-disk.service; the carve could race the VM launch -- mkfs on a volume the guest has open, or a grow that lands after QEMU already sized the drive" >&2
+					fails=$((fails + 1))
+				fi
+				# Wants= is also what PULLS the unit in: it is wantedBy nothing, so
+				# without this the carve never runs at all.
+				if ! grep -Eq '^Wants=.*cogworx-guest-disk\.service' "$sup"; then
+					echo "FAIL: cogworx-supervisor does not Want= cogworx-guest-disk.service; nothing else pulls that unit in, so the disk would never be carved" >&2
+					fails=$((fails + 1))
+				fi
+				# ...but NOT Requires=: a carve that fails must not also make the unit
+				# that launches the sandbox fail, and the bounded case matters too --
+				# with Wants the launch proceeds when a probe times out.
+				if grep -Eq '^Requires=.*cogworx-guest-disk\.service' "$sup"; then
+					echo "FAIL: cogworx-supervisor Requires= cogworx-guest-disk.service; a failed carve would then prevent the sandbox from starting at all" >&2
+					fails=$((fails + 1))
+				fi
+				# RemainAfterExit keeps the unit active for the rest of the boot, so the
+				# supervisor's own Restart=always does not re-enqueue the carve and the
+				# grow on every restart cycle: both stay once-per-HOST-boot, which is
+				# exactly the Stop -> resize -> Start shape restart-to-grow needs.
+				#
+				# It is NOT what protects the store volume's mkfs, and reading it that
+				# way is how F2 got in: RemainAfterExit suppresses a re-run only in the
+				# `active` state, and the refusals above deliberately leave this unit
+				# `failed`. The /run latch asserted higher up is the protection; this
+				# assertion is about restart-cycle churn and about the grow's
+				# granularity.
+				if ! grep -Eq '^RemainAfterExit=(yes|true|1|on)$' ${gceUnits}/cogworx-guest-disk.service; then
+					echo "FAIL: cogworx-guest-disk is not RemainAfterExit; every supervisor restart cycle would re-enqueue the carve and the grow mid-boot" >&2
+					fails=$((fails + 1))
+				fi
+				# Not wantedBy anything, the state-disk.nix idiom: the supervisor is
+				# the single puller, so the unit cannot run on a boot class that has
+				# no business touching a guest disk.
+				if [ -e ${gceUnits}/multi-user.target.wants/cogworx-guest-disk.service ]; then
+					echo "FAIL: cogworx-guest-disk is wantedBy multi-user.target; it must be pulled in only by the unit that launches the guest" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The carve script, RUN rather than read. The eval check above can only
+			# see that certain tokens are present in it, and every one of those greps
+			# passes on a script whose control flow is wrong -- an inverted test, an
+			# `exit 0` moved below the mkfs, a blkid guard that reads "could not read
+			# the disk" as "blank", or a grow leg that sizes the pool before the store
+			# would all satisfy them while destroying the user's work tree or silently
+			# never growing. This is the one piece of code in the change that can
+			# destroy data that has no other copy, so its contract is exercised against
+			# real block devices, a real volume group and a real mkfs.
+			#
+			# The fixture is a SYMLINK at the script's baked by-id path, which is
+			# exactly what udev creates on the real host -- so the script runs
+			# unmodified and un-parameterised, addressing the device, the volume group
+			# and the two logical volumes by the names it ships with. `[ -b ]` follows
+			# symlinks, so pointing it at a loop device, a regular file, a
+			# device-mapper error target or nothing at all selects the branches.
+			#
+			# The one thing that IS parameterised is the store overlay's size: the
+			# shipped 16 GiB would mean a multi-gigabyte tmpfs and a minutes-long mkfs
+			# in a vmTools VM for a property that has nothing to do with the number.
+			# gce-image-guest-disk-format asserts the shipped size AND diffs the two
+			# realized scripts with the size lines normalised out, so this cannot drift
+			# into testing different code.
+			#
+			# DM_DISABLE_UDEV is set for the FIXTURE, never in the shipped script:
+			# there is no udevd in this VM, so lvm has to create the device nodes
+			# itself instead of waiting on a udev cookie that will never be answered.
+			#
+			# THE BLIND SPOT THAT SETTING CREATES, named here because three rounds of
+			# review derived a false premise from a fixture that cannot express the
+			# question. On the SHIPPED image this script is NOT the only thing that
+			# activates the volume group. `services.lvm.enable` is true, which puts
+			# lvm2 in `services.udev.packages` (MEASURED on the realized host), and
+			# /etc/lvm/lvm.conf leaves `event_activation` at its default 1 -- so
+			# lvm2's own 69-dm-lvm.rules fires off the disk's uevent and runs
+			# `systemd-run --no-block ... lvm vgchange -aay cogworx-guest`,
+			# INDEPENDENTLY of this unit and before it (which keeps
+			# DefaultDependencies and so starts after basic.target) has run a line.
+			# Both /dev/cogworx-guest/{pool,store} therefore exist on boots where
+			# this script exited early -- and supervise.sh leg (e2), which tests only
+			# that those two nodes are block devices, launches a guest on them.
+			#
+			# THIS FIXTURE CANNOT REPRODUCE THAT ACTIVATOR, and the reason is
+			# structural rather than a missing line: the rule's RUN+= is
+			# `/run/current-system/systemd/bin/systemd-run --no-block`, which needs a
+			# systemd MANAGER on D-Bus. vmTools' stage 2 is a shell script as PID 1,
+			# with no systemd and no dbus, so running udevd with lvm2's rules here
+			# would fire a rule whose activation command cannot work. Case 14 below
+			# therefore SIMULATES the state instead: it activates the volume group
+			# from the fixture before invoking the script, exactly as udev would have,
+			# and then makes the script exit early. What that reproduces is
+			# "both nodes exist without this unit having created them in this host
+			# boot", which is the premise every store-mkfs guard rests on. What it
+			# does NOT reproduce is udev's activation racing this unit in TIME; only
+			# a real GCE boot can show that, so the image pipeline's fresh-instance
+			# validation is where that half is evidenced.
+			gce-image-guest-disk-behaviour = (pkgs.vmTools.override {
+				# vmTools' own default list plus `loop`; see cogbox-guest-migrate-behaviour.
+				rootModules = [
+					"virtio_pci" "virtio_mmio" "virtio_blk" "virtio_balloon" "virtio_rng"
+					# dm_mod is both the LVM substrate and, for the unreadable-device
+					# case, the only honest way to build a device whose reads FAIL
+					# rather than a device that is merely empty.
+					"ext4" "virtiofs" "crc32c" "loop" "dm_mod"
+				];
+			}).runInLinuxVM (pkgs.runCommand "gce-image-guest-disk-behaviour" {
+				nativeBuildInputs = [ pkgs.util-linux pkgs.e2fsprogs pkgs.coreutils pkgs.lvm2 ];
+				# The default 512 MiB leaves the root tmpfs too small for two ext4
+				# filesystems plus the loop backing file.
+				memSize = 2048;
+			} ''
+				fails=0
+				fmt=${gceGuestDiskScriptSmall}
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+				dev=/dev/disk/by-id/google-cogworx-guest
+				pooldev=/dev/cogworx-guest/pool
+				storedev=/dev/cogworx-guest/store
+				storeflag=/run/cogworx-guest-disk.store-formatted
+				mkdir -p /dev/disk/by-id /etc/lvm /run
+				export DM_DISABLE_UDEV=1
+
+				# EVERY case below is a fresh HOST BOOT unless it says otherwise, and
+				# `boot` is what makes that true. The script latches its unconditional
+				# store-volume mkfs on a /run marker, because /run is a tmpfs the host
+				# clears at boot and cogworx-supervisor is After= this unit -- so an
+				# absent marker proves no guest can be holding the store volume. This VM
+				# has ONE /run for all the cases, so without clearing it here every case
+				# after the first would silently exercise the SAME-BOOT path and the
+				# store assertions would be testing the opposite of what they say.
+				# Cases 11, 12 and 14 deliberately re-invoke "$fmt" WITHOUT clearing it,
+				# and case 13 arms it by hand: all four are about a RETRY within one
+				# host boot.
+				boot() { rm -f "$storeflag"; "$fmt"; }
+
+				# A fresh backing file on a loop device per case, reachable at the baked
+				# by-id path through the same kind of symlink udev would create. 256 MiB
+				# against the fixture's 32 MiB store volume, so the pool gets the clear
+				# majority of the group and a grow has somewhere to go.
+				loop=""
+				fresh_loop() {
+					if [ -n "$loop" ]; then
+						vgchange -an cogworx-guest 2>/dev/null || true
+						losetup -d "$loop" || true
+						loop=""
+					fi
+					rm -f /disk.img
+					truncate -s 256M /disk.img
+					loop=$(losetup --find --show /disk.img)
+					ln -sfn "$loop" "$dev"
+				}
+				lv_bytes() { lvs --noheadings --units b --nosuffix -o lv_size "$1" | tr -d '[:space:]'; }
+				vg_free() { vgs --noheadings --units b --nosuffix -o vg_free cogworx-guest | tr -d '[:space:]'; }
+				# ext4's own idea of how big it is, in bytes, read from the superblock
+				# rather than by mounting -- this check must never mount a pool.
+				fs_bytes() {
+					dumpe2fs -h "$1" 2>/dev/null | awk -F: '
+						/^Block count/ { n = $2 } /^Block size/ { s = $2 }
+						END { gsub(/ /, "", n); gsub(/ /, "", s); print n * s }'
+				}
+				fs_uuid() { blkid -p -o value -s UUID "$1"; }
+
+				echo "== case 1: a blank disk gets the whole LVM stack, and both labels =="
+				fresh_loop
+				boot || bad "the carve leg failed on a blank disk"
+				[ "$(blkid -p -o value -s TYPE "$loop")" = LVM2_member ] \
+					|| bad "case 1 did not make the disk a physical volume"
+				[ "$(vgs --noheadings -o vg_name cogworx-guest | tr -d '[:space:]')" = cogworx-guest ] \
+					|| bad "case 1 did not create the cogworx-guest volume group"
+				[ -b "$pooldev" ] || bad "case 1 left no $pooldev device node; QEMU would have nothing to open"
+				[ -b "$storedev" ] || bad "case 1 left no $storedev device node; the guest cannot boot without its store overlay"
+				# SIZING POLICY, measured: the store takes its configured size and the
+				# pool takes everything else, so there is nothing left over.
+				[ "$(lv_bytes "$pooldev")" -gt "$(lv_bytes "$storedev")" ] \
+					|| bad "case 1 gave the data pool no more space than the store overlay; the pool is supposed to take the remainder"
+				[ "$(vg_free)" = 0 ] \
+					|| bad "case 1 left $(vg_free) bytes unallocated; the pool must take the whole remainder or the disk is being wasted"
+				[ "$(blkid -p -o value -s TYPE "$pooldev")" = ext4 ] || bad "case 1 left the pool volume unformatted"
+				[ "$(blkid -p -o value -s LABEL "$pooldev")" = cogworx-guest ] \
+					|| bad "case 1 did not LABEL the pool; the guest resolves it by label and would never find it"
+				[ "$(blkid -p -o value -s LABEL "$storedev")" = cogworx-store-rw ] \
+					|| bad "case 1 did not LABEL the store overlay; the guest's stage-1 mount resolves it by label"
+				store_size_1=$(lv_bytes "$storedev")
+				[ "$store_size_1" = 33554432 ] \
+					|| bad "case 1 sized the store overlay at $store_size_1 bytes, not the configured 32 MiB"
+
+				echo "== discard: freed blocks must reach the provider disk THROUGH device-mapper =="
+				# The mechanism that stops the sparse ratchet the design is about. QEMU
+				# opens each logical volume with discard=unmap, so a guest ext4 mounted
+				# `discard` issues BLKDISCARD down to the dm device; if dm-linear did not
+				# pass that through, the trim would stop one layer above the disk and
+				# nothing would ever be returned.
+				loop_disc=$(cat /sys/class/block/"$(basename "$loop")"/queue/discard_max_bytes)
+				if [ "$loop_disc" = 0 ]; then
+					# Not a failure of dm -- a fixture that cannot express the question.
+					# Say so rather than passing quietly, exactly as the unreadable-device
+					# case does.
+					bad "the fixture loop device advertises no discard support, so the passthrough assertions below would be vacuous"
+				fi
+				for lv in "$pooldev" "$storedev"; do
+					dm=$(basename "$(readlink -f "$lv")")
+					dm_disc=$(cat /sys/class/block/"$dm"/queue/discard_max_bytes)
+					[ "$dm_disc" -gt 0 ] \
+						|| bad "$lv ($dm) advertises discard_max_bytes=0; device-mapper is not passing discards down to the disk, so freed guest blocks would never be returned"
+				done
+				echo "discard evidence: loop=$loop_disc pool=$(cat /sys/class/block/"$(basename "$(readlink -f "$pooldev")")"/queue/discard_max_bytes) store=$(cat /sys/class/block/"$(basename "$(readlink -f "$storedev")")"/queue/discard_max_bytes)"
+
+				echo "== case 2: NEGATIVE -- a re-run never touches the POOL, and always remakes the STORE =="
+				# The single most important assertion in the change on the pool side:
+				# this is the step between a resumed instance and the total,
+				# unrecoverable loss of the user's work tree, on every boot. The store
+				# half is the deliberate opposite, and testing both in one case is what
+				# makes the asymmetry impossible to lose by accident.
+				mkdir -p /mnt/pool
+				mount "$pooldev" /mnt/pool
+				echo the-users-only-copy > /mnt/pool/sentinel
+				umount /mnt/pool
+				pool_uuid_1=$(fs_uuid "$pooldev")
+				store_uuid_1=$(fs_uuid "$storedev")
+				vg_uuid_1=$(vgs --noheadings -o vg_uuid cogworx-guest | tr -d '[:space:]')
+				boot || bad "the carve leg failed on an already-initialised disk"
+				[ "$(fs_uuid "$pooldev")" = "$pool_uuid_1" ] \
+					|| bad "case 2 REFORMATTED the populated pool: its UUID changed, so the user's work tree is gone"
+				mount "$pooldev" /mnt/pool
+				[ "$(cat /mnt/pool/sentinel)" = the-users-only-copy ] \
+					|| bad "case 2 lost the sentinel from a volume it must not have written to"
+				umount /mnt/pool
+				[ "$(fs_uuid "$storedev")" != "$store_uuid_1" ] \
+					|| bad "case 2 did NOT remake the store overlay's filesystem; that mkfs is what keeps the /nix/store upper as ephemeral as the tmpfs it replaced and is the only way it can grow"
+				[ "$(vgs --noheadings -o vg_uuid cogworx-guest | tr -d '[:space:]')" = "$vg_uuid_1" ] \
+					|| bad "case 2 re-created the volume group; an already-LVM disk must be recognised, not re-initialised"
+				[ "$(vg_free)" = 0 ] || bad "case 2 changed the allocation on a disk nobody grew"
+
+				echo "== case 3: GROW -- pvresize, then the pool takes the new extents =="
+				# Decision 5, host half. The operator grows the provider disk and
+				# restarts; this unit runs BEFORE the guest launches, so the volumes are
+				# already bigger by the time QEMU opens them.
+				pool_size_2=$(lv_bytes "$pooldev")
+				pool_fs_2=$(fs_bytes "$pooldev")
+				truncate -s 512M /disk.img
+				losetup -c "$loop"
+				boot || bad "the carve leg failed after the disk grew"
+				[ "$(lv_bytes "$pooldev")" -gt "$pool_size_2" ] \
+					|| bad "case 3 did not grow the data pool volume after the disk grew; restart-to-grow is dead for the pool"
+				[ "$(vg_free)" = 0 ] \
+					|| bad "case 3 left $(vg_free) bytes unallocated after the grow; the pool takes the remainder"
+				[ "$(lv_bytes "$storedev")" = "$store_size_1" ] \
+					|| bad "case 3 changed the store overlay's size; it takes its CONFIGURED size and the pool takes what is left"
+				# The DIVISION OF LABOUR, asserted rather than assumed: the host grows
+				# the VOLUME and stops there, and the guest's x-systemd.growfs grows the
+				# pool's FILESYSTEM on the same boot (cogbox-guest-volume-hosted asserts
+				# the mount option and that the pool is a stage-2 mount, which is what
+				# makes that unit able to run at all).
+				[ "$(fs_bytes "$pooldev")" = "$pool_fs_2" ] \
+					|| bad "case 3 resized the pool's FILESYSTEM from the host; that belongs to the guest, which is the only side that knows whether the filesystem is in use"
+				[ "$(fs_bytes "$pooldev")" -lt "$(lv_bytes "$pooldev")" ] \
+					|| bad "case 3 left the pool filesystem no smaller than its volume, so there is nothing for the guest to grow into and the assertion above proved nothing"
+				# ...and the space really is usable, which a size comparison alone does
+				# not show. resize2fs here stands in for the guest's growfs; it is the
+				# FIXTURE doing it, not the shipped script.
+				e2fsck -fp "$pooldev" >/dev/null 2>&1 || true
+				resize2fs "$pooldev" >/dev/null 2>&1 \
+					|| bad "case 3's new extents could not actually be used: resize2fs failed on the grown pool volume"
+				[ "$(fs_bytes "$pooldev")" -gt "$pool_fs_2" ] \
+					|| bad "case 3's pool filesystem did not grow into the new extents even when told to"
+				mount "$pooldev" /mnt/pool
+				[ "$(cat /mnt/pool/sentinel)" = the-users-only-copy ] || bad "case 3 lost data while growing"
+				umount /mnt/pool
+				# The store's filesystem, by contrast, is ALWAYS the size of its volume,
+				# because the host lays it down fresh. That is what makes restart-to-grow
+				# true for the half x-systemd.growfs cannot reach.
+				[ "$(fs_bytes "$storedev")" -gt $(( $(lv_bytes "$storedev") - 4194304 )) ] \
+					|| bad "case 3's store filesystem is materially smaller than its volume; the unconditional mkfs is what keeps the two in step"
+
+				echo "== case 4: the STORE volume grows to a RAISED configured size, and the pool absorbs the rest =="
+				# The other direction of the sizing policy, and the only path that
+				# exercises lvextend on the store. Seeded by hand at half the configured
+				# size, which is also what an instance carved by an older image with a
+				# smaller store looks like.
+				fresh_loop
+				pvcreate -qq --yes "$loop"
+				vgcreate -qq --yes cogworx-guest "$loop"
+				lvcreate -qq --yes -L 16m -n store cogworx-guest
+				boot || bad "the carve leg failed on a disk whose store volume was smaller than configured"
+				[ "$(lv_bytes "$storedev")" = 33554432 ] \
+					|| bad "case 4 did not grow the store overlay volume to its configured size"
+				[ -b "$pooldev" ] || bad "case 4 did not create the missing data pool volume"
+				[ "$(vg_free)" = 0 ] || bad "case 4 left free extents instead of giving them to the pool"
+
+				echo "== case 5: NEGATIVE -- an interrupted first mkfs on the POOL self-heals =="
+				# lvcreate succeeded, mkfs did not. The volume exists and is blank, so
+				# the three-probe test applied to the POOL VOLUME (not just the disk) is
+				# what makes the next boot finish the job instead of leaving a volume the
+				# guest cannot mount.
+				wipefs -a -q "$pooldev"
+				dd if=/dev/zero of="$pooldev" bs=1M count=2 status=none
+				boot || bad "the carve leg failed on a pool volume with no filesystem"
+				[ "$(blkid -p -o value -s LABEL "$pooldev")" = cogworx-guest ] \
+					|| bad "case 5 did not format a blank pool volume; an interrupted first mkfs would never heal"
+
+				echo "== case 5b: an UNREADABLE POOL volume still gets the store remade =="
+				# The refusal that costs nothing and used to cost the store overlay. A
+				# pool volume the host cannot read makes this unit exit 1 -- correctly --
+				# but by then BOTH logical volumes exist, so QEMU opens two drives and
+				# the guest boots anyway. With the store's unconditional mkfs sitting
+				# behind the pool probe, that boot handed the guest last boot's store
+				# filesystem: no longer ephemeral, not sized to the volume, and possibly
+				# the half-written result of an interrupted format on the one mount the
+				# guest's stage 1 cannot boot without.
+				#
+				# It is also the state F2 is about: this unit ends `failed` with both
+				# volumes carved and a guest live on them, which is exactly when a
+				# `systemctl start cogworx-guest-disk` retry must NOT remake the store
+				# filesystem. Case 11 below is that half.
+				# dmsetup wipe_table swaps the pool's live table for an error target,
+				# which is the honest shape: a real volume of the right size whose every
+				# read fails, with the EXTENTS untouched underneath -- so the table can
+				# be put back afterwards and the volume read to prove nothing was
+				# written to it. Addressed by dm NAME, which is not the /dev/dm-N node
+				# basename `readlink -f` resolves to.
+				pool_dm=$(dmsetup info -c --noheadings -o name "$pooldev" | tr -d '[:space:]')
+				store_uuid_5=$(fs_uuid "$storedev")
+				pool_uuid_5=$(fs_uuid "$pooldev")
+				dmsetup wipe_table --noudevsync "$pool_dm" \
+					|| bad "case 5b could not swap the pool volume's table for an error target"
+				if dd if="$pooldev" of=/dev/null bs=1M count=1 status=none 2>/dev/null; then
+					bad "case 5b's pool volume still READS, so the refusal it is about is unexercised and the assertions below prove nothing"
+				fi
+				boot > case5b.out 2>&1 \
+					&& bad "case 5b exited 0 on a pool volume it could not examine; that refusal must be visible in systemctl --failed"
+				grep -q 'cannot be READ' case5b.out \
+					|| bad "case 5b did not report an unreadable pool volume, so it refused for some other reason"
+				# Restore the real table before reading anything back off the volume.
+				vgchange -an cogworx-guest >/dev/null 2>&1 || true
+				vgchange -ay cogworx-guest >/dev/null
+				[ "$(fs_uuid "$storedev")" != "$store_uuid_5" ] \
+					|| bad "case 5b did NOT remake the store overlay's filesystem before refusing the pool; the guest is then started on last boot's store, which is neither ephemeral nor grown"
+				[ "$(blkid -p -o value -s LABEL "$storedev")" = cogworx-store-rw ] \
+					|| bad "case 5b left the store overlay without its label; the guest's stage-1 mount resolves it by label"
+				# ...and the refusal is still a refusal: nothing was written to the volume
+				# this host could not read.
+				[ "$(fs_uuid "$pooldev")" = "$pool_uuid_5" ] \
+					|| bad "case 5b WROTE to the pool volume it had just declared unreadable"
+
+				echo "== case 6: NEGATIVE -- a disk carrying a NON-LVM filesystem is left alone, LOUDLY =="
+				# Not ours. The likeliest cause is the wrong disk attached, and writing
+				# a volume group over somebody else's filesystem is the failure this
+				# whole guard chain exists to prevent.
+				#
+				# The refusal is unchanged; its EXIT STATUS is what this case now
+				# asserts, 1 rather than 0. This used to be a boot that still produced a
+				# guest, because a launch-time chooser fell back to the workstation
+				# runner, so `active` was honest. With one baked profile it produces no
+				# guest at all -- and exit 0 left NOTHING in `systemctl --failed` while
+				# cogworx-supervisor flapped under Restart=always, which is the
+				# undiagnosable stuck-in-Booting shape this design exists to prevent.
+				fresh_loop
+				mkfs.ext4 -q -L someone-elses "$loop"
+				boot 2> case6.err \
+					&& bad "case 6 exited 0 on a disk it refused to carve; with one baked storage profile that boot has no guest at all, so the refusal must be visible in systemctl --failed"
+				[ "$(blkid -p -o value -s TYPE "$loop")" = ext4 ] \
+					|| bad "case 6 overwrote a disk carrying a non-LVM filesystem"
+				[ "$(blkid -p -o value -s LABEL "$loop")" = someone-elses ] \
+					|| bad "case 6 relabelled a filesystem that is most likely not ours"
+				grep -q 'leaving it alone' case6.err \
+					|| bad "case 6 refused silently; a disk the guest cannot use must say why"
+
+				echo "== case 7: NEGATIVE -- a foreign VOLUME GROUP is reported, never renamed, and FAILS =="
+				# Same visibility argument as case 6: somebody else's group is left
+				# exactly as it is, and the unit fails so that the refusal lands
+				# somewhere an operator and the control plane can both see it.
+				fresh_loop
+				pvcreate -qq --yes "$loop"
+				vgcreate -qq --yes somebody-elses-vg "$loop"
+				boot 2> case7.err \
+					&& bad "case 7 exited 0 on somebody else's volume group; that boot has no guest, so the refusal must land in systemctl --failed"
+				[ "$(pvs --noheadings -o vg_name "$loop" | tr -d '[:space:]')" = somebody-elses-vg ] \
+					|| bad "case 7 renamed or replaced somebody else's volume group"
+				grep -q WARNING case7.err \
+					|| bad "case 7 did not warn; a disk the guest cannot use must not be silent"
+				vgchange -an somebody-elses-vg >/dev/null 2>&1 || true
+				vgremove -qq -f somebody-elses-vg >/dev/null 2>&1 || true
+
+				echo "== case 8: NEGATIVE -- a REGULAR FILE at the device path is not touched =="
+				# microvm.nix's own autoCreate guard is `[ ! -e ]`, which would touch a
+				# missing device node into a regular file and mkfs THAT, handing the user
+				# a blank pool while their real disk sat unattached. `[ ! -b ]` here is
+				# what makes that unreachable from this side.
+				rm -f /notadisk
+				truncate -s 256M /notadisk
+				ln -sfn /notadisk "$dev"
+				boot || bad "the carve leg failed instead of skipping a regular file"
+				[ -z "$(blkid -p -o value -s TYPE /notadisk)" ] \
+					|| bad "case 8 wrote to a REGULAR FILE at the device path"
+				[ "$(stat -c %s /notadisk)" = 268435456 ] \
+					|| bad "case 8 changed the size of a regular file it must not have touched"
+
+				echo "== case 9: no device at all -- exit 0, and create nothing =="
+				# A resolver VM and every instance created before the guest disk existed
+				# boot this same image with no such device. Both must still boot.
+				rm -f "$dev"
+				boot || bad "the carve leg failed on a boot class with no guest disk; that boot now has no sandbox at all"
+				[ ! -e "$dev" ] || bad "case 9 CREATED something at the device path"
+				# ...and it STILL arms the once-per-host-boot latch on the way out, which
+				# is the late-attach half of case 14. A disk that attaches after this run
+				# exited 0 is activated by lvm2's udev rule (see the blind-spot note above),
+				# leg (e2) then finds both nodes and launches a guest, and the operator
+				# retries this unit in the same host boot -- so the exit-0 path is a
+				# pre-mkfs exit like any other and may not leave the latch unarmed.
+				[ -e "$storeflag" ] \
+					|| bad "case 9's absent-device exit left the once-per-host-boot marker unarmed; a disk attached later in this host boot is activated by udev, leg (e2) launches a guest on it, and a retry of this unit is then free to mkfs the store volume underneath that guest"
+
+				echo "== case 10: NEGATIVE -- a device that cannot be READ is not written to =="
+				# The finding this case exists for. blkid returns exit 2 with empty
+				# stdout for a device it could not probe, identically to a blank one, so
+				# a guard resting on blkid alone reads "I could not read this disk" as
+				# "this disk is blank" -- and carves the disk most likely to hold data.
+				# device-mapper's `error` target is the honest way to produce it: a real
+				# block device of a real size whose every read returns EIO.
+				dmsetup create cogbox-eio --table "0 131072 error" --noudevsync
+				eio=/dev/mapper/cogbox-eio
+				dmsetup mknodes cogbox-eio || true
+				if [ ! -b "$eio" ]; then
+					# Two calls rather than one lookup plus a shell suffix-strip: a bare
+					# dollar-brace is Nix interpolation inside this string, and escaping
+					# one here to save a subprocess buys nothing.
+					eio_major=$(dmsetup info -c --noheadings -o major cogbox-eio)
+					eio_minor=$(dmsetup info -c --noheadings -o minor cogbox-eio)
+					mknod "$eio" b "$eio_major" "$eio_minor"
+				fi
+				[ -b "$eio" ] \
+					|| bad "case 10 has no block device to test with, so the unreadable-device guard is unexercised and the assertions below prove nothing"
+				ln -sfn "$eio" "$dev"
+				# Prove the fixture has the shape this case is about before asserting
+				# anything about the script, or a pass here means nothing. BOTH signature
+				# probes must be indistinguishable from blank -- blkid exit 2 with no
+				# TYPE, wipefs exit 0 with no signatures -- while the READ fails. That
+				# combination is the finding: two blind probes agreeing.
+				brc=0
+				btype=$(blkid -p -o value -s TYPE "$eio" 2>/dev/null) || brc=$?
+				wrc=0
+				wsigs=$(wipefs --no-act -i -O TYPE "$eio" 2>/dev/null) || wrc=$?
+				if [ "$brc" -ne 2 ] || [ -n "$btype" ]; then
+					bad "case 10 did not reproduce the unreadable-device shape (blkid exit $brc, type '$btype'); the guard it exists to test is then unexercised"
+				fi
+				if [ "$wrc" -ne 0 ] || [ -n "$wsigs" ]; then
+					bad "case 10 gave the signature probes something to refuse on (wipefs exit $wrc, signatures '$wsigs'); the read proof is then not what is being tested"
+				fi
+				if dd if="$eio" of=/dev/null bs=1M count=1 status=none 2>/dev/null; then
+					bad "case 10 device READS fine, so it is not the unreadable-device shape at all"
+				fi
+				# A fault, not a boot class, so the unit is expected to FAIL loudly -- it
+				# costs nothing (the supervisor only Wants= it) and a later supervisor
+				# start retries it, so a transient error self-heals.
+				boot > case10.out 2>&1 \
+					&& bad "case 10 exited 0 on a disk it could not examine; that refusal must be visible in systemctl --failed"
+				# THE assertion, and it is on the ATTEMPT rather than on the outcome
+				# because the outcome cannot discriminate: pvcreate fails on an error
+				# target of its own accord, so a script with no read proof at all still
+				# leaves the device uncarved and still exits nonzero. What separates the
+				# two is whether it TRIED. On a real disk that reads intermittently --
+				# the shape this guards against -- that attempt succeeds.
+				grep -q 'provably blank' case10.out \
+					&& bad "case 10 went on to CARVE a device it could not read; the attempt IS the defect, whatever pvcreate then did with it"
+				grep -q 'cannot be READ' case10.out \
+					|| bad "case 10 did not report an unreadable disk at all, so it refused for some other reason and the read proof is unexercised"
+				[ -z "$(blkid -p -o value -s TYPE "$eio" 2>/dev/null)" ] \
+					|| bad "case 10 WROTE to a device it could not read; a blank-looking signature probe was taken as proof of blankness"
+				dmsetup remove cogbox-eio
+
+				echo "== case 11: NEGATIVE -- a SAME-BOOT re-run must not remake the store filesystem =="
+				# F2, reproduced through the state that actually produces it rather than
+				# by calling the script twice.
+				#
+				# RemainAfterExit stops a re-run only while the unit is `active`. The
+				# pool probe is ALLOWED to refuse (case 5b), and a refusal leaves this
+				# unit `failed` with BOTH logical volumes carved and active -- and
+				# cogworx-supervisor only Wants= it, so the guest was launched anyway and
+				# QEMU is holding /dev/cogworx-guest/store open as its /nix/store overlay
+				# upper. From there a plain `systemctl start cogworx-guest-disk` -- the
+				# obvious operator retry of a failed unit, and what any future Wants=
+				# edge would also do -- re-entered the store leg and ran `mkfs.ext4 -F`
+				# on that live volume. `-F` refuses a MOUNTED device and this host mounts
+				# neither, so nothing stopped it.
+				#
+				# The fixture cannot run a guest, so it asserts the mechanism instead:
+				# after a run that got as far as the store leg, a re-run WITHOUT a fresh
+				# /run must leave the store filesystem's UUID untouched.
+				fresh_loop
+				boot || bad "case 11 could not carve a fresh disk to start from"
+				pool_dm_11=$(dmsetup info -c --noheadings -o name "$pooldev" | tr -d '[:space:]')
+				# Produce the failed-with-volumes-carved state: an unreadable pool makes
+				# the run exit 1 AFTER the store leg has already re-formatted.
+				dmsetup wipe_table --noudevsync "$pool_dm_11" \
+					|| bad "case 11 could not swap the pool volume's table for an error target"
+				boot > case11a.out 2>&1 \
+					&& bad "case 11's setup run exited 0 on an unreadable pool; it is supposed to reproduce the FAILED unit state"
+				store_uuid_11=$(fs_uuid "$storedev")
+				[ -n "$store_uuid_11" ] \
+					|| bad "case 11's setup run left the store volume with no filesystem, so the assertion below cannot distinguish anything"
+				[ -e "$storeflag" ] \
+					|| bad "case 11's setup run did not leave the once-per-host-boot marker; the latch is not armed and the re-run below proves nothing"
+				# THE RETRY, deliberately WITHOUT clearing /run -- the same host boot.
+				"$fmt" > case11b.out 2>&1 \
+					&& bad "case 11's retry exited 0 on a pool it still cannot read; the refusal must be unchanged"
+				grep -q 'NOT (re)formatting' case11b.out \
+					|| bad "case 11's retry did not report skipping the store mkfs, so it either ran it or skipped it for some other reason"
+				[ "$(fs_uuid "$storedev")" = "$store_uuid_11" ] \
+					|| bad "case 11's retry REMADE the store overlay's filesystem in the same host boot; a live guest holds that volume open as its /nix/store overlay upper, and mkfs -F only refuses a MOUNTED device"
+				# ...and the latch is a per-BOOT bound, not a permanent off switch: the
+				# next host boot must still remake it, or the overlay stops being
+				# ephemeral and stops growing. Without this half the assertion above
+				# would also pass on a script that simply never formats the store again.
+				boot > case11c.out 2>&1 \
+					&& bad "case 11's next-boot run exited 0 on an unreadable pool"
+				[ "$(fs_uuid "$storedev")" != "$store_uuid_11" ] \
+					|| bad "case 11's NEXT host boot did not remake the store overlay's filesystem; the marker has become a permanent latch rather than a once-per-boot bound"
+				vgchange -an cogworx-guest >/dev/null 2>&1 || true
+				vgchange -ay cogworx-guest >/dev/null 2>&1 || true
+
+				echo "== case 12: NEGATIVE -- a run that DIED BEFORE the store leg must not let a same-boot retry remake the store filesystem =="
+				# Case 11's twin, and the half case 11 cannot reach. Case 11's setup run
+				# gets all the way THROUGH the store leg before the pool probe refuses, so
+				# it only ever exercises a latch the store leg itself armed. The window
+				# this case is about is the one BEFORE that: both volume device nodes are
+				# up (`lvmc vgchange -ay` here, lvm2's own udev rule on the shipped image --
+				# case 14), supervise.sh leg (e2) gates the guest launch on exactly those two
+				# nodes existing, and `After=` is satisfied by a FAILED start job -- so every
+				# leg between the top of the script and the store leg can fail with a guest
+				# already live on the store volume.
+				#
+				# The fault injected is the one the unit's TimeoutStartSec exists for, in
+				# its fast-failing form: a disk that still answers its probe and its reads
+				# -- so the three-probe test types it LVM2_member and the volume group
+				# activates -- and refuses WRITES, so `pvresize` dies. MEASURED with
+				# blockdev --setro: vgchange exit 0 with both nodes present, dd and blkid
+				# unaffected, pvresize exit 5 ("Error writing device").
+				fresh_loop
+				boot || bad "case 12 could not carve a fresh disk to start from"
+				store_uuid_12=$(fs_uuid "$storedev")
+				# A FRESH host boot -- hence the marker is cleared -- whose run dies after
+				# the activation and before the store leg.
+				rm -f "$storeflag"
+				blockdev --setro "$loop"
+				"$fmt" > case12a.out 2>&1 \
+					&& bad "case 12's setup run exited 0 on a disk whose writes fail; it is supposed to reproduce the run that DIES between the activation and the store leg"
+				# The fixture really is that window, asserted with the script's own words
+				# rather than with lvm's error text, which is version-coupled.
+				grep -q '(re)creating ext4' case12a.out \
+					&& bad "case 12's setup run reached the store leg after all, so it does not reproduce the state this case is about"
+				[ -b "$storedev" ] \
+					|| bad "case 12's setup run left no store volume node, so no guest could have been launched and the retry below has nothing to protect"
+				[ -b "$pooldev" ] \
+					|| bad "case 12's setup run left no pool volume node; both nodes present is precisely when supervise.sh leg (e2) lets the guest start, and that is the state this case is about"
+				# THE discriminating assertion on the setup run: a run that ACTIVATED the
+				# volume group must leave the marker behind however it then died. Without
+				# it the retry below reformats the store volume under a guest leg (e2)
+				# already let start.
+				[ -e "$storeflag" ] \
+					|| bad "case 12's setup run left no once-per-host-boot marker although both volume nodes were present; a guest can exist from before this script's first line (case 14), so the retry below is free to mkfs the store volume underneath it"
+				# The transient fault clears and the operator does what the failed unit's
+				# own message invites -- in the SAME host boot, so no fresh marker.
+				blockdev --setrw "$loop"
+				"$fmt" > case12b.out 2>&1 \
+					|| bad "case 12's retry failed on a disk that is healthy again; unlike case 11 the pool here is fine, so the retry is expected to SUCCEED"
+				grep -q 'NOT (re)formatting' case12b.out \
+					|| bad "case 12's retry did not report skipping the store mkfs, so it either ran it or skipped it for some other reason"
+				[ "$(fs_uuid "$storedev")" = "$store_uuid_12" ] \
+					|| bad "case 12's retry REMADE the store overlay's filesystem in the same host boot; a guest launched by leg (e2) after the failed run holds that volume open as its /nix/store overlay upper, and mkfs -F only refuses a MOUNTED device"
+				# ...and the latch is still a per-BOOT bound. Without this half the
+				# assertion above would also pass on a script that armed the marker and
+				# never formatted the store again.
+				boot > case12c.out 2>&1 \
+					|| bad "case 12's next host boot failed on a healthy disk"
+				[ "$(fs_uuid "$storedev")" != "$store_uuid_12" ] \
+					|| bad "case 12's NEXT host boot did not remake the store overlay's filesystem; arming the marker earlier has turned it into a permanent latch rather than a once-per-boot bound"
+
+				echo "== case 13: NEGATIVE -- a same-boot retry of an INTERRUPTED FIRST carve FAILS by name instead of exiting 0 with no store filesystem =="
+				# Case 12's other half, and the one path arming the latch at the
+				# activation opened. Case 12's setup run had LAST boot's store filesystem
+				# to fall back on, so its retry skipping the mkfs cost only freshness. A
+				# FIRST-EVER carve has nothing to fall back to, and the window is the
+				# same one: the marker is armed on the script's first lines, both device
+				# nodes are up (from `lvmc vgchange -ay`, or from lvm2's udev rule on the
+				# shipped image -- case 14), supervise.sh leg (e2) launches a guest on
+				# exactly those two nodes, and every leg between there and the store mkfs
+				# can still fail -- the [ -b ] node checks losing a race with udev, a
+				# transient lvm error, a TimeoutStartSec kill, a host crash.
+				#
+				# On the retry the marker still says a guest may hold the store volume
+				# open, so the mkfs must NOT run. MEASURED before the refusal below
+				# existed: the script skipped it, ran off its own end and exited 0 --
+				# leaving the unit `active`, nothing in `systemctl --failed`, and the
+				# store volume with no filesystem at all. The guest's /nix/.rw-store is
+				# neededForBoot, x-initrd.mount, resolved BY LABEL and carries no nofail,
+				# so stage 1 cannot mount a label that does not exist: the sandbox never
+				# starts for the rest of the host boot and no unit anywhere says why.
+				# That is the stuck-in-Booting shape this whole file is written against,
+				# so the skip has to be loud when there is nothing there to skip.
+				fresh_loop
+				# Carved by hand rather than through an injected fault: the script has no
+				# leg that both creates the volumes and then fails before the store mkfs
+				# on demand, and this is precisely the state such a run leaves behind --
+				# both logical volumes present, neither filesystem written, marker armed.
+				pvcreate -qq --yes "$loop"
+				vgcreate -qq --yes cogworx-guest "$loop"
+				lvcreate -qq --yes -L 32m -n store cogworx-guest
+				lvcreate -qq --yes -l 100%FREE -n pool cogworx-guest
+				: > "$storeflag"
+				# Prove the fixture is that state before asserting anything about the
+				# script, or a pass below means nothing.
+				[ -b "$storedev" ] \
+					|| bad "case 13 has no store volume node, so this is not the interrupted-first-carve state and the assertions below prove nothing"
+				[ -b "$pooldev" ] \
+					|| bad "case 13 has no pool volume node; both nodes present is precisely when supervise.sh leg (e2) lets the guest start, and that is the state this case is about"
+				[ -z "$(blkid -p -o value -s TYPE "$storedev" 2>/dev/null)" ] \
+					|| bad "case 13's store volume already carries a filesystem, so the never-formatted path this case exists for is unexercised"
+				"$fmt" > case13a.out 2>&1 \
+					&& bad "case 13's same-boot retry exited 0 with the store volume unformatted; the unit stays active, nothing lands in systemctl --failed, and the guest's stage-1 mount by label fails for the rest of the host boot with no unit saying why"
+				grep -q 'has no cogworx-store-rw filesystem' case13a.out \
+					|| bad "case 13's retry did not NAME the missing store filesystem; a refusal that costs the user their sandbox has to say which volume and why, or the operator is back to guessing from serial output"
+				[ -z "$(blkid -p -o value -s TYPE "$storedev" 2>/dev/null)" ] \
+					|| bad "case 13's retry FORMATTED the store volume in a host boot whose marker says a guest may already hold it open; the refusal must only get LOUDER, never turn into a write"
+				# ...and the next host boot still heals it, the same closing half cases 11
+				# and 12 carry. Without it the assertion above also passes on a script
+				# that has simply stopped formatting the store volume at all.
+				boot > case13b.out 2>&1 \
+					|| bad "case 13's next host boot failed on a healthy disk"
+				[ "$(blkid -p -o value -s LABEL "$storedev" 2>/dev/null)" = cogworx-store-rw ] \
+					|| bad "case 13's NEXT host boot did not lay down the store filesystem the retry refused to; the refusal has turned a recoverable interrupted carve into a permanently unbootable instance"
+
+				echo "== case 14: NEGATIVE -- volumes activated by UDEV, not by this unit, must still bound the store mkfs to once per host boot =="
+				# The case DM_DISABLE_UDEV blinds this fixture to, simulated by hand --
+				# see the blind-spot note at the fixture's `export DM_DISABLE_UDEV=1`
+				# for why udevd with lvm2's rules cannot be run in this harness and for
+				# exactly what this case does and does not reproduce.
+				#
+				# It is also the ROOT of cases 11, 12 and 13 rather than a fourth
+				# sibling of them. Every one of those reasons about a marker that some
+				# earlier run of THIS SCRIPT armed, because in this fixture the script
+				# is the only thing that can create the volume device nodes. On the
+				# shipped image it is not: lvm2's 69-dm-lvm.rules activates the volume
+				# group off the disk's own uevent, so BOTH nodes -- which is the entire
+				# test supervise.sh leg (e2) applies before launching a guest -- exist
+				# on a boot where this script exited at its very first refusal. "Marker
+				# absent" then did not mean "no guest can exist"; it only meant "no run
+				# of this script reached the vgchange", and those two stopped being the
+				# same statement the moment something else could activate.
+				#
+				# The chain, end to end: existing carved sandbox, host boot, udev
+				# activates. Run A hits a transient read error on the disk and exits at
+				# the 'cannot be READ' branch -- before the line the latch used to be
+				# armed on. Unit failed, marker absent, both nodes present, so leg (e2)
+				# starts a guest that mounts /dev/disk/by-label/cogworx-store-rw
+				# READ-WRITE as its neededForBoot /nix/.rw-store overlay upper. The disk
+				# reads fine again and the operator does what this unit's own message
+				# invites -- `systemctl start cogworx-guest-disk`. With the latch armed
+				# at the activation, run B saw no marker and ran `mkfs.ext4 -F` on the
+				# live guest's store volume (`-F` refuses only a MOUNTED device, and
+				# this host mounts neither), destroying the running sandbox's /nix/store
+				# overlay upper mid-session -- and then exited 0, so nothing landed in
+				# `systemctl --failed` either.
+				fresh_loop
+				boot || bad "case 14 could not carve a fresh disk to start from"
+				mount "$pooldev" /mnt/pool
+				echo the-users-only-copy-14 > /mnt/pool/sentinel
+				umount /mnt/pool
+				store_uuid_14=$(fs_uuid "$storedev")
+				pool_uuid_14=$(fs_uuid "$pooldev")
+				# A NEW host boot of an ALREADY-CARVED instance: /run is cleared, and the
+				# volume group is activated by something OTHER than this script. The
+				# vgchange here stands in for the `vgchange -aay --autoactivation event`
+				# that 69-dm-lvm.rules runs; the deactivate first is what makes it a real
+				# activation rather than a no-op on a group left active by the run above.
+				rm -f "$storeflag"
+				vgchange -an cogworx-guest >/dev/null
+				vgchange -ay cogworx-guest >/dev/null
+				# Prove the fixture is that state before asserting anything about the
+				# script, or a pass below means nothing.
+				[ -b "$storedev" ] \
+					|| bad "case 14 has no store volume node before the script runs, so it is not the udev-activated state and the assertions below prove nothing"
+				[ -b "$pooldev" ] \
+					|| bad "case 14 has no pool volume node before the script runs; both nodes present is precisely when supervise.sh leg (e2) lets a guest start, and that is the state this case is about"
+				[ ! -e "$storeflag" ] \
+					|| bad "case 14 starts with the marker already armed, so it is not a fresh host boot and the run-A assertion below is vacuous"
+				# RUN A: a transient read error on the DISK. The same dm `error` target
+				# case 10 uses, at the same baked by-id path, so probe_blank's `dd` fails
+				# and the script exits at 'cannot be READ' -- the earliest refusal it has,
+				# and one that is reachable on a disk whose volume group is already up.
+				# (`lvmc pvs` failing, `vgchange -ay` failing and a TimeoutStartSec kill
+				# on a wedged probe all land in the same window; this is the one the
+				# fixture can inject deterministically.)
+				dmsetup create cogbox-eio14 --table "0 131072 error" --noudevsync
+				eio14=/dev/mapper/cogbox-eio14
+				dmsetup mknodes cogbox-eio14 || true
+				if [ ! -b "$eio14" ]; then
+					eio14_major=$(dmsetup info -c --noheadings -o major cogbox-eio14)
+					eio14_minor=$(dmsetup info -c --noheadings -o minor cogbox-eio14)
+					mknod "$eio14" b "$eio14_major" "$eio14_minor"
+				fi
+				[ -b "$eio14" ] \
+					|| bad "case 14 has no unreadable device to fault the disk with, so run A would not exit early and the assertions below prove nothing"
+				ln -sfn "$eio14" "$dev"
+				"$fmt" > case14a.out 2>&1 \
+					&& bad "case 14's run A exited 0 on a disk it could not read; it is supposed to reproduce the run that dies at the FIRST refusal"
+				grep -q 'cannot be READ' case14a.out \
+					|| bad "case 14's run A did not refuse on an unreadable disk, so it did not exit in the window this case is about"
+				# Both nodes are STILL there -- udev put them there and this unit failing
+				# did not take them away -- so leg (e2) is satisfied and a guest is live
+				# on the store volume from here on.
+				[ -b "$storedev" ] \
+					|| bad "case 14's run A left no store volume node, so no guest could have been launched and the retry below has nothing to protect"
+				[ -b "$pooldev" ] \
+					|| bad "case 14's run A left no pool volume node; leg (e2) would not have launched a guest and this case proves nothing"
+				# THE discriminating assertion, and the one that fails on a script whose
+				# latch is armed at its own vgchange: the volume group was ALREADY active
+				# when this run started, so a guest can exist from before the first line
+				# of it, and every exit path -- including the very first refusal -- has to
+				# leave the marker behind.
+				[ -e "$storeflag" ] \
+					|| bad "case 14's run A exited before arming the once-per-host-boot marker although the volume group was ALREADY ACTIVE and both nodes were present; supervise.sh leg (e2) launches a guest on exactly those two nodes, so the retry below is free to mkfs the store volume underneath it"
+				# The transient error clears and the operator retries the failed unit, in
+				# the SAME host boot -- which is what this unit's own failure message and
+				# the supervisor's Wants= edge both invite.
+				ln -sfn "$loop" "$dev"
+				dmsetup remove cogbox-eio14
+				"$fmt" > case14b.out 2>&1 \
+					|| bad "case 14's retry failed on a disk that is healthy again; the fault was transient, so the retry is expected to SUCCEED"
+				grep -q 'NOT (re)formatting' case14b.out \
+					|| bad "case 14's retry did not report skipping the store mkfs, so it either ran it or skipped it for some other reason"
+				# The evidence line, in the style of the discard one above: the store
+				# filesystem's identity across the retry is the single measurement this
+				# whole case turns on, and a reader of the log should not have to infer
+				# it from whether an assertion fired.
+				echo "case 14 store filesystem UUID: before the retry $store_uuid_14, after it $(fs_uuid "$storedev")"
+				[ "$(fs_uuid "$storedev")" = "$store_uuid_14" ] \
+					|| bad "case 14's retry REMADE the store overlay's filesystem in a host boot where UDEV had already activated the volume group; a guest launched by leg (e2) holds that volume open as its /nix/store overlay upper and mkfs -F only refuses a MOUNTED device, so this is the running sandbox's entire /nix/store upper destroyed mid-session"
+				[ "$(fs_uuid "$pooldev")" = "$pool_uuid_14" ] \
+					|| bad "case 14's retry REFORMATTED the populated pool; the user's work tree has no other copy"
+				mount "$pooldev" /mnt/pool
+				[ "$(cat /mnt/pool/sentinel)" = the-users-only-copy-14 ] \
+					|| bad "case 14's retry lost the sentinel from a volume it must not have written to"
+				umount /mnt/pool
+				# ...and the latch is still a per-BOOT bound, not a permanent off switch.
+				# Without this half the assertion above also passes on a script that has
+				# simply stopped remaking the store filesystem at all.
+				boot > case14c.out 2>&1 \
+					|| bad "case 14's next host boot failed on a healthy disk"
+				[ "$(fs_uuid "$storedev")" != "$store_uuid_14" ] \
+					|| bad "case 14's NEXT host boot did not remake the store overlay's filesystem; arming the marker at the top of the script has turned it into a permanent latch rather than a once-per-boot bound"
+
+				echo "== all cases ran =="
+				# Leave nothing holding the VM's root filesystem open. vmTools' stage 2
+				# ends with `mount -o remount,ro dummy /` to flush the build output, and
+				# a loop device whose backing file lives on that root -- or a live
+				# device-mapper table over one -- makes that remount fail with EBUSY,
+				# which surfaces as an init panic rather than as a readable test result.
+				vgchange -an cogworx-guest >/dev/null 2>&1 || true
+				if [ -n "$loop" ]; then losetup -d "$loop" >/dev/null 2>&1 || true; fi
+				losetup -D >/dev/null 2>&1 || true
+				rm -f /disk.img /notadisk "$dev"
+
+				[ "$fails" -eq 0 ] || exit 1
+				mkdir -p $out
+				touch $out/ok
+			'');
+
+			# The hosted-guest DELIVERY seam, and -- since the launch-time chooser was
+			# removed -- the SAFETY PROPERTY that makes one baked profile acceptable.
+			#
+			# Delivery: everything the guest half declares is inert unless the image
+			# actually bakes the hosted runner, and the ways it silently would not are
+			# (a) the wrapper pointing somewhere else, (b) the launcher's plugin
+			# re-exec resolving packages.default, and (c) the fast-path runner record
+			# validating against a runner composed for a different package. All three
+			# are invisible at eval and all three look exactly like "the storage
+			# feature did not work".
+			#
+			# Safety: with no fallback runner, a refused carve means no guest. That is
+			# accepted ONLY while the host half stays up and reachable and the failure
+			# is visible and named -- otherwise this is the stuck-in-Booting mode with a
+			# tidier cause. The second half of this check asserts those legs against
+			# the realized units.
+			gce-image-hosted-guest-profile = pkgs.runCommand "gce-image-hosted-guest-profile" { } ''
+				fails=0
+
+				# Guard against a VACUOUS run first. Every absence assertion below
+				# is meaningless if the two runners are the same derivation -- which
+				# is what would happen if the hosted nixosConfiguration stopped
+				# setting the profile, the exact regression worth catching.
+				if [ '${gceHostedRunner}' = '${gceWorkstationRunner}' ]; then
+					echo "FAIL: the hosted and workstation runners are the SAME derivation, so the hosted profile is not being applied and every assertion below is vacuous" >&2
+					exit 1
+				fi
+
+				# ONE MODE. The host's cogbox wrapper must exec packages.cogbox-hosted
+				# DIRECTLY, with nothing between them that could select a second guest
+				# at runtime.
+				#
+				# An earlier revision put a storage-profile chooser there, testing the
+				# two volume device nodes and falling back to the WORKSTATION runner
+				# when either was missing. It was removed because the image could then
+				# run in two modes while all per-instance state -- the state disk, the
+				# instance config dir, the recorded runner path, the retained 9p work
+				# tree, the harness overlay image -- persisted across the flip, which
+				# was the single root of four separate blocker rounds. So the assertion
+				# is now the opposite of what it was: no chooser, and no workstation
+				# package reachable from the wrapper at all.
+				wrapper=${gceCogboxWrapper}/bin/cogbox
+				if grep -q 'cogbox-choose-storage-profile' "$wrapper"; then
+					echo "FAIL: the GCE cogbox wrapper still fronts a storage-profile chooser; this image is hosted-only, and a runtime choice between two guest profiles is the state-across-a-flip class four rounds of blockers came from" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF '${gceHostedCogbox}/bin/cogbox' "$wrapper"; then
+					echo "FAIL: the GCE cogbox wrapper does not exec packages.cogbox-hosted; the image would never launch the hosted guest" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -qF '${gceWorkstationCogbox}/bin/cogbox' "$wrapper"; then
+					echo "FAIL: the GCE cogbox wrapper can still reach packages.cogbox; that is the second mode this change removed" >&2
+					fails=$((fails + 1))
+				fi
+
+				# ...whose launch script must bake the hosted runner, and must
+				# re-exec through the hosted ATTRIBUTE. Without the second, the
+				# first plugin add rebuilds packages.default = the workstation guest
+				# and the user's pool quietly stops being mounted.
+				launch=${gceHostedCogbox}/libexec/cogbox-launch.sh
+				if ! grep -qF '${gceHostedRunner}' "$launch"; then
+					echo "FAIL: the hosted launch script does not bake the hosted runner" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -qF '${gceWorkstationRunner}' "$launch"; then
+					echo "FAIL: the hosted launch script still references the workstation runner" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'run "path:${self}#cogbox-hosted"' "$launch"; then
+					echo "FAIL: the hosted launcher's re-exec does not name the cogbox-hosted attribute; a plugin add would rebuild the workstation guest and unmount the user's data pool" >&2
+					fails=$((fails + 1))
+				fi
+				# The runner.path fast-path record must be keyed on the PACKAGE too,
+				# not on the flake source alone: @flakeSource@ is byte-identical for
+				# cogbox and cogbox-hosted, so a rev-only key let a record written by
+				# one validate for the other -- and FAST_PATH=1 is exactly the path
+				# that does not rewrite it, so a wrong record is sticky until the image
+				# rev moves. Read off the SUBSTITUTED script, so this also proves both
+				# @-substitutions landed. Compare AND write are both checked: fixing
+				# one alone leaves the two spellings disagreeing, which silently
+				# disables the fast path on every boot forever.
+				if ! grep -qF 'RUNNER_KEY="${self}#cogbox-hosted"' "$launch"; then
+					echo "FAIL: the hosted launcher does not key its runner record on <flakeSource>#cogbox-hosted; a record composed against a different package would be accepted and the re-exec that would rebuild the right runner skipped" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF '[ "$FP_REV" = "$RUNNER_KEY" ]' "$launch"; then
+					echo "FAIL: the hosted launcher's fast path does not compare the record against RUNNER_KEY" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF '"$RUNNER_KEY" "${gceHostedRunner}" > "$RUNNER_PATH_FILE"' "$launch"; then
+					echo "FAIL: the hosted launcher does not RECORD RUNNER_KEY plus the hosted runner; a record whose key differs from the one the fast path compares never matches, so every boot pays a full eval" >&2
+					fails=$((fails + 1))
+				fi
+
+				# ...and the image's REGISTERED store must contain the hosted runner
+				# and NOT the workstation one. The launch is offline, so a runner that
+				# is not registered here cannot be started at all -- which is what
+				# makes the second half a real assertion and not bookkeeping: with no
+				# chooser there is nothing that could start the workstation guest, so
+				# its presence would mean something still references it.
+				paths=${gceClosure}/store-paths
+				if ! grep -qxF '${gceHostedRunner}' "$paths"; then
+					echo "FAIL: ${gceHostedRunner} is not in the GCE image closure; the launch is offline, so the guest could not be started at all" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -qxF '${gceWorkstationRunner}' "$paths"; then
+					echo "FAIL: the WORKSTATION runner is still in the GCE image closure; this image is hosted-only, so something is still pulling in a guest it can never launch" >&2
+					fails=$((fails + 1))
+				fi
+
+				# --- THE SAFETY PROPERTY --------------------------------------------
+				#
+				# Hosted-only is only acceptable because a refused carve or an
+				# unmountable pool leaves the HOST HALF fully up and reachable. The
+				# stuck-in-Booting mode was bad for one reason: there was no recovery
+				# path -- the instance sat in Booting with no sshd and no control
+				# channel, so nobody could look. A guest that will not launch is
+				# survivable; an unreachable VM is not. Three legs, each asserted
+				# against the realized host units rather than argued in prose.
+				#
+				# 1. No host mount unit for the guest disk, so nothing on the host's
+				#    boot path can be held by it. (gce-image-guest-disk-format asserts
+				#    the fstab side; this is the unit side, which is what a
+				#    RequiresMountsFor= or an x-systemd.before= would show up in.)
+				gdisk=${gceUnits}/cogworx-guest-disk.service
+				if grep -Eq '^(Before|RequiredBy|WantedBy)=.*(sshd|local-fs|sysinit|basic|multi-user)' "$gdisk"; then
+					echo "FAIL: cogworx-guest-disk orders itself before a host boot target or sshd; a refused or slow carve would then hold the host's own login path, which is the one thing hosted-only may not do:" >&2
+					grep -E '^(Before|RequiredBy|WantedBy)=' "$gdisk" >&2
+					fails=$((fails + 1))
+				fi
+				if grep -q 'RequiresMountsFor=' "$gdisk"; then
+					echo "FAIL: cogworx-guest-disk declares RequiresMountsFor=; systemd turns that into a hard Requires= on the covering mount unit, so a guest-disk path would become a host boot dependency" >&2
+					fails=$((fails + 1))
+				fi
+				# 2. The failure is a FAILED unit, not a job parked in `activating`.
+				#    A Type=oneshot has NO start timeout by default, and this unit is
+				#    the one that probes a provider disk that can block in D-state.
+				if ! grep -Eq '^TimeoutStartSec=[0-9]' "$gdisk"; then
+					echo "FAIL: cogworx-guest-disk has no finite TimeoutStartSec; a Type=oneshot gets no start timeout by default, so a wedged probe leaves the unit ACTIVATING forever -- invisible in systemctl --failed, which is precisely the shape hosted-only is not allowed to have" >&2
+					fails=$((fails + 1))
+				fi
+				# 3. sshd and the control channel do not depend on any of it. sshd is
+				#    ordered BEFORE the supervisor (supervisor.nix), never after it,
+				#    and nothing here may invert that.
+				if grep -Eq '^(After|Requires|Wants)=.*cogworx-(guest-disk|supervisor)' ${gceUnits}/sshd.service; then
+					echo "FAIL: sshd depends on the guest-disk or supervisor units; the host's login path must be reachable on exactly the boots where the guest is not" >&2
+					grep -E '^(After|Requires|Wants)=' ${gceUnits}/sshd.service >&2
+					fails=$((fails + 1))
+				fi
+				# ...and the refusal is NAMED, not merely visible. supervise.sh tests
+				# the guest volume device nodes before the launch and fatals by name
+				# onto serial, which is the only channel the control plane has on a VM
+				# whose guest never came up. The env it reads is derived from the
+				# hosted guest's own autoCreate = false volumes, so renaming a volume
+				# group or moving a volume fails the build instead of silently making
+				# the message name a path nothing uses.
+				sup=${gceUnits}/cogworx-supervisor.service
+				if ! grep -qF 'COGWORX_GUEST_VOLUMES' "$sup"; then
+					echo "FAIL: cogworx-supervisor is not given COGWORX_GUEST_VOLUMES; an uncarved guest disk would reach serial only as the generic \"sandbox start failed\", and with no fallback runner that message is the whole of an operator's recovery path" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'COGWORX_GUEST_VOLUMES' ${gceSuperviseScript}; then
+					echo "FAIL: the realized supervise script never reads COGWORX_GUEST_VOLUMES, so the env above is inert" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF 'is not a block device; cogworx-guest-disk.service did not carve' ${gceSuperviseScript}; then
+					echo "FAIL: the realized supervise script does not fatal by NAME on a missing guest volume; reading the env without acting on it leaves the generic \"sandbox start failed\" as the only symptom" >&2
+					fails=$((fails + 1))
+				fi
+				nvol=0
+				for d in ${lib.concatStringsSep " " gceHostedVolumeDevices}; do
+					nvol=$((nvol + 1))
+					if ! grep -qF "$d" "$sup"; then
+						echo "FAIL: cogworx-supervisor's COGWORX_GUEST_VOLUMES does not name $d, one of the hosted guest's autoCreate=false volumes; a boot where that volume is missing would fail without saying which one" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				if [ "$nvol" -lt 2 ]; then
+					echo "FAIL: only $nvol autoCreate=false volumes were derived from the hosted guest config; expected the data pool and the store overlay, and finding fewer makes the loop above vacuous" >&2
 					fails=$((fails + 1))
 				fi
 				[ "$fails" -eq 0 ] || exit 1
@@ -4100,6 +8375,21 @@
 				vcpu = 16;
 				mem = 32768;
 				extraModules = cogboxModules system {};
+			};
+		}) supportedSystems)
+		# The HOSTED-profile guest: identical modules, cogbox.storage.profile =
+		# "hosted". It has to be a separate nixosConfiguration rather than a
+		# host-side or launch-time switch, because packages.cogbox bakes the guest
+		# runner and the GCE image bakes packages.cogbox -- mkGceHost's extraModules
+		# configure the HOST system and cannot reach the guest config at all. The
+		# GCE host half selects this runner; the cogbox-guest-* checks assert its
+		# realized fstab.
+		// lib.listToAttrs (map (system: {
+			name = "${configName system}-hosted";
+			value = mkMicrovm system "cogbox" {
+				vcpu = 16;
+				mem = 32768;
+				extraModules = cogboxModules system {} ++ [ { cogbox.storage.profile = "hosted"; } ];
 			};
 		}) supportedSystems)
 		# The CONTAINER config exposed as a buildable nixosConfiguration so the

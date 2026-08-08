@@ -61,6 +61,55 @@ let
 		else lib.foldl' lib.min (lib.head sshdOtherAccountOrders) sshdOtherAccountOrders;
 	pamControl = config.security.pam.services.sshd.rules.account.cogworx-control;
 
+	# THIS IMAGE IS HOSTED-ONLY. There is ONE guest storage profile on the GCE
+	# backend, it is baked, and nothing at runtime selects between two.
+	#
+	# An earlier revision put a chooser in front of `cogbox` that tested the two
+	# guest volume device nodes and fell back to the WORKSTATION runner when
+	# either was missing, so that the four cases guest-disk.nix refuses to carve
+	# still yielded a bootable guest. It was removed deliberately, and the reason
+	# is not the closure it cost: it was that the image could then run in two
+	# modes while every piece of per-instance state -- the state disk, the
+	# instance config dir, the recorded runner path, the retained 9p work tree,
+	# the harness overlay image -- persisted ACROSS the flip. Four separate
+	# blocker rounds each found one instance of that: an ordering-dependent brain
+	# materialisation, two occupancy tests that read a fallback boot's own
+	# scaffolding as user data, and a fast-path runner record keyed on something
+	# identical in both modes and therefore reused across the flip. They were not
+	# four bugs; they were one structural fact. Removing the flip removes the
+	# class.
+	#
+	# WHAT REPLACES THE FALLBACK is not a second mode but VISIBILITY, because the
+	# failure mode the chooser was written against was bad for a specific
+	# reason: there was no recovery path. The instance sat in Booting with no
+	# sshd and no control channel, so nobody could look. That is a property of
+	# the HOST half, and the host half is untouched by any of this:
+	#
+	#   - guest-disk.nix declares NO fileSystems entry, so no host mount unit
+	#     exists that could hold local-fs.target, and nothing on the host's boot
+	#     path waits for the guest disk;
+	#   - cogworx-supervisor merely Wants= cogworx-guest-disk (never Requires=),
+	#     and that unit carries an explicit finite TimeoutStartSec, so a refusal
+	#     or a wedged probe LANDS IN `systemctl --failed` instead of parking a
+	#     job in `activating`;
+	#   - sshd, the control CA and the state disk are all upstream of every one
+	#     of those, so `ssh <vm> cogbox <verb>` answers on exactly the boots
+	#     where the guest does not come up.
+	#
+	# A guest that will not launch is an acceptable outcome; an unreachable VM is
+	# not. gce-image-hosted-guest-profile asserts each of those three legs.
+	#
+	# The device list below survives the chooser it used to feed. It is handed to
+	# the supervisor as COGWORX_GUEST_VOLUMES so supervise.sh can name the
+	# missing volume on serial before it tries to launch -- a classified line the
+	# control plane's Backend.Log reads -- instead of the generic "sandbox start
+	# failed" a failed QEMU drive open produces. The paths are READ OFF the
+	# hosted guest configuration rather than re-spelled here, so they cannot
+	# drift from the volumes the runner actually declares.
+	hostedGuestVolumeDevices = map (v: v.image) (lib.filter (v: !v.autoCreate)
+		self.nixosConfigurations."cogbox-${lib.head (lib.splitString "-" system)}-hosted"
+			.config.microvm.volumes);
+
 	# cogbox, re-wrapped so that a NON-INTERACTIVE `ssh <vm> cogbox <verb>`
 	# carries the three path variables. This is not a nicety: `ssh host cmd`
 	# runs a non-login, non-interactive shell, which sources neither
@@ -125,12 +174,29 @@ let
 	# gce-cogbox-wrapper-env asserts both directions against the real wrapper,
 	# and asserts this one agrees with the unit (a divergence would mean the boot
 	# render and the bind render grant to different groups).
+	#
+	# It wraps packages.cogbox-hosted DIRECTLY -- no chooser, no indirection --
+	# and that package is the only cogbox this image contains. Read the two names
+	# carefully, because they are unrelated and nearly identical: this
+	# derivation's `cogboxHosted` has always meant "cogbox as HOSTED ON this GCE
+	# machine" (the wrapper), while `cogbox-hosted` is the package whose baked
+	# guest runner uses the HOSTED STORAGE PROFILE -- work/, machine-state and the
+	# harness overlay uppers on one dedicated block volume the host never mounts,
+	# instead of the workstation layout's RAM-backed machine-state.
+	#
+	# A second PACKAGE (rather than an option) is still required, and that is
+	# unchanged by dropping the chooser: mkGceHost's extraModules configure THIS
+	# system, while the guest closure is baked inside packages.cogbox* (mkCogbox
+	# substitutes the runner's store path into cogbox-launch.sh), so a host module
+	# cannot reach the guest config at all. Hence a second nixosConfiguration and
+	# a second package -- exactly one of which ships in this image.
+	# gce-image-hosted-guest-profile asserts every leg of it.
 	cogboxHosted = pkgs.runCommand "cogbox-gce" {
 		nativeBuildInputs = [ pkgs.makeWrapper ];
 		meta = { mainProgram = "cogbox"; };
 	} ''
 		mkdir -p $out/bin
-		makeWrapper ${self.packages.${system}.cogbox}/bin/cogbox $out/bin/cogbox \
+		makeWrapper ${self.packages.${system}.cogbox-hosted}/bin/cogbox $out/bin/cogbox \
 			--set-default XDG_CONFIG_HOME ${cfg.stateDir}/config \
 			--set-default COGBOX_DATA ${cfg.stateDir}/data/cogbox \
 			--set-default COGBOX_PROXY_RUNAS ${cfg.proxyUser}:${cfg.proxyUser} \
@@ -141,6 +207,7 @@ in
 {
 	imports = [
 		./state-disk.nix
+		./guest-disk.nix
 		./scrub.nix
 		./floor.nix
 		./supervisor.nix
@@ -163,6 +230,55 @@ in
 				the control plane's `stateDiskDevice` constant, not a
 				provider-assigned value: the guest can only find the disk if
 				both halves spell it the same way.
+			'';
+		};
+		guestDevice = lib.mkOption {
+			type = lib.types.str;
+			default = "/dev/disk/by-id/google-cogworx-guest";
+			description = ''
+				The ONE dedicated per-instance guest disk -- the user's work
+				tree, tool caches and guest journal, plus the guest's writable
+				/nix/store overlay -- resolved through its FIXED provider
+				deviceName, exactly as stateDevice is. `cogworx-guest` is the
+				same shape of cross-repo wire contract with the control plane's
+				`guestDiskDevice` constant.
+
+				This host puts an LVM volume group on it, carves the two
+				logical volumes the guest needs, keeps them grown to the disk,
+				and lays a filesystem on each (guest-disk.nix). It NEVER MOUNTS
+				a guest filesystem: the volumes carry the untrusted half's data
+				and are passed straight through to QEMU as virtio-blk devices,
+				which the guest mounts by label. An operator override here
+				changes only where this host looks for the disk, never the
+				volume-group, logical-volume or label names the guest looks for
+				-- see guest-disk.nix.
+			'';
+		};
+		storeOverlaySizeMiB = lib.mkOption {
+			type = lib.types.int;
+			default = 16384;
+			description = ''
+				Size, in MiB, of the logical volume carved out of the guest disk
+				for the guest's writable /nix/store overlay. The data pool takes
+				whatever is left, so this is the ONE number that divides the
+				disk; raising it on an existing instance moves free space from
+				the pool to the overlay on the next boot, and lowering it does
+				nothing until the instance is recreated (guest-disk.nix never
+				shrinks a volume).
+
+				16 GiB matches the size the guest has always been TOLD it has
+				(the "16G" every instance's config.json carried), so the hosted
+				profile is not a quiet reduction of the ceiling a plugin install
+				or brain rebuild fits inside today -- and unlike the tmpfs it
+				replaces, 16 GiB here is deliverable rather than a number larger
+				than the guest's whole RAM. It costs the pool 16 GiB of the
+				provider disk outright, because a logical volume is not sparse;
+				size the disk for both halves.
+
+				It is a HOST option because the host is what carves the volume.
+				The guest sets autoCreate = false on both volumes and therefore
+				sizes neither, so there is deliberately no guest-side twin of
+				this knob to drift out of step with it.
 			'';
 		};
 		controlUser = lib.mkOption {
@@ -348,6 +464,22 @@ in
 
 	config = {
 		cogworx.gce.cogboxPackage = cogboxHosted;
+
+		# The hosted guest's autoCreate = false volume paths, handed to
+		# supervise.sh so leg (e2) can say WHICH volume is missing before it tries
+		# to launch. Without it the only symptom of an uncarved guest disk is
+		# `cogbox start` failing to open a drive, which reaches serial as the
+		# generic "sandbox start failed" -- true, useless, and indistinguishable
+		# from half a dozen unrelated causes. With one baked runner there is
+		# nothing to fall back TO, so naming the cause is the whole of the
+		# recovery path an operator gets.
+		#
+		# Space-separated because supervise.sh iterates it with word splitting;
+		# the paths are store-free device nodes with no spaces in them, and
+		# gce-image-hosted-guest-profile asserts this env is exactly the volume
+		# set the hosted runner declares.
+		systemd.services.cogworx-supervisor.environment.COGWORX_GUEST_VOLUMES =
+			lib.concatStringsSep " " hostedGuestVolumeDevices;
 
 		# --- GCE metadata handling: absent, not merely unused ---------------
 		#

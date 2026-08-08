@@ -362,6 +362,39 @@ fi
 RT="$XDG_RUNTIME_DIR/cogbox-$INSTANCE"
 rm -rf "$RT" "$RT.lock"
 
+# --- (e2) the guest's block volumes must exist before the launch ------------
+#
+# This image bakes ONE guest storage profile, and that guest declares both its
+# volumes with autoCreate = false: microvm's createVolumesScript makes nothing,
+# QEMU is handed two device paths it must be able to open, and
+# cogworx-guest-disk.service is what puts them there. That unit REFUSES to carve
+# a disk it does not understand -- absent, unreadable, a foreign filesystem,
+# somebody else's volume group -- and each refusal is correct on its own terms.
+#
+# What is NOT acceptable is refusing invisibly. Without this leg the only
+# symptom is `cogbox start` failing to open a drive, which reaches serial as the
+# generic "sandbox start failed" below: true, and indistinguishable from a
+# kernel that would not boot, a passt that would not start, or a port collision.
+# On the one boot class where an operator has nothing else to go on -- the guest
+# never came up, so getSerialPortOutput is the only channel -- that is the
+# difference between a diagnosis and the stuck-in-Booting failure mode.
+#
+# It is checked HERE, past both short-circuits, on purpose. A resolver VM has no
+# guest disk by design and returned at (d1); a maintenance boot has no guest at
+# all and returned at (d2). Only a boot that is about to start a sandbox reaches
+# this line, and such a boot always needs both volumes.
+#
+# fatal() is the right severity even though it costs a restart cycle: the host
+# half stays up and reachable either way -- sshd, the control channel and the
+# state disk are all upstream of this unit -- so this converts an unexplained
+# flap into an explained one and changes nothing else. Word splitting on the
+# variable is intended (a space-separated device list rendered from the hosted
+# guest's own volume set), and `:-` keeps `set -u` happy on a host that declares
+# none, where this loop is correctly a no-op.
+for _vol in ${COGWORX_GUEST_VOLUMES:-}; do
+	[ -b "$_vol" ] || fatal "guest volume $_vol is not a block device; cogworx-guest-disk.service did not carve this instance's guest disk (systemctl status cogworx-guest-disk names which of absent / unreadable / foreign filesystem / foreign volume group it refused on), so QEMU has nothing to open and the sandbox cannot start"
+done
+
 # --- (f) start the sandbox --------------------------------------------------
 emit "starting sandbox $INSTANCE"
 start_args=(start --no-ssh -y -n "$INSTANCE")

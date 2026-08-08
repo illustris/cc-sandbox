@@ -236,6 +236,7 @@ run_boot() {
 	COGWORX_POLL_INTERVAL=1 \
 	COGWORX_READY_TIMEOUT=4 \
 	COGWORX_HOSTKEY_TIMEOUT=2 \
+	COGWORX_GUEST_VOLUMES="${SEED_GUEST_VOLUMES-}" \
 	XDG_CONFIG_HOME="${SEED_XDG_CONFIG_HOME-$home/state/config}" \
 	COGBOX_DATA="$home/state/data/cogbox" \
 	XDG_RUNTIME_DIR="$home/run" \
@@ -655,6 +656,71 @@ if grep -q '^cogworx: FAILED: XDG_CONFIG_HOME is unset or empty' "$ROOT/noxdg/se
 	ok "the refusal reaches serial, so the boot is diagnosable from getSerialPortOutput"
 else
 	bad "empty XDG_CONFIG_HOME emitted no classified serial line: $(cat "$ROOT/noxdg/serial.log" 2>/dev/null)"
+fi
+
+# --- 6f. a MISSING guest volume is fail-closed, and says WHICH ---------------
+#
+# Leg (e2), and it exists because the GCE image is now hosted-only. There is one
+# baked guest storage profile and no launch-time fallback, so when
+# cogworx-guest-disk refuses to carve -- absent disk, unreadable disk, foreign
+# filesystem, foreign volume group -- QEMU is handed two paths that do not exist
+# and no guest starts. That outcome is accepted; being unable to DIAGNOSE it is
+# not, and that was the whole of the stuck-in-Booting failure mode. Without
+# this leg the only symptom is `cogbox start` failing to open a drive, which
+# reaches serial as the generic "sandbox start failed" -- true, and
+# indistinguishable from a kernel that would not boot or a port collision. On a
+# VM whose guest never came up, getSerialPortOutput is the only channel the
+# control plane has.
+#
+# The NEGATIVE CONTROL for both cases below is every other case in this file:
+# they run with COGWORX_GUEST_VOLUMES unset, the loop is then a no-op, and they
+# all reach `cogbox start`. So a leg that simply always fataled would fail them,
+# not pass here.
+
+SEED_GUEST_VOLUMES="$ROOT/absent-vol/pool $ROOT/absent-vol/store"
+rc=$(run_boot novolume "${BASE_ATTRS[@]}")
+unset SEED_GUEST_VOLUMES
+md="$ROOT/novolume/md"
+n=$(evcount "$md" 'cogbox start')
+if [ "$rc" != 0 ] && [ "$n" = 0 ]; then
+	ok "a missing guest volume exits non-zero with zero cogbox start"
+else
+	bad "missing guest volume: rc=$rc, cogbox start invoked $n times"
+fi
+# NAMED, not merely non-zero. An operator reading serial has to learn which
+# volume is missing and which unit to go look at; "sandbox start failed" is what
+# this replaces.
+if grep -q "^cogworx: FAILED: guest volume $ROOT/absent-vol/pool is not a block device" "$ROOT/novolume/serial.log" 2>/dev/null; then
+	ok "the refusal names the missing volume on serial"
+else
+	bad "missing guest volume emitted no named serial line: $(cat "$ROOT/novolume/serial.log" 2>/dev/null)"
+fi
+if grep -q 'cogworx-guest-disk' "$ROOT/novolume/serial.log" 2>/dev/null; then
+	ok "the serial line points at the unit that refused to carve"
+else
+	bad "the refusal does not name cogworx-guest-disk, so an operator has no next step"
+fi
+
+# ...and the test is `-b`, not `-e`. microvm.nix's own autoCreate guard is
+# `[ ! -e ]`, which would touch a missing device node into a REGULAR FILE and
+# mkfs that -- handing the user a blank pool while their real disk sat
+# unattached. Both volumes are autoCreate = false precisely to make that
+# unreachable, and a regular file at the device path must fail here for the same
+# reason: QEMU can open it, and the guest would then boot on a file instead of
+# its disk. (This is also the only shape a build sandbox can express -- it has
+# character devices but no block devices -- so it is the case that actually
+# proves the predicate rather than the path.)
+mkdir -p "$ROOT/filevol"
+: > "$ROOT/filevol/pool"
+SEED_GUEST_VOLUMES="$ROOT/filevol/pool"
+rc=$(run_boot filevolume "${BASE_ATTRS[@]}")
+unset SEED_GUEST_VOLUMES
+md="$ROOT/filevolume/md"
+n=$(evcount "$md" 'cogbox start')
+if [ "$rc" != 0 ] && [ "$n" = 0 ]; then
+	ok "a REGULAR FILE at a guest volume path is refused, so the test is -b and not -e"
+else
+	bad "regular file at a guest volume path: rc=$rc, cogbox start invoked $n times"
 fi
 
 # --- 7. absent nonce is fail-closed -----------------------------------------
