@@ -55,6 +55,7 @@ $XDG_RUNTIME_DIR/cogbox[-<name>]/
   opencode-data          -> $COGBOX_OPENCODE_DATA
   codex-home             -> $COGBOX_CODEX_HOME
   hermes-agent-home      -> $COGBOX_HERMES_HOME
+  omp-home               -> $COGBOX_OMP_HOME
   pi-home                -> $COGBOX_PI_HOME
   .harness-stubs/        # empty stubs for inactive harnesses (so QEMU
                          # 9p sources resolve even when the host has no
@@ -88,12 +89,12 @@ Two sources of guest extension share one mechanism, `--override-input userExtens
 
 ## Plugin brain materialization
 
-The base module declares the `cogbox.*` option tree and folds the merged `config.cogbox` of every plugin into one `cogbox-brain` derivation at build (per-harness native trees + merged `opencode.json`/`.mcp.json`/codex `config.toml` + a generated capability index skill). Two base-owned `Type=oneshot` services (modeled on `load-ssh-keys`, ordered `before=sshd.service`) materialize it at boot:
+The base module declares the `cogbox.*` option tree and folds the merged `config.cogbox` of every plugin into one `cogbox-brain` derivation at build (per-harness native trees + merged opencode/codex/OMP MCP settings + a generated capability index skill). Two base-owned `Type=oneshot` services (modeled on `load-ssh-keys`, ordered `before=sshd.service`) materialize it at boot:
 
-1. `cogbox-brain-materialize` runs after backend state is available and creates the `~/work` (`/root/work` → `/var/lib/cogbox/work`) symlink, the `~/work/.cogbox/brain` link to the RO store derivation, and per-leaf child symlinks into each harness's real writable dirs (`.claude/skills/<s>`, `.opencode/agents/<a>.md`, `.agents/skills/<s>`, …). When Hermes is enabled, it creates the managed runtime skeleton (`~/.hermes/{cron,sessions,logs,memories}`) after the persistent Hermes home is ready and before materializing Hermes skills. In the VM these writes land in the Hermes overlay upper. In the container `/root/.hermes` is linked to the per-instance state PVC at `/var/lib/cogbox-state/hermes-home`; setup replaces only an empty image-scaffold directory and fails closed rather than merging or deleting a nonempty or conflicting home. It only ever drops *child* symlinks, never whole-dir links, so the harness can scaffold session state alongside and peers coexist. It reads only closure-resident store paths, so it works offline.
+1. `cogbox-brain-materialize` runs after backend state is available and creates the `~/work` (`/root/work` -> `/var/lib/cogbox/work`) symlink, the `~/work/.cogbox/brain` link to the RO store derivation, and per-leaf child symlinks into each harness's real writable dirs (`.claude/skills/<s>`, `.opencode/agents/<a>.md`, `.omp/rules/<r>.md`, `.agents/skills/<s>`, etc.). When Hermes is enabled, it creates the managed runtime skeleton (`~/.hermes/{cron,sessions,logs,memories}`) after the persistent Hermes home is ready and before materializing Hermes skills. In the VM these writes land in the Hermes overlay upper. In the container `/root/.hermes` is linked to the per-instance state PVC at `/var/lib/cogbox-state/hermes-home`; setup replaces only an empty image-scaffold directory and fails closed on a nonempty directory, wrong symlink, or invalid persistent target.
 2. `cogbox-brain-trust` pre-accepts Claude Code workspace trust for `~/work` (both `/root/work` and the `/var/lib/cogbox/work` it resolves to) and reconciles stale pre-migration project keys.
 
-The workdir/cwd is base-owned: `programs.bash.loginShellInit` and the harness launchers (`c`/`oc`/`cx`/`h`/`p`) `cd ~/work` (the launcher also exports `OPENCODE_CONFIG` and merges `cogbox.env`). The contract has no `loginShellInit`/`cwd` surface, so a plugin cannot fight over cwd. See [plugins](plugins.md) for the full contract.
+The workdir/cwd is base-owned: `programs.bash.loginShellInit` and the harness launchers (`c`/`oc`/`om`/`cx`/`h`/`p`) `cd ~/work` (the launcher also exports `OPENCODE_CONFIG` and merges `cogbox.env`). The contract has no `loginShellInit`/`cwd` surface, so a plugin cannot fight over cwd. See [plugins](plugins.md) for the full contract.
 
 ## Guest environment and non-Nix binaries
 

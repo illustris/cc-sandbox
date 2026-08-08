@@ -224,6 +224,32 @@
 				};
 			};
 
+			omp = {
+				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				package = inputs.llm-agents.packages.${system}.omp;
+				launcher = {
+					name = "om";
+					# OMP defaults to yolo today, but pass it explicitly so a
+					# persisted user setting cannot reintroduce approval prompts.
+					# mkLauncher also supplies NODE_EXTRA_CA_CERTS from l7CaEnv;
+					# the compiled Bun executable needs that explicit bundle for
+					# OAuth on minimal Nix systems.
+					flags = [ "--approval-mode" "yolo" ];
+					# OMP's auth management parser rejects launch-only flags.
+					# Login still needs the same CA environment, but no approval mode.
+					unflaggedCommands = [ "auth-broker" ];
+					env = {};
+				};
+				paths = {
+					# OMP keeps config, its SQLite credential store, sessions,
+					# profiles, skills, and caches below ~/.omp.
+					home = {
+						guest = "/root/.omp";
+						kind = "overlay";
+					};
+				};
+			};
+
 			pi = {
 				# Opt-in (fail-closed worker can't fetch the overridden pi from npmjs): gated on `enablePi` above.
 				enable = enablePi && builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
@@ -1454,7 +1480,15 @@
 							(l7CaEnv // cfg.env // ocConfig // h.launcher.env);
 						envStr = lib.concatStringsSep " " envParts;
 						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
-					# Land non-login `cogbox ssh -- c/oc/cx` in the standardized
+						unflaggedCommands = h.launcher.unflaggedCommands or [];
+						unflaggedPattern = lib.concatStringsSep "|" (map lib.escapeShellArg unflaggedCommands);
+						command = ''exec env PATH="/root/work/.cogbox/brain/bin:$PATH" ${envStr} ${lib.getExe h.package}'';
+						unflaggedDispatch = lib.optionalString (unflaggedCommands != []) ''
+							case "''${1-}" in
+								${unflaggedPattern}) ${command} "$@" ;;
+							esac
+						'';
+					# Land non-login `cogbox ssh -- c/oc/om/cx/h/p` in the standardized
 					# workdir too (loginShellInit covers the interactive login path).
 					# Prepend the brain's plugin-tool bin to PATH so the harness AND its
 					# tool subprocesses (e.g. claude-code's Bash) resolve cogbox.packages
@@ -1464,7 +1498,8 @@
 					# (literal in the '' string); redundant-but-harmless on the VM.
 					in "#!${pkgs.runtimeShell}\n"
 						+ "cd /root/work 2>/dev/null || true\n"
-						+ ''exec env PATH="/root/work/.cogbox/brain/bin:$PATH" ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
+						+ unflaggedDispatch
+						+ ''${command} ${flagsStr} "$@"''
 						+ "\n"
 				);
 
@@ -1579,6 +1614,12 @@
 					(if m ? command
 						then { command = m.command; args = m.args or []; } // lib.optionalAttrs (m ? env) { env = m.env; }
 						else { url = m.url; } // lib.optionalAttrs (m ? headers) { headers = m.headers; })) cfg.mcp;
+				ompMcp = lib.mapAttrs (_: m:
+					(if m ? command
+						then { type = "stdio"; command = m.command; args = m.args or []; }
+							// lib.optionalAttrs (m ? env) { env = m.env; }
+						else { type = "http"; url = m.url; }
+							// lib.optionalAttrs (m ? headers) { headers = m.headers; })) cfg.mcp;
 				settingsModel = h: let s = cfg.settings.${h} or null; in
 					lib.optionalAttrs (s != null && s.model != null) { model = s.model; };
 				claudeHooks = lib.mapAttrs (_: cmd: [ { hooks = [ { type = "command"; command = cmd; } ]; } ]) cfg.hooks;
@@ -1598,6 +1639,7 @@
 				codexConfigAttrs = lib.optionalAttrs (cfg.mcp != {}) { mcp_servers = codexMcp; }
 					// settingsModel "codex";
 				codexConfig = tomlFmt.generate "config.toml" codexConfigAttrs;
+				ompMcpJson = jsonFmt.generate "mcp.json" { mcpServers = ompMcp; };
 
 				# --- the cogbox-authored capability index (the only always-on text) ---
 				indexRows = lib.mapAttrsToList (n: p:
@@ -1650,6 +1692,17 @@
 					${linkInto "$out/opencode/agents" ".md" agents}
 					${linkInto "$out/opencode/commands" ".md" commands}
 					cp ${opencodeConfig} $out/opencode.json
+				'' + lib.optionalString (harnesses ? "omp") ''
+					# OMP discovers all four unit types natively from the project
+					# .omp tree. Keep MCP project-scoped as well so the host's
+					# ~/.omp credential/state overlay remains untouched.
+					mkdir -p $out/omp/skills $out/omp/agents $out/omp/commands $out/omp/rules
+					${linkInto "$out/omp/skills" "" skills}
+					ln -s ${indexSkill} $out/omp/skills/cogbox-plugins
+					${linkInto "$out/omp/agents" ".md" agents}
+					${linkInto "$out/omp/commands" ".md" commands}
+					${linkInto "$out/omp/rules" ".md" rules}
+					${lib.optionalString (cfg.mcp != {}) "cp ${ompMcpJson} $out/omp/mcp.json"}
 				'' + lib.optionalString (harnesses ? "codex" || harnesses ? "pi") ''
 					# The agentskills.io project layout, read natively by BOTH codex
 					# (~/.agents/skills) and pi (.agents/skills in cwd/ancestors) --
@@ -1802,6 +1855,16 @@
 					linkleaves "$brain/opencode/agents"   "$WORK/.opencode/agents"
 					linkleaves "$brain/opencode/commands" "$WORK/.opencode/commands"
 
+
+					# omp: native project skills/agents/commands/rules and MCP.
+					linkleaves "$brain/omp/skills"   "$WORK/.omp/skills"
+					linkleaves "$brain/omp/agents"   "$WORK/.omp/agents"
+					linkleaves "$brain/omp/commands" "$WORK/.omp/commands"
+					linkleaves "$brain/omp/rules"    "$WORK/.omp/rules"
+					if [ -e "$brain/omp/mcp.json" ] && [ ! -e "$WORK/.omp/mcp.json" ]; then
+						mkdir -p "$WORK/.omp"
+						ln -sfn "$brain/omp/mcp.json" "$WORK/.omp/mcp.json"
+					fi
 					# codex + pi: skills under .agents/skills (codex resolves it from
 					# ~, pi from cwd/ancestors -- the launchers cd to ~/work, and
 					# /root/work -> $WORK, so both see this same tree). codex global
@@ -4375,6 +4438,7 @@
 				opencode = enabledHarnesses.opencode.package;
 				codex = inputs.llm-agents.packages.${system}.codex;
 				hermes-agent = enabledHarnesses.hermes-agent.package;
+				omp = enabledHarnesses.omp.package;
 				# pi is opt-out of the default image (enablePi above), so it is no longer
 				# in enabledHarnesses. Reference the BASE numtide pi (not the overridden
 				# one we've stopped shipping) so the release version gate stays a cache
@@ -4754,11 +4818,13 @@
 				test '${releaseHarnesses.opencode.version}' = '1.18.7'
 				test '${releaseHarnesses.codex.version}' = '0.145.0'
 				test '${releaseHarnesses.hermes-agent.version}' = '2026.7.20'
+				test '${releaseHarnesses.omp.version}' = '17.1.5'
 				test '${releaseHarnesses.pi.version}' = '0.82.1'
 
 				assert_version '2.1.220' ${releaseHarnesses.claude-code}/bin/claude --version
 				assert_version '1.18.7' ${releaseHarnesses.opencode}/bin/opencode --version
 				assert_version '0.145.0' ${releaseHarnesses.codex}/bin/codex --version
+				assert_version '17.1.5' ${releaseHarnesses.omp}/bin/omp --version
 				assert_version '0.82.1' ${releaseHarnesses.pi}/bin/pi --version
 
 				if ! hermes_output=$(${releaseHarnesses.hermes-agent}/bin/hermes --version 2>&1); then

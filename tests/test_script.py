@@ -116,9 +116,11 @@ with subtest("Phase A: CLI / state without booting"):
     machine.succeed("test -d /home/testuser/.config/opencode")
     machine.succeed("test -d /home/testuser/.local/share/opencode")
     machine.succeed("test -d /home/testuser/.hermes")
-    machine.succeed("test -d /home/testuser/.pi")
-    # codex is opt-in and not built by default, so its host dir is NOT seeded.
+    machine.succeed("test -d /home/testuser/.omp")
+    # Codex and pi are opt-in and not built by default, so their host dirs
+    # are not seeded.
     machine.fail("test -d /home/testuser/.codex")
+    machine.fail("test -d /home/testuser/.pi")
     machine.succeed(
         "test -f /home/testuser/.local/share/cogbox/instances/default/.config/active-harnesses"
     )
@@ -126,8 +128,9 @@ with subtest("Phase A: CLI / state without booting"):
         "cat /home/testuser/.local/share/cogbox/instances/default/.config/active-harnesses"
     ).strip().splitlines()
     assert "claude-code" in active and "opencode" in active, active
-    assert "hermes-agent" in active and "pi" in active, active
+    assert "hermes-agent" in active and "omp" in active, active
     assert "codex" not in active, active
+    assert "pi" not in active, active
     # Old top-level default config must NOT be created any more.
     machine.fail("test -e /home/testuser/.config/cogbox/config.json")
     net = machine.succeed(
@@ -291,13 +294,14 @@ NIX_EOF"""))
     machine.succeed(as_user(
         "cogbox ssh 'sed -n 1p /var/lib/cogbox/work/.claude/skills/cogbox-plugins/SKILL.md | grep -qx -- ---'"
     ))
-    # The codex/pi-shared .agents/skills tree is built whenever EITHER
-    # harness is enabled (pi is, by default -- previously this tree only
-    # existed with codex opted in), and hermes's skills land inside its
-    # home overlay upper. A plugin-less brain has no rules, so no
-    # AGENTS.md digest is linked into ~/work.
     machine.succeed(as_user(
-        "cogbox ssh 'test -f /var/lib/cogbox/work/.agents/skills/cogbox-plugins/SKILL.md'"
+        "cogbox ssh 'test -f /var/lib/cogbox/work/.omp/skills/cogbox-plugins/SKILL.md'"
+    ))
+    # Hermes's skills land inside its home overlay upper. With both codex
+    # and pi disabled, their shared .agents/skills tree is omitted. A
+    # plugin-less brain has no rules, so no AGENTS.md digest is linked.
+    machine.succeed(as_user(
+        "cogbox ssh 'test ! -e /var/lib/cogbox/work/.agents/skills/cogbox-plugins/SKILL.md'"
     ))
     machine.succeed(as_user(
         "cogbox ssh 'test -f /root/.hermes/skills/cogbox-plugins/SKILL.md'"
@@ -604,7 +608,7 @@ NIX_EOF"""))
     assert rc != 0, out
     assert "does not expose cogboxPlugins.nonexistent" in out, out
 
-with subtest("Phase F: opencode harness wired into the VM (codex opt-in, excluded)"):
+with subtest("Phase F: default harnesses wired into the VM (codex/pi opt-in, excluded)"):
     boot_and_wait("cc-default", "", ssh_port=2222)
     # Built-in harness launchers are on $PATH inside the VM unconditionally
     # (D4: binaries always installed regardless of which harness has
@@ -614,10 +618,20 @@ with subtest("Phase F: opencode harness wired into the VM (codex opt-in, exclude
     assert c_path and oc_path, (c_path, oc_path)
     h_path = machine.succeed(as_user("cogbox ssh 'command -v h'")).strip()
     assert h_path, h_path
-    pi_version = machine.succeed(as_user("cogbox ssh 'p --version'")).strip()
-    assert pi_version == "0.80.10", pi_version
-    # codex is opt-in (disabled by default), so its `cx` launcher is absent.
+    om_version = machine.succeed(as_user("cogbox ssh 'om --version'")).strip()
+    assert om_version == "17.1.5", om_version
+    machine.succeed(as_user(
+        "cogbox ssh 'om auth-broker --help | grep -q \"Manage the omp auth-broker\"'"
+    ))
+    # OMP's compiled Bun runtime does not reliably discover Nix's CA store.
+    # The full-auto launcher must point it at the assembled system + L7 bundle
+    # so every OAuth provider's login/token exchange can validate TLS.
+    machine.succeed(as_user(
+        "cogbox ssh 'test \"$NODE_EXTRA_CA_CERTS\" = /run/cogbox/ca-bundle.crt'"
+    ))
+    # Codex and pi are opt-in, so their launchers are absent.
     machine.succeed(as_user("cogbox ssh '! command -v cx'"))
+    machine.succeed(as_user("cogbox ssh '! command -v p'"))
 
     # Per-harness config dirs are mounted at the expected guest paths.
     machine.succeed(as_user(
@@ -630,7 +644,7 @@ with subtest("Phase F: opencode harness wired into the VM (codex opt-in, exclude
         "cogbox ssh 'mountpoint -q /root/.hermes'"
     ))
     machine.succeed(as_user(
-        "cogbox ssh 'mountpoint -q /root/.pi'"
+        "cogbox ssh 'mountpoint -q /root/.omp'"
     ))
     # The materializer must fail closed if the Hermes overlay mount fails:
     # ordering alone is insufficient because systemd can continue after a
@@ -671,13 +685,16 @@ with subtest("Phase F: opencode harness wired into the VM (codex opt-in, exclude
     machine.succeed(as_user(
         "cogbox ssh 'test -d /var/lib/harness-rw/opencode/config/upper'"
     ))
+    machine.succeed(as_user(
+        "cogbox ssh 'test -d /var/lib/harness-rw/omp/home/upper'"
+    ))
 
-    # Persistence: write a file under opencode's config overlay, reboot,
-    # verify it survives. The sync flushes the write through overlayfs
+    # Persistence: write files under the opencode and OMP overlays, reboot,
+    # and verify both survive. The sync flushes the writes through overlayfs
     # to the ext4 overlay image; without it, SIGTERM-killed QEMU loses
     # uncommitted journal entries.
     machine.succeed(as_user(
-        "cogbox ssh 'echo persisted > /root/.config/opencode/marker && sync'"
+        "cogbox ssh 'echo persisted > /root/.config/opencode/marker && echo omp-persisted > /root/.omp/marker && sync'"
     ))
     stop_instance("cc-default")
     boot_and_wait("cc-default", "", ssh_port=2222)
@@ -685,6 +702,10 @@ with subtest("Phase F: opencode harness wired into the VM (codex opt-in, exclude
         "cogbox ssh 'cat /root/.config/opencode/marker'"
     )).strip()
     assert out == "persisted", out
+    omp_out = machine.succeed(as_user(
+        "cogbox ssh 'cat /root/.omp/marker'"
+    )).strip()
+    assert omp_out == "omp-persisted", omp_out
     stop_instance("cc-default")
 
 with subtest("Phase I: background default, console + monitor sockets, stop teardown"):

@@ -94,7 +94,7 @@ The base declares one option tree; each plugin module fills in its slice, and th
 
 ## The workdir: `~/work`
 
-`~/work` is a base-created symlink into the persisted 9p share (`/var/lib/cogbox/work`); HOME stays `/root`. It is the standardized project dir: agents and users land there (`loginShellInit` and the `c`/`oc`/`cx`/`h`/`p` launchers `cd ~/work`), it survives restarts, and it is host-visible under `~/.local/share/cogbox/instances/<name>/data/work/`.
+`~/work` is a base-created symlink into the persisted 9p share (`/var/lib/cogbox/work`); HOME stays `/root`. It is the standardized project dir: agents and users land there (`loginShellInit` and the `c`/`oc`/`om`/`cx`/`h`/`p` launchers `cd ~/work`), it survives restarts, and it is host-visible under `~/.local/share/cogbox/instances/<name>/data/work/`.
 
 At build, the base folds every plugin's merged `config.cogbox` into **one derivation** (`cogbox-brain`) laying out each enabled harness's native tree + merged config + a cogbox-authored capability **index** skill. At boot, one base-owned oneshot (modeled on `load-ssh-keys`) materializes it:
 
@@ -112,18 +112,18 @@ The base drops only **child** symlinks into real writable dirs (never a whole-di
 
 One neutral unit → each enabled harness's native layout (gated on which harnesses the instance uses):
 
-| Neutral | claude-code | opencode | codex | pi | hermes-agent |
-|---|---|---|---|---|---|
-| **skill** `<s>` | `.claude/skills/<s>/SKILL.md` | `.opencode/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` (native project discovery) | `~/.hermes/skills/<s>/SKILL.md` (VM overlay upper or container state PVC; no project discovery) |
-| **rule** `<r>` | `.claude/rules/<r>.md` (`paths:`; empty ⇒ always-on) | `instructions` glob in `opencode.json` | `AGENTS.md` digest (always-on) | `AGENTS.md` digest (always-on) | `AGENTS.md` digest (always-on) |
-| **agent** `<a>` | `.claude/agents/<a>.md` | `.opencode/agents/<a>.md` | (best-effort) | -- | -- |
-| **command** `<c>` | `.claude/commands/<c>.md` | `.opencode/commands/<c>.md` | skill `.agents/skills/<c>` | -- | -- |
-| **mcp** `<srv>` | `.mcp.json` `mcpServers` | `opencode.json` `mcp` | `config.toml` `[mcp_servers]` | -- | -- |
-| **settings** | `.claude/settings.json` | `opencode.json` | `config.toml` | -- | -- |
-| **env** | launcher env | launcher env | launcher env | launcher env | launcher env |
-| **index** | `.claude/skills/cogbox-plugins/` | `.opencode/skills/cogbox-plugins/` | `.agents/skills/cogbox-plugins/` | `.agents/skills/cogbox-plugins/` | `~/.hermes/skills/cogbox-plugins/` |
+| Neutral | claude-code | opencode | omp | codex | pi | hermes-agent |
+|---|---|---|---|---|---|---|
+| **skill** `<s>` | `.claude/skills/<s>/SKILL.md` | `.opencode/skills/<s>/SKILL.md` | `.omp/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` (native project discovery) | `~/.hermes/skills/<s>/SKILL.md` (VM overlay upper or container state PVC; no project discovery) |
+| **rule** `<r>` | `.claude/rules/<r>.md` (`paths:`; empty means always-on) | `instructions` glob in `opencode.json` | `.omp/rules/<r>.md` | `AGENTS.md` digest (always-on) | `AGENTS.md` digest (always-on) | `AGENTS.md` digest (always-on) |
+| **agent** `<a>` | `.claude/agents/<a>.md` | `.opencode/agents/<a>.md` | `.omp/agents/<a>.md` | (best-effort) | -- | -- |
+| **command** `<c>` | `.claude/commands/<c>.md` | `.opencode/commands/<c>.md` | `.omp/commands/<c>.md` | skill `.agents/skills/<c>` | -- | -- |
+| **mcp** `<srv>` | `.mcp.json` `mcpServers` | `opencode.json` `mcp` | `.omp/mcp.json` `mcpServers` | `config.toml` `[mcp_servers]` | -- | -- |
+| **settings** | `.claude/settings.json` | `opencode.json` | -- | `config.toml` | -- | -- |
+| **env** | launcher env | launcher env | launcher env | launcher env | launcher env | launcher env |
+| **index** | `.claude/skills/cogbox-plugins/` | `.opencode/skills/cogbox-plugins/` | `.omp/skills/cogbox-plugins/` | `.agents/skills/cogbox-plugins/` | `.agents/skills/cogbox-plugins/` | `~/.hermes/skills/cogbox-plugins/` |
 
-The same store copy is symlinked into each layout (no duplication). codex agent/command fidelity is best-effort (claude-only frontmatter is dropped; read-only relies on prompt + egress lockdown). codex, pi, and hermes have no native per-file rules dir, so the merged rules are concatenated into one `AGENTS.md` digest linked at `~/work/AGENTS.md` (only-if-absent, never clobbering a user file); `paths:`-scoped rules become always-on there. pi and codex share the same `.agents/skills/` tree (agentskills.io layout); hermes only loads `$HERMES_HOME/skills`, so its links go into the VM's per-instance overlay upper or the container's per-instance PVC-backed home (the host dir is untouched). pi/hermes have no plugin MCP, settings, agent, or command mapping yet.
+The same store copy is symlinked into each layout (no duplication). OMP consumes skills, rules, agents, commands, and MCP through its native project `.omp` tree. codex agent/command fidelity is best-effort (claude-only frontmatter is dropped; read-only relies on prompt + egress lockdown). codex, pi, and Hermes have no native per-file rules dir, so the merged rules are concatenated into one `AGENTS.md` digest linked at `~/work/AGENTS.md` (only-if-absent, never clobbering a user file); `paths:`-scoped rules become always-on there. pi and codex share the same `.agents/skills/` tree (agentskills.io layout); Hermes only loads `$HERMES_HOME/skills`, so its links go into the VM's per-instance overlay upper or the container's per-instance PVC-backed home (the host dir is untouched). pi/Hermes have no plugin MCP, settings, agent, or command mapping yet; OMP has no neutral settings mapping yet.
 
 ## Network rules and credential injection
 

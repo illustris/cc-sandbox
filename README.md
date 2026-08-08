@@ -11,16 +11,7 @@ Each harness's host config and auth tokens are mounted into an isolated
 QEMU guest where the agent can read, write, and run commands without
 prompting -- without that blast radius reaching the host.
 
-Currently supported harnesses: `claude-code`
-([Claude Code](https://docs.anthropic.com/en/docs/claude-code)),
-`opencode` ([opencode](https://github.com/sst/opencode)),
-`codex` ([OpenAI Codex CLI](https://github.com/openai/codex)),
-`hermes-agent` ([Hermes Agent](https://github.com/NousResearch/hermes-agent)),
-and `pi` ([pi coding agent](https://github.com/earendil-works/pi)). Codex is
-opt-in and **disabled by default** (its Rust build is slow); enable it by
-setting `enableCodex = true` in `flake.nix`. The architecture is
-harness-agnostic; see [Harnesses](docs/harnesses.md) for the model and
-how to add more.
+Currently supported harnesses: `claude-code` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)), `opencode` ([opencode](https://github.com/sst/opencode)), `omp` ([Oh My Pi](https://github.com/can1357/oh-my-pi)), `codex` ([OpenAI Codex CLI](https://github.com/openai/codex)), `hermes-agent` ([Hermes Agent](https://github.com/NousResearch/hermes-agent)), and `pi` ([pi coding agent](https://github.com/earendil-works/pi)). Codex and pi are opt-in and **disabled by default**; enable them by setting `enableCodex = true` or `enablePi = true` in `flake.nix`. The architecture is harness-agnostic; see [Harnesses](docs/harnesses.md) for the model and how to add more.
 
 ## Quick start
 
@@ -37,8 +28,8 @@ touching anything (the list reflects which harnesses were built in, so
 No harness state detected. Set up which?
   [1] claude-code     (creates ~/.claude/, ~/.claude.json)
   [2] hermes-agent     (creates ~/.hermes/)
-  [3] opencode     (creates ~/.config/opencode/, ~/.local/share/opencode/)
-  [4] pi     (creates ~/.pi/)
+  [3] omp     (creates ~/.omp/)
+  [4] opencode     (creates ~/.config/opencode/, ~/.local/share/opencode/)
   [5] all
 Choice [1-5, comma-separated for multiple]:
 
@@ -63,11 +54,7 @@ The package installs the CLI as both `cogbox` and `cbx` (a short alias
 symlink); once it's on your `PATH`, the two names are interchangeable
 (`cbx stop`, `cbx list`, ...).
 
-Each enabled harness ships a launcher inside the VM: `c` for
-`claude-code`, `oc` for `opencode`, `cx` for `codex`, `h` for
-`hermes-agent`, `p` for `pi`. Every enabled harness binary is installed
-regardless of which host-state directories you select, so once the VM
-boots its launcher is on `$PATH`.
+Each enabled harness ships a full-auto launcher inside the VM: `c` for `claude-code`, `oc` for `opencode`, `om` for `omp`, `cx` for `codex`, `h` for `hermes-agent`, and `p` for `pi`. Every enabled harness binary is installed regardless of which host-state directories you select, so once the VM boots its launcher is on `$PATH`.
 
 ## Documentation
 
@@ -736,10 +723,7 @@ explicitly.
 
 - Linux host with KVM. Build targets: `x86_64-linux`, `aarch64-linux`,
   `riscv64-linux`.
-- Per-harness platform availability varies. `claude-code`, `opencode`,
-  `codex`, `hermes-agent`, and `pi` all come from
-  `numtide/llm-agents.nix`, which builds them for `x86_64-linux` and
-  `aarch64-linux` only.
+- Per-harness platform availability varies. `claude-code`, `opencode`, `omp`, `codex`, `hermes-agent`, and `pi` all come from `numtide/llm-agents.nix`, which builds them for `x86_64-linux` and `aarch64-linux` only.
 - One instance per name at a time (PID lock per runtime directory).
   Multiple differently-named instances can run simultaneously.
 - Installed packages do not persist across VM reboots: the writable nix
