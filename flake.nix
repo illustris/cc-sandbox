@@ -589,7 +589,11 @@
 				};
 			})
 			userExt
-			({ config, pkgs, lib, utils, ... }: let
+			# `options` is taken here (not just `config`) for ONE reason: the plugin
+			# brain below has to know WHICH plugin defined each cogbox.contents root,
+			# and the merged config value has already thrown that away. Only
+			# options.cogbox.contents.definitionsWithLocations still carries it.
+			({ config, options, pkgs, lib, utils, ... }: let
 				harnesses = mkHarnesses system pkgs;
 				hermesHomeHelper = mkHermesHomeHelper pkgs;
 				cfg = config.cogbox;
@@ -1477,7 +1481,7 @@
 						# the harness's own launcher env (wins). Plugin env is launcher-
 						# scoped on purpose -- never a hard global environment.variables.
 						envParts = lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}")
-							(l7CaEnv // cfg.env // ocConfig // h.launcher.env);
+							(l7CaEnv // pluginEnv // ocConfig // h.launcher.env);
 						envStr = lib.concatStringsSep " " envParts;
 						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
 						unflaggedCommands = h.launcher.unflaggedCommands or [];
@@ -1529,34 +1533,197 @@
 					(lib.filterAttrs (n: t: t == "regular" && lib.hasSuffix ".md" n && n != "README.md")
 						(readDirSafe dir));
 
-				mergeRoots = perRoot: lib.foldl' (a: b: a // b) {} perRoot;
-				dupNames = perRoot: let
-					names = lib.concatMap lib.attrNames perRoot;
-					counts = lib.foldl' (acc: n: acc // { ${n} = (acc.${n} or 0) + 1; }) {} names;
-				in lib.attrNames (lib.filterAttrs (_: c: c > 1) counts);
+				# --- provenance: WHICH plugin contributed each cogbox.contents root ---
+				# `cogbox plugin add` renders the composition flake so every generated
+				# import is wrapped in a module stamping `_file` with the plugin's
+				# install name ("p-<name>"), and the instance's own flake with
+				# "cogbox-user" (zig/src/plugin/compose.zig). nixpkgs propagates a
+				# module's `_file` down as the fallback file of every INLINE module it
+				# imports (lib/modules.nix: loadModule passes the parent's _file to
+				# unifyModuleSyntax, which takes `_file = toString m._file or file`),
+				# and a plugin's module is a bare function out of a flake output with no
+				# _file of its own -- so the stamp reaches the option definition intact.
+				# definitionsWithLocations then hands us one { file, value } per DEFINING
+				# module: exactly the provenance the merged cfg.contents has discarded,
+				# and the reason the old collision message could name no plugin.
+				#
+				# Untagged (user = false, plugin = null) is not an error by itself; it
+				# only means that root cannot be QUALIFIED. Two ways to land there: a
+				# composition flake generated before provenance stamping existed, and a
+				# plugin that declares cogbox.contents from an imported PATH
+				# (imports = [ ./sub.nix ]), which nixpkgs files under the path itself.
+				#
+				# `user` is a separate flag rather than a reserved tag string so a
+				# plugin installed under the name "cogbox-user" cannot impersonate the
+				# instance's own flake and steal the unqualified name.
+				rootTag = file: let
+					f = toString file;
+				in if f == "cogbox-user" then { user = true; plugin = null; }
+					else if lib.hasPrefix "p-" f then { user = false; plugin = lib.removePrefix "p-" f; }
+					else { user = false; plugin = null; };
+				tagLabel = t: if t.user then "the instance's own flake"
+					else if t.plugin != null then "plugin '${t.plugin}'"
+					else "an unattributed cogbox.contents root";
+				# Identity of a tag for "this same source defined it twice" detection.
+				# null = untagged, which every caller screens out before comparing.
+				tagKey = t: if t.user then "cogbox-user"
+					else if t.plugin != null then "p-${t.plugin}" else null;
 
-				roots = cfg.contents;
-				perRootSkills   = map discoverSkills roots;
-				perRootAgents   = map (discoverMd "agents") roots;
-				perRootCommands = map (discoverMd "commands") roots;
-				perRootRules    = map (discoverMd "rules") roots;
+				# The contents roots in merge order, each carrying its tag. Rebuilt from
+				# the definitions rather than read off cfg.contents because only the
+				# definitions know the provenance; this flattening reproduces
+				# cfg.contents exactly. `coercedTo path (p: [p])` runs at MERGE time, so
+				# a definition's `value` is whatever the author wrote -- a bare path or
+				# a list -- and both must be coerced here. mkIf/mkMerge are already
+				# discharged by the time definitionsWithLocations is built, so no
+				# property wrapper arrives; any other unexpected shape degrades to a
+				# one-element untagged root rather than throwing.
+				taggedRoots = lib.concatMap (d: let
+					vs = if builtins.isList d.value then d.value else [ d.value ];
+					tag = rootTag d.file;
+				in map (r: { root = r; inherit tag; }) vs)
+					options.cogbox.contents.definitionsWithLocations;
+				# [ { tag; units = { name -> path }; } ], one entry per root.
+				perRootTagged = discover: map (r: { inherit (r) tag; units = discover r.root; }) taggedRoots;
+
+				# The generated capability index is linked in under this skill name
+				# (indexSkill below, `ln -s ... $out/claude/skills/cogbox-plugins`), so
+				# a plugin shipping a skill by that name used to fail as a bare
+				# "ln: File exists" naming nobody. Skills only: no other unit kind gets
+				# an index leaf.
+				reservedSkillName = "cogbox-plugins";
+
+				# Resolve one unit kind's DISCOVERED names across all contents roots.
+				# Plugins live in independently-owned repos and are installed in
+				# arbitrary combinations, so "pick globally unique names" is not an
+				# invariant any author can uphold -- two plugins each shipping a skill
+				# called `overview` is normal, not a bug. cogbox therefore disambiguates
+				# instead of refusing to build: every colliding PLUGIN copy is renamed
+				# to "<plugin>-<unit>" and both stay installed. The instance's own flake
+				# is the one root cogbox will not rename behind the user's back, so it
+				# keeps the bare name when it is one of the colliders.
+				#
+				# Returns { units; owners; sources; collisions; }: the name -> path map
+				# the brain materializes, per-final-name plugin attribution and the
+				# ORIGINAL source path (both for the index), and the list of messages
+				# for what could NOT be resolved. `units` throws that list; `collisions`
+				# does not, so a check can assert on the text a user will see.
+				resolveKind = kind: perRootList: let
+					# name -> [ { tag; path; } ], in root order.
+					byName = lib.zipAttrs (map (r: lib.mapAttrs (_: path: { inherit (r) tag; inherit path; }) r.units) perRootList);
+
+					step = name: providers: let
+						labels = map (x: tagLabel x.tag) providers;
+						keys = map (x: tagKey x.tag) providers;
+						# Tags that appear more than once: one source defining the same
+						# name from two of its own roots. Nothing distinguishes the two
+						# copies, so this is the genuine residue.
+						dupKeys = lib.unique (lib.filter (k: k != null && lib.count (x: x == k) keys > 1) keys);
+						dupLabels = lib.unique (map (x: tagLabel x.tag)
+							(lib.filter (x: lib.elem (tagKey x.tag) dupKeys) providers));
+						qualify = x: if x.tag.user
+							# The user's own content is never renamed behind their back.
+							then { final = name; orig = name; qualified = false; src = x.path; path = x.path; inherit (x) tag; }
+							else let q = "${x.tag.plugin}-${name}"; in
+								{ final = q; orig = name; qualified = true; src = x.path;
+									path = qualifiedUnit "${kind} '${name}' from ${tagLabel x.tag}" q x.path; inherit (x) tag; };
+					in
+						if kind == "skill" && name == reservedSkillName then {
+							entries = [];
+							collisions = [ "cogbox: ${kind} '${name}' (from ${lib.concatStringsSep ", " labels}) uses the name cogbox reserves for its own generated capability index. Rename that ${kind} in the plugin, or place it under a different name with cogbox.${kind}s." ];
+						}
+						else if builtins.length providers == 1 then {
+							# The overwhelmingly common case. Pass the discovered store
+							# path straight through: bare name, bare symlink, no copy
+							# derivation -- so the brain out-path stays byte-identical to
+							# what it was before this pass existed. The container
+							# prebuild and the container boot rebuild must agree on it.
+							entries = [ (let x = builtins.head providers; in
+								{ final = name; orig = name; qualified = false; src = x.path; path = x.path; inherit (x) tag; }) ];
+							collisions = [];
+						}
+						else if lib.any (k: k == null) keys then {
+							entries = [];
+							collisions = [ "cogbox: ${kind} '${name}' is provided by ${toString (builtins.length providers)} cogbox.contents roots (${lib.concatStringsSep ", " labels}), at least one of which cogbox cannot attribute to a plugin -- so it cannot tell the copies apart to qualify them. Rename the ${kind} in one of those roots, or set cogbox.${kind}s explicitly. (A root is unattributed when it comes from the instance's own flake outside a plugin composition; when the composition flake predates provenance stamping, which any 'cogbox plugin add/del/update' regenerates; or when the plugin declares cogbox.contents from an imported file, imports = [ ./sub.nix ].)" ];
+						}
+						else if dupKeys != [] then {
+							entries = [];
+							collisions = [ "cogbox: ${lib.concatStringsSep " and " dupLabels} provides ${kind} '${name}' from more than one of its own cogbox.contents roots. cogbox can only disambiguate ACROSS plugins, never inside one: rename one of the two copies, or set cogbox.${kind}s.\"<new-name>\" explicitly to place it." ];
+						}
+						else { entries = map qualify providers; collisions = []; };
+
+					steps = lib.mapAttrsToList step byName;
+					entries = lib.concatMap (s: s.entries) steps;
+					# A qualified "<plugin>-<unit>" can land on a name that is already
+					# taken -- plugin 'a' shipping a skill literally called
+					# `b-overview` while plugins 'b' and 'c' both ship `overview`.
+					# Group by FINAL name and refuse any group with more than one
+					# member: silently last-wins here would reintroduce exactly the
+					# failure mode this pass exists to remove.
+					byFinal = lib.zipAttrs (map (e: { ${e.final} = e; }) entries);
+					takenErrors = lib.concatLists (lib.mapAttrsToList (n: es:
+						lib.optional (builtins.length es > 1)
+							"cogbox: ${kind} name '${n}' is claimed twice: ${lib.concatStringsSep "; " (map (e:
+								"${tagLabel e.tag} provides ${if e.qualified then "'${e.orig}', which cogbox qualified to '${n}' because '${e.orig}' collides across plugins" else "'${n}'"}") es)}. The qualified name is unavailable, so rename the ${kind} in one of them or set cogbox.${kind}s explicitly."
+					) byFinal);
+					# The reserved index name is reachable by QUALIFICATION too, and the
+					# discovered-name test in `step` cannot see that: a plugin installed
+					# as `cogbox` shipping `skills/plugins` becomes `cogbox-plugins` the
+					# moment any second plugin also ships `plugins`. Both finals are then
+					# unique, so `takenErrors` stays empty, and the brain build dies on a
+					# bare `ln`/`cp` error under $out/claude/skills/cogbox-plugins naming
+					# neither plugin nor unit -- `cogbox init` non-zero on the VM path,
+					# which is precisely the wedge this pass exists to remove.
+					reservedErrors = lib.optionals (kind == "skill") (lib.concatLists (lib.mapAttrsToList (n: es:
+						lib.optional (n == reservedSkillName)
+							"cogbox: ${kind} '${(builtins.head es).orig}' (from ${lib.concatStringsSep ", " (map (e: tagLabel e.tag) es)}) qualifies to '${n}', which is the name cogbox reserves for its own generated capability index. Rename that ${kind} in the plugin, or place it under a different name with cogbox.${kind}s."
+					) byFinal));
+					collisions = lib.concatMap (s: s.collisions) steps ++ takenErrors ++ reservedErrors;
+				in {
+					inherit collisions;
+					units = lib.throwIf (collisions != []) (lib.concatStringsSep "\n" collisions)
+						(lib.listToAttrs (map (e: lib.nameValuePair e.final e.path) entries));
+					owners = lib.listToAttrs (map (e: lib.nameValuePair e.final (if e.tag.plugin != null then e.tag.plugin else "-")) entries);
+					sources = lib.listToAttrs (map (e: lib.nameValuePair e.final e.src) entries);
+				};
+
+				resolvedSkills   = resolveKind "skill"   (perRootTagged discoverSkills);
+				resolvedAgents   = resolveKind "agent"   (perRootTagged (discoverMd "agents"));
+				resolvedCommands = resolveKind "command" (perRootTagged (discoverMd "commands"));
+				resolvedRules    = resolveKind "rule"    (perRootTagged (discoverMd "rules"));
 
 				# Explicit cogbox.{skills,...} compose on top of (and override) a
 				# discovered unit of the same name -- explicit is the more
-				# intentional declaration.
-				skills   = mergeRoots perRootSkills   // cfg.skills;
-				agents   = mergeRoots perRootAgents   // cfg.agents;
-				commands = mergeRoots perRootCommands // cfg.commands;
-				rules    = mergeRoots perRootRules    // cfg.rules;
+				# intentional declaration. Applied AFTER qualification, so an author can
+				# target either the bare name or a qualified "<plugin>-<unit>".
+				skills   = resolvedSkills.units   // cfg.skills;
+				agents   = resolvedAgents.units   // cfg.agents;
+				commands = resolvedCommands.units // cfg.commands;
+				rules    = resolvedRules.units    // cfg.rules;
 
-				# Discovered-name collisions ACROSS contents roots (the base owns the
-				# readDir merge, so it must catch these; explicit-name collisions are
-				# caught for free by the module system's attrsOf merge).
-				discoveredCollisions =
-					(map (n: "skill '${n}'")   (dupNames perRootSkills))
-					++ (map (n: "agent '${n}'")   (dupNames perRootAgents))
-					++ (map (n: "command '${n}'") (dupNames perRootCommands))
-					++ (map (n: "rule '${n}'")    (dupNames perRootRules));
+				# Every unresolvable-collision message, exposed (below) as a build
+				# attribute. Forcing any of the four bindings above throws these; this
+				# list is the same text WITHOUT the throw, which is the only way a
+				# check can assert on the message a user actually gets.
+				brainCollisions = resolvedSkills.collisions ++ resolvedAgents.collisions
+					++ resolvedCommands.collisions ++ resolvedRules.collisions;
+
+				# cogbox.env deliberately gets NO cross-plugin resolution: an env var's
+				# name IS its meaning, so qualifying it would only break the consumer.
+				# Two plugins setting one key to DIFFERENT values already fails loudly
+				# (attrsOf str merges with mergeEqualOption -- and the _file stamps
+				# above now make that nixpkgs error name the plugins instead of two
+				# anonymous store paths). What stays silent is a PRIORITY-resolved
+				# override: one plugin's lib.mkDefault quietly losing to another's plain
+				# definition. Warn whenever a key comes from more than one source.
+				envDupKeys = let
+					perKeyFiles = lib.zipAttrs (lib.concatMap (d:
+						map (k: { ${k} = toString d.file; }) (lib.attrNames d.value))
+						options.cogbox.env.definitionsWithLocations);
+				in lib.attrNames (lib.filterAttrs (_: files: lib.length (lib.unique files) > 1) perKeyFiles);
+				pluginEnv = lib.warnIf (envDupKeys != [])
+					"cogbox: env var(s) ${lib.concatStringsSep ", " envDupKeys} are defined by more than one cogbox.env source; the highest-priority definition wins silently (cogbox never qualifies env var names)."
+					cfg.env;
 
 				# --- minimal YAML-frontmatter reader (for the index + codex). Pure
 				#     readFile over store paths; only flat `key: value` lines. ---
@@ -1642,8 +1809,16 @@
 				ompMcpJson = jsonFmt.generate "mcp.json" { mcpServers = ompMcp; };
 
 				# --- the cogbox-authored capability index (the only always-on text) ---
-				indexRows = lib.mapAttrsToList (n: p:
-					"| `${n}` | ${sanitize ((fmOf (p + "/SKILL.md")).description or "")} |") skills;
+				# Descriptions are read from the ORIGINAL discovered path, never from a
+				# qualified copy: the copy is a derivation, and readFile-ing one would
+				# turn this eval into import-from-derivation -- which the offline
+				# container boot rebuild cannot do. An explicit cogbox.skills entry
+				# overrides discovery, so it supplies its own path and a blank plugin
+				# column (cogbox knows no plugin for it).
+				indexSkillSrc = resolvedSkills.sources // cfg.skills;
+				indexSkillOwner = n: if cfg.skills ? ${n} then "-" else (resolvedSkills.owners.${n} or "-");
+				indexRows = lib.mapAttrsToList (n: _:
+					"| `${n}` | ${indexSkillOwner n} | ${sanitize ((fmOf (indexSkillSrc.${n} + "/SKILL.md")).description or "")} |") skills;
 				# Built as an explicit line list (NOT a '' here-string): a SKILL.md
 				# whose `---` frontmatter is not at column 0 is not recognized by the
 				# harness, and '' dedent leaves stray leading tabs.
@@ -1657,13 +1832,142 @@
 					""
 					"Plugin-provided skills available in this sandbox. Load a skill by relevance before answering domain questions in its area."
 					""
-					"| skill | description |"
-					"|---|---|"
+					"| skill | plugin | description |"
+					"|---|---|---|"
 				] ++ indexRows) + "\n");
 
 				# --- the materialized brain derivation (RO store leaves) ---
 				linkInto = dir: ext: attrs: lib.concatStringsSep "\n"
 					(lib.mapAttrsToList (n: p: ''ln -s ${p} "${dir}/${n}${ext}"'') attrs);
+				# Copy a unit under a QUALIFIED name, rewriting its frontmatter `name:`
+				# to match. A copy, not a symlink, because the leaf's own content has to
+				# change: docs/plugins.md requires a skill's frontmatter name to equal
+				# its directory name (opencode enforces it), and claude-code keys its
+				# agents on the frontmatter name too -- a qualified unit still carrying
+				# the bare name in its frontmatter would collide again inside the
+				# harness, one layer down from where cogbox just fixed it.
+				#
+				# Only the LEADING `---` block is touched (a `name:` line further down
+				# is prose, not metadata) and only when that block already has one, so
+				# this never invents frontmatter a plugin chose not to ship.
+				#
+				# A pure function of (newName, src) with a fixed derivation name, so the
+				# container prebuild and the container boot rebuild produce the same
+				# out-path -- the byte-identical-brain rule below. runCommandLocal (not
+				# runCommand) keeps it buildable in the egress-less sandbox.
+				#
+				# `what` names the unit and its plugin ("skill 'overview' from plugin
+				# 'a'"). It is only used when the rewrite CANNOT be carried out, which
+				# has to fail loudly rather than ship a copy still declaring the bare
+				# name: that would reintroduce the collision one layer down, inside the
+				# harness, with nothing said anywhere.
+				qualifiedUnit = what: newName: src: pkgs.runCommandLocal "cogbox-unit-${newName}" {} ''
+					what=${lib.escapeShellArg what}
+					# The delimiter and the key are matched with exactly the whitespace
+					# tolerance cogbox's own frontmatter reader has (fmOf trims around
+					# both halves of `key: value`). Byte-exact matching silently skipped
+					# a plugin authored on Windows -- line 1 is `---\r`, never `---`, so
+					# `fm` was never set and the `name:` line was never reached -- and
+					# the qualified copy shipped with the ORIGINAL name in it.
+					fm_name() {  # $1 = markdown file -> the leading block's `name:`, or ""
+						awk '
+							NR == 1 && !/^---[[:space:]]*$/ { exit }
+							NR == 1                         { next }
+							/^---[[:space:]]*$/             { exit }
+							/^[[:space:]]*name[[:space:]]*:/ {
+								sub(/^[[:space:]]*name[[:space:]]*:[[:space:]]*/, "")
+								sub(/[[:space:]]+$/, "")
+								print; exit
+							}
+						' "$1"
+					}
+					rewrite_fm() {  # $1 = markdown file (rewritten in place), $2 = new name
+						awk -v n="$2" '
+							NR == 1 && /^---[[:space:]]*$/   { fm = 1; print; next }
+							fm && /^---[[:space:]]*$/        { fm = 0; print; next }
+							fm && !done && /^[[:space:]]*name[[:space:]]*:/ { print "name: " n; done = 1; next }
+							{ print }
+						' "$1" > "$1.new"
+						mv "$1.new" "$1"
+						# Belt and braces, and the reason the recognizers above are not
+						# left to speak for themselves: if a leading block still declares
+						# some other name, this rewriter has met a shape it does not
+						# understand. Refuse the build -- with the plugin and the unit in
+						# the message, the same contract every other residue keeps --
+						# rather than ship a copy whose frontmatter contradicts its name.
+						got=$(fm_name "$1")
+						if [ -n "$got" ] && [ "$got" != "$2" ]; then
+							echo "cogbox: $what could not be qualified to '$2': its frontmatter still declares 'name: $got'. Rename it in the plugin, or place it under a different name with cogbox.skills/agents/commands/rules." >&2
+							exit 1
+						fi
+					}
+					if [ -d ${src} ]; then
+						# A skill is a DIRECTORY; its new directory name comes from the
+						# symlink linkInto creates, so only SKILL.md needs rewriting.
+						#
+						# Copied STRUCTURE-PRESERVING (no -L). A skill tree may carry a
+						# symlink that does not resolve inside the build sandbox -- a
+						# relative link pointing out of the tree, an absolute link to a
+						# host path -- and dereferencing aborts the whole derivation with
+						# a `cp: cannot stat` naming neither plugin nor unit, i.e. turns
+						# a plugin PAIR into a failed boot. Those links were already
+						# dangling before qualification (linkInto symlinked the directory
+						# and never followed them), so copying them through leaves them
+						# exactly as broken as they were and no worse.
+						#
+						# What the flat copy DOES cost, stated honestly: a link that stays
+						# inside the skill tree keeps working, but one that ESCAPES the
+						# skill directory (`../shared/SKILL.md`, a repo sharing one text
+						# between skill variants) does not. `$out` sits at the top of the
+						# store, not under <contents>/skills/, so an escaping link points
+						# somewhere else entirely here. That is a REGRESSION against the
+						# un-qualified path for payload files, which linked the discovered
+						# directory in place and left such a link resolving; qualification
+						# has to copy, so it is the price of resolving the collision at
+						# all. SKILL.md does not pay it -- it is re-materialized below.
+						cp -r ${src} $out
+						chmod -R u+w $out
+						# The one file whose CONTENT this derivation changes, taken from
+						# the SOURCE rather than read back out of the copy above.
+						# --remove-destination because the copied leaf may itself be a
+						# now-dangling symlink, which cp would otherwise follow.
+						#
+						# Whether that source read succeeds depends on how the contents
+						# root reached the build, and BOTH outcomes are correct:
+						#   - a store TREE (what a flake input or a `path:` plugin source
+						#     produces -- one store path holding the whole repo): the link
+						#     still resolves at its original depth, so the qualified copy
+						#     gets a real file and the rewrite below;
+						#   - a bare path LITERAL: nix copies each discovered leaf
+						#     DIRECTORY to the store on its own, so the link points
+						#     outside its store path and cannot be read at all.
+						#
+						# Then rewrite UNCONDITIONALLY, and refuse when the read failed.
+						# Testing `[ -f $out/SKILL.md ]` first is what made both cases
+						# silent: the test was false, so neither the rewrite nor its
+						# fm_name assertion ran, and cogbox shipped a `<plugin>-<unit>/`
+						# whose SKILL.md dangled -- a skill the harness cannot read at all,
+						# still advertised by description in the generated index.
+						# discoverSkills only accepts a directory whose SKILL.md
+						# pathExists (resolved in the plugin's own tree), so a leaf that
+						# cannot be read HERE is genuinely unreadable, and that is a
+						# legitimate hard failure -- named, like every other residue,
+						# rather than skipped.
+						cp -L --remove-destination ${src}/SKILL.md $out/SKILL.md || {
+							echo "cogbox: $what could not be qualified to '${newName}': its SKILL.md cannot be read (a link resolving nowhere inside the build, or not a file). Fix it in the plugin, or place that skill under a different name with cogbox.skills." >&2
+							exit 1
+						}
+						chmod u+w $out/SKILL.md
+						rewrite_fm $out/SKILL.md "${newName}"
+					else
+						# agent/command/rule: a single .md file IS the unit. discoverMd
+						# only accepts a `regular` readDir entry, so this side is never
+						# handed a symlink and -L is safe here.
+						cp -L ${src} $out
+						chmod u+w $out
+						rewrite_fm $out "${newName}"
+					fi
+				'';
 				# Plugin-contributed tools, merged into one bin/ tree. Fixed name so the
 				# out-path is a pure function of cfg.packages -- the container prebuild
 				# and boot rebuild must produce a byte-identical cogbox-brain out-path
@@ -1810,8 +2114,35 @@
 								printf 'time=%s reason=%s narinfos=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" no-out-path "$nnar" > "$icd/brain.fallback" || true
 							fi
 						else
-							echo "cogbox-brain: rebuild failed; using baked base brain (see prior nix log; plugin-cache narinfos: $nnar, 0 = worker seed never populated the cache)" >&2
-							printf 'time=%s reason=%s narinfos=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" rebuild-failed "$nnar" > "$icd/brain.fallback" || true
+							# WHY A SECOND EVAL ON THE FAILURE PATH. An unresolvable
+							# unit-name collision makes cogboxBrain THROW, so the build
+							# above fails and this branch keeps the image's plugin-less
+							# BASE brain: the sandbox boots green with no plugin skills,
+							# agents, commands, rules or $out/bin tools at all. On the VM
+							# path the same composition refuses to boot and says why; a
+							# container must not degrade that far in silence.
+							# cogboxBrainCollisions is the same message list WITHOUT the
+							# throw, so it still evaluates here -- and it is the only
+							# thing that names the plugins and the unit. Same overrides,
+							# same offline constraint, and empty for every other cause
+							# (offline, cold plugin-cache, a plugin's own eval error),
+							# which keeps those on the generic line below.
+							cmsg=$(${pkgs.nix}/bin/nix eval --raw \
+									--extra-experimental-features "nix-command flakes" \
+									"''${subst[@]}" \
+									--override-input userExtensions "path:$icd/plugins-flake" \
+									--override-input userExtensions/user/nixpkgs "path:${nixpkgs}" \
+									--apply 'c: builtins.concatStringsSep "\n" c' \
+									"path:${self}#nixosConfigurations.${configName system}-container.config.system.build.cogboxBrainCollisions" 2>/dev/null || true)
+							if [ -n "$cmsg" ]; then
+								echo "cogbox-brain: this instance's plugin set cannot be composed, so the sandbox is starting WITHOUT any plugin content:" >&2
+								printf '%s\n' "$cmsg" >&2
+								{ printf 'time=%s reason=%s narinfos=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" unit-name-collision "$nnar"
+									printf '%s\n' "$cmsg"; } > "$icd/brain.fallback" || true
+							else
+								echo "cogbox-brain: rebuild failed; using baked base brain (see prior nix log; plugin-cache narinfos: $nnar, 0 = worker seed never populated the cache)" >&2
+								printf 'time=%s reason=%s narinfos=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" rebuild-failed "$nnar" > "$icd/brain.fallback" || true
+							fi
 						fi
 					else
 						# No plugin composition -> the baked base brain IS the correct
@@ -2091,15 +2422,14 @@
 			in {
 				nixpkgs.config.allowUnfree = true;
 
-				# Discovered-unit name collisions across cogbox.contents roots fail
-				# the build, plugin-agnostically attributed. (Explicit-name
-				# collisions across plugins are caught for free by the module
-				# system's attrsOf merge; the add-time lint pre-empts both.)
-				assertions = (map (c: {
-					assertion = false;
-					message = "cogbox: duplicate discovered ${c} across cogbox.contents roots; rename one (units share a flat namespace) or use an explicit cogbox.* override.";
-				}) discoveredCollisions)
-				++ lib.optional (mcpViolations != []) {
+				# Discovered-unit name collisions are NOT asserted here: resolveKind
+				# throws them from inside the skills/agents/commands/rules bindings
+				# instead. config.assertions only fire through system.build.toplevel,
+				# which the VM path forces but the container's boot-time brain rebuild
+				# does not (it builds system.build.cogboxBrain) -- so the same collision
+				# used to hard-fail a microVM and silently last-wins on a container.
+				# One mechanism, both backends, and the error arrives earlier.
+				assertions = lib.optional (mcpViolations != []) {
 					assertion = false;
 					message = "cogbox.mcp servers may only set command/args/env/url/headers; rejected: ${lib.concatStringsSep ", " mcpViolations}. MCP auth goes through host-side inject, never inline.";
 				};
@@ -2397,6 +2727,17 @@
 				# exact mechanism cogbox-launch.sh uses to fold per-instance plugins
 				# into the VM runner.
 				system.build.cogboxBrain = cogbox-brain;
+				# The unresolvable-collision messages, WITHOUT the throw that
+				# cogboxBrain carries. Forcing the brain is the user-facing failure;
+				# forcing this list is how a check reads the exact text that failure
+				# prints (builtins.tryEval reports that an eval threw, never why).
+				system.build.cogboxBrainCollisions = brainCollisions;
+				# The resolved unit -> path maps, keyed by FINAL (possibly qualified)
+				# name. The brain swallows them whole, so this is the only handle a
+				# check has on ONE qualified copy -- specifically on a copy that must
+				# REFUSE to build, which is a builder failure rather than an eval
+				# throw and therefore invisible to cogboxBrainCollisions.
+				system.build.cogboxBrainUnits = { inherit skills agents commands rules; };
 
 				microvm = lib.mkIf isVm {
 					writableStoreOverlay = "/nix/.rw-store";
@@ -5069,6 +5410,200 @@
 					echo "FAIL: brain-materialize rebuilds via the VM config (microvm force-fetch regression)" >&2
 					exit 1
 				fi
+				touch $out
+			'';
+
+			# CROSS-PLUGIN UNIT-NAME COLLISIONS RESOLVE, they do not brick the box.
+			#
+			# WHY THIS NEEDS A CHECK. Plugins live in independently-owned repos and are
+			# installed in arbitrary combinations, so no author can see what their
+			# skill names will be paired with -- two plugins each shipping
+			# skills/overview is normal. Under the old hard assertion that composition
+			# did not EVALUATE, so the guest system could not be built at all: `cogbox
+				# init` exited non-zero, the supervisor restart-looped, and the real Nix
+			# error stayed inside the VM's journal where nobody could see it. The
+			# failure surface was a sandbox stuck "Booting" forever.
+			#
+			# Asserted on a real brain BUILD (the leaf layout and the rewritten
+			# frontmatter are the actual guest-visible artifacts), and, for the residue
+			# cogbox still cannot resolve, on the MESSAGE rather than merely on the
+			# fact that something threw -- "fail to boot, but say why" is the whole
+			# point of the residue path.
+			brain-unit-name-collisions = let
+				# The fixtures live HERE rather than in nixosConfigurations for one
+				# reason: two of them must not evaluate, and `nix flake check`
+				# evaluates every nixosConfigurations entry's toplevel -- an
+				# intentionally-throwing config published there would fail the whole
+				# flake check. Each wraps its contents root in exactly the
+				# `_file`-stamped module `cogbox plugin add` renders into the
+				# per-instance composition flake (zig/src/plugin/compose.zig), so these
+				# exercise the real provenance path rather than a stand-in for it.
+				# CONTAINER configs: cogboxBrain is target-independent, and the
+				# container is the cheaper of the two targets to evaluate.
+				collideFixture = imports: (mkContainer system "cogbox" {
+					extraModules = cogboxModules system { target = "container"; userExt.imports = imports; };
+				}).config.system.build;
+				# Three independently-owned plugins, each shipping skills/overview (a
+				# and b also ship agents/triage): every copy is qualified, all stay
+				# usable. Root `c` is the awkward-but-legal shape a real plugin repo
+				# reaches sooner or later -- a SKILL.md with CRLF line endings, and a
+				# symlink inside the skill directory that does not resolve in the
+				# store -- because both of those used to be silent wrong answers:
+				# a copy that kept the bare name in its frontmatter, and a `cp -L`
+				# that aborted the whole brain build naming neither plugin nor unit.
+				resolved = (collideFixture [
+					{ _file = "p-a"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/a; }) ]; }
+					{ _file = "p-b"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/b; }) ]; }
+					{ _file = "p-c"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/c; }) ]; }
+				]).cogboxBrain;
+				# Root `d` ships a SKILL.md that is itself a relative symlink ESCAPING
+				# its skill directory -- how a repo shares one text between several
+				# skill variants. Discovery accepts it either way (pathExists resolves
+				# it in the plugin's own tree), and what the qualified copy can then do
+				# with it depends on how that tree reaches the build, so BOTH shapes
+				# are pinned. `contents` as a store TREE (what a flake input or a
+				# `path:` plugin source actually produces: one store path holding the
+				# whole repo) keeps the link resolvable at the source, so the leaf is
+				# re-materialized from there and gets its rewrite:
+				escapingTree = (collideFixture [
+					{ _file = "p-a"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/a; }) ]; }
+					{ _file = "p-d"; imports = [ ({ ... }: { cogbox.contents = "${./tests/fixtures/brain-collide/d}"; }) ]; }
+				]).cogboxBrain;
+				# ...whereas a bare path literal makes nix copy each discovered leaf
+				# DIRECTORY to the store on its own, so the same link points outside
+				# its store path and the leaf cannot be read at all. That is the
+				# genuinely-unreadable case, and it must be refused by name instead of
+				# shipping a qualified skill whose SKILL.md dangles while the generated
+				# index still advertises its description. A BUILDER refusal, not an
+				# eval throw, so cogboxBrainCollisions/mustThrow cannot see it: it is
+				# asserted with testers.testBuildFailure against the one unit
+				# derivation, reached through system.build.cogboxBrainUnits.
+				escapingAlone = pkgs.testers.testBuildFailure (collideFixture [
+					{ _file = "p-a"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/a; }) ]; }
+					{ _file = "p-d"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/d; }) ]; }
+				]).cogboxBrainUnits.skills."d-overview";
+				# Same collision, but one side is the instance's OWN flake.
+				userWins = (collideFixture [
+					{ _file = "cogbox-user"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/a; }) ]; }
+					{ _file = "p-b"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/b; }) ]; }
+				]).cogboxBrain;
+				# Residue: ONE plugin providing the same unit from two of its own
+				# roots. Nothing distinguishes the copies, so this must still fail.
+				sameTag = collideFixture [
+					{ _file = "p-a"; imports = [ ({ ... }: { cogbox.contents = [
+						./tests/fixtures/brain-collide/a
+						./tests/fixtures/brain-collide/b
+					]; }) ]; }
+				];
+				# Residue: a plugin squatting on the reserved index name.
+				reserved = collideFixture [
+					{ _file = "p-a"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/reserved; }) ]; }
+				];
+				# Residue: the reserved name reached by QUALIFICATION rather than by
+				# discovery. Neither plugin ships `cogbox-plugins`; both ship
+				# `plugins`, and the one installed as `cogbox` qualifies onto the
+				# index's own leaf. Nothing in the discovered-name pass can see this.
+				reservedQual = collideFixture [
+					{ _file = "p-cogbox"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/reserved-qual-a; }) ]; }
+					{ _file = "p-other"; imports = [ ({ ... }: { cogbox.contents = ./tests/fixtures/brain-collide/reserved-qual-b; }) ]; }
+				];
+				# builtins.tryEval reports THAT an eval threw and never why, so the
+				# text is read off system.build.cogboxBrainCollisions -- the same
+				# strings the throw carries, without the throw.
+				evalFails = b: !(builtins.tryEval (builtins.seq b.cogboxBrain.drvPath null)).success;
+				mustThrow = what: b: lib.optionalString (!(evalFails b)) ''
+					echo "FAIL: ${what} must refuse to evaluate, but the brain built" >&2
+					exit 1
+				'';
+			in pkgs.runCommand "cogbox-brain-unit-name-collisions" {
+				sameTagMsg = lib.concatStringsSep "\n" sameTag.cogboxBrainCollisions;
+				reservedMsg = lib.concatStringsSep "\n" reserved.cogboxBrainCollisions;
+				reservedQualMsg = lib.concatStringsSep "\n" reservedQual.cogboxBrainCollisions;
+			} ''
+				fail() { echo "FAIL: $1" >&2; exit 1; }
+
+				# (1) two PLUGIN roots ship the same names -> every copy is qualified,
+				#     both stay usable, and NEITHER keeps the bare name.
+				s=${resolved}/claude/skills
+				[ -e "$s/a-overview/SKILL.md" ] || fail "a-overview missing from the brain"
+				[ -e "$s/b-overview/SKILL.md" ] || fail "b-overview missing from the brain"
+				[ -e "$s/overview" ] && fail "bare 'overview' survived a cross-plugin collision"
+				grep -qx 'name: a-overview' "$s/a-overview/SKILL.md" || fail "a-overview frontmatter name not rewritten"
+				grep -qx 'name: b-overview' "$s/b-overview/SKILL.md" || fail "b-overview frontmatter name not rewritten"
+				# The single-file unit kind (agent) takes the other qualifiedUnit branch.
+				g=${resolved}/claude/agents
+				[ -e "$g/a-triage.md" ] || fail "a-triage.md missing from the brain"
+				[ -e "$g/b-triage.md" ] || fail "b-triage.md missing from the brain"
+				[ -e "$g/triage.md" ] && fail "bare 'triage.md' survived a cross-plugin collision"
+				grep -qx 'name: a-triage' "$g/a-triage.md" || fail "a-triage frontmatter name not rewritten"
+				# Only the LEADING '---' block is metadata: a 'name:' line in the body
+				# must come through untouched.
+				grep -qx 'name: not-metadata' "$g/a-triage.md" || fail "body 'name:' line was rewritten"
+				# The index gained a plugin column and attributes each qualified skill.
+				i=$s/cogbox-plugins/SKILL.md
+				grep -q '^| skill | plugin | description |$' "$i" || fail "index header has no plugin column"
+				grep -q '^| `a-overview` | a |' "$i" || fail "index does not attribute a-overview to plugin a"
+				grep -q '^| `b-overview` | b |' "$i" || fail "index does not attribute b-overview to plugin b"
+
+				# (1b) the awkward-but-legal plugin tree. A CRLF SKILL.md must still
+				# get its frontmatter name rewritten (matching only the byte-exact
+				# '---' delimiter silently shipped the bare name), and a symlink that
+				# does not resolve must be copied THROUGH rather than dereferenced
+				# (which aborted the whole brain build with a `cp: cannot stat`).
+				[ -e "$s/c-overview/SKILL.md" ] || fail "c-overview missing from the brain"
+				grep -qx 'name: c-overview' "$s/c-overview/SKILL.md" || fail "CRLF skill frontmatter name not rewritten"
+				[ -L "$s/c-overview/data.json" ] || fail "unresolvable symlink was not copied through as a symlink"
+
+				# (1c) a SKILL.md that IS a relative symlink escaping its skill
+				# directory. The tree is still copied flat, so that link dangles in
+				# the copy; the leaf is re-materialized from the source instead. It
+				# must arrive as a REAL FILE carrying the QUALIFIED name -- reading it
+				# back out of the flat copy left a `d-overview/` whose SKILL.md
+				# dangled, with the rewrite and its frontmatter assertion both skipped
+				# and nothing said anywhere.
+				l=${escapingTree}/claude/skills
+				[ -f "$l/d-overview/SKILL.md" ] || fail "d-overview/SKILL.md is not a readable file"
+				grep -qx 'name: d-overview' "$l/d-overview/SKILL.md" || fail "symlinked SKILL.md frontmatter name not rewritten"
+				# ...and when the same link cannot be read at all, the unit refuses to
+				# build, naming the plugin and the unit like every other residue.
+				grep -q "cogbox: skill 'overview' from plugin 'd' could not be qualified to 'd-overview'" \
+					${escapingAlone}/testBuildFailure.log \
+					|| fail "an unreadable SKILL.md was not refused by name"
+				[ "$(cat ${escapingAlone}/testBuildFailure.exit)" != 0 ] || fail "an unreadable SKILL.md built anyway"
+
+				# (2) the instance's own flake is never renamed behind the user's back.
+				u=${userWins}/claude/skills
+				[ -e "$u/overview/SKILL.md" ] || fail "user root lost the bare 'overview'"
+				[ -e "$u/b-overview/SKILL.md" ] || fail "plugin copy b-overview missing"
+				[ -e "$u/a-overview" ] && fail "user root was qualified"
+				grep -qx 'name: overview' "$u/overview/SKILL.md" || fail "user skill frontmatter was rewritten"
+
+				# (3) residue: one plugin, two of its own roots -> throws, and the
+				#     message names the plugin and the unit.
+				${mustThrow "a same-plugin duplicate" sameTag}
+				printf '%s\n' "$sameTagMsg" > same.txt
+				grep -q "plugin 'a'" same.txt || fail "same-plugin message does not name the plugin"
+				grep -q "skill 'overview'" same.txt || fail "same-plugin message does not name the unit"
+				grep -q 'ACROSS plugins' same.txt || fail "same-plugin message does not say what cogbox can/cannot do"
+
+				# (4) residue: the reserved index name -> a real message, not the bare
+				#     'ln: File exists' this used to produce.
+				${mustThrow "a plugin squatting on the reserved index name" reserved}
+				printf '%s\n' "$reservedMsg" > reserved.txt
+				grep -q "plugin 'a'" reserved.txt || fail "reserved-name message does not name the plugin"
+				grep -q 'cogbox-plugins' reserved.txt || fail "reserved-name message does not name the unit"
+
+				# (5) residue: the reserved index name reached by QUALIFICATION.
+				#     Neither plugin ships 'cogbox-plugins'; both ship 'plugins', and
+				#     the one installed as 'cogbox' qualifies straight onto the index's
+				#     own leaf. Testing only the DISCOVERED name let this through, and
+				#     the brain build then died on a bare `ln`/`cp` error naming nobody.
+				${mustThrow "a qualified name landing on the reserved index name" reservedQual}
+				printf '%s\n' "$reservedQualMsg" > reserved-qual.txt
+				grep -q "plugin 'cogbox'" reserved-qual.txt || fail "reserved-qual message does not name the plugin"
+				grep -q "skill 'plugins'" reserved-qual.txt || fail "reserved-qual message does not name the discovered unit"
+				grep -q "qualifies to 'cogbox-plugins'" reserved-qual.txt || fail "reserved-qual message does not name the qualified unit"
+
 				touch $out
 			'';
 			# GUEST-HALF DNS: no public fallback resolver, asserted against the
@@ -8636,21 +9171,25 @@
 			# NOT cache-hit for the plugin path. Pre-build the runner with
 			# the exact same nested shape the composition produces: two
 			# plugins from one flake (default = hello, extra = etc marker)
-			# plus the scaffold's no-op module, in add order, user last.
+			# plus the scaffold's no-op module, in add order, user last -- each
+			# behind the `_file` provenance wrapper compose.zig now emits. The
+			# wrapper carries no config of its own, so it does not perturb
+			# definition order, but keeping the two shapes identical is what
+			# makes this prebuild a real cache hit.
 			cogbox-x86_64-test-plugin = mkMicrovm "x86_64-linux" "cogbox" {
 				vcpu = 16;
 				mem = 32768;
 				extraModules = cogboxModules "x86_64-linux" {
 					userExt = {
 						imports = [
-							({ pkgs, ... }: {
+							{ _file = "p-testhello"; imports = [ ({ pkgs, ... }: {
 								environment.systemPackages = [ pkgs.hello ];
 								system.extraDependencies = [ pkgs.hello ];
-							})
-							({ ... }: {
+							}) ]; }
+							{ _file = "p-testextra"; imports = [ ({ ... }: {
 								environment.etc."cogbox-test-extra".text = "extra\n";
-							})
-							({ pkgs, lib, ... }: { })
+							}) ]; }
+							{ _file = "cogbox-user"; imports = [ ({ pkgs, lib, ... }: { }) ]; }
 						];
 					};
 				};
@@ -8699,6 +9238,7 @@
 					};
 				};
 			};
+
 		};
 	};
 }

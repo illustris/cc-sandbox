@@ -95,13 +95,32 @@ pub fn render(
 		// Import the plugin's module via its cogboxPlugins.<attr>.module
 		// reference; `or {}` makes the module optional (a pure-policy plugin
 		// that only contributes networkRules/l7Rules/inject omits it).
-		try out.appendSlice(allocator, "\t\t\t\t(inputs.\"p-");
+		//
+		// The `_file` wrapper carries PROVENANCE into the module system. The
+		// merged config.cogbox the guest brain reads is anonymous -- every
+		// contents root is just some /nix/store/...-source path, which is why
+		// a cross-plugin skill-name collision used to fail the build naming no
+		// plugin. nixpkgs passes a module's `_file` down as the fallback file
+		// for each inline module it imports (lib/modules.nix: loadModule hands
+		// the parent's _file to unifyModuleSyntax, which takes
+		// `_file = toString m._file or file`), and a plugin's module is a bare
+		// FUNCTION out of a flake output carrying no _file of its own -- so it
+		// inherits "p-<name>" from this wrapper, all the way down to the
+		// option definition. flake.nix then reads
+		// options.cogbox.contents.definitionsWithLocations to learn which
+		// plugin contributed which root, and qualifies colliding unit names as
+		// "<plugin>-<unit>" instead of refusing to build. The user flake gets
+		// the "cogbox-user" marker so the brain can leave the instance's OWN
+		// content unqualified.
+		try out.appendSlice(allocator, "\t\t\t\t{ _file = \"p-");
+		try appendNixString(allocator, &out, p.name);
+		try out.appendSlice(allocator, "\"; imports = [ (inputs.\"p-");
 		try out.appendSlice(allocator, p.name);
 		try out.appendSlice(allocator, "\".cogboxPlugins.\"");
 		try out.appendSlice(allocator, p.attr);
-		try out.appendSlice(allocator, "\".module or {})\n");
+		try out.appendSlice(allocator, "\".module or {}) ]; }\n");
 	}
-	try out.appendSlice(allocator, "\t\t\t\tuser.nixosModules.default\n" ++
+	try out.appendSlice(allocator, "\t\t\t\t{ _file = \"cogbox-user\"; imports = [ user.nixosModules.default ]; }\n" ++
 		"\t\t\t];\n" ++
 		"\t\t};\n" ++
 		"\t};\n" ++

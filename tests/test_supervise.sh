@@ -149,6 +149,15 @@ STUB
 printf 'cogbox %s\n' "$*" >> "$FAKEMD/events"
 case "${1:-}" in
 	init)
+		# A FAILING init, which is the shape the classification leg exists for:
+		# write the requested output on BOTH streams (the supervisor captures the
+		# combined one) and exit non-zero. The real failure is a guest system
+		# that will not evaluate, whose entire diagnostic value is in these lines.
+		if [ -n "${STUB_INIT_OUT:-}" ]; then
+			printf '%s\n' "$STUB_INIT_OUT"
+			printf '%s\n' "$STUB_INIT_OUT" >&2
+		fi
+		[ "${STUB_INIT_RC:-0}" = 0 ] || exit "${STUB_INIT_RC}"
 		# The real init seeds $XDG_CONFIG_HOME/cogbox/instances/<name>/config.json
 		# and writes it ONLY when the file is absent (cogbox-launch.sh), which is
 		# both what a mutation reads and what makes re-running init safe. Mirror
@@ -237,6 +246,8 @@ run_boot() {
 	COGWORX_READY_TIMEOUT=4 \
 	COGWORX_HOSTKEY_TIMEOUT=2 \
 	COGWORX_GUEST_VOLUMES="${SEED_GUEST_VOLUMES-}" \
+	STUB_INIT_RC="${STUB_INIT_RC:-0}" \
+	STUB_INIT_OUT="${STUB_INIT_OUT:-}" \
 	XDG_CONFIG_HOME="${SEED_XDG_CONFIG_HOME-$home/state/config}" \
 	COGBOX_DATA="$home/state/data/cogbox" \
 	XDG_RUNTIME_DIR="$home/run" \
@@ -735,6 +746,202 @@ if [ "$rc" != 0 ] && [ "$n" = 0 ]; then
 else
 	bad "absent nonce: rc=$rc, $n guest attributes published"
 fi
+
+# --- 8. a failed init is CLASSIFIED, not swallowed --------------------------
+#
+# THE FAILURE MODE THIS REPLACES. A sandbox created with two plugins that
+# both shipped a skill called `overview`; the composed guest system would not
+# EVALUATE, `cogbox init` exited non-zero, and the supervisor restart-looped
+# without bound. Serial filled with identical "FAILED: cogbox init
+# failed" lines -- enough to overwrite the 1 MB ring buffer and destroy the
+# earlier maintenance-boot output -- while the ONE line of Nix error that
+# explained everything was reachable only over SSH, on a box whose guest never
+# came up. Three properties fix that, and all three are asserted here: the full
+# output survives on the STATE DISK, an allowlisted summary reaches serial and
+# the guest attribute, and the serial line is deduplicated so the ring buffer
+# keeps the boot history.
+
+# The real shape: one cogbox-stamped line worth reading, and other output that
+# must NOT leave the VM boundary. Serial on GCE is provider-retained state
+# readable under a coarser grant than the control channel, so the summary is an
+# ALLOWLIST ('cogbox: ' only) rather than a filter -- a filter only removes the
+# leaks somebody already thought of.
+INIT_CANARY="l7proxy: allow api.example.com init-canary-do-not-serialize"
+INIT_ERR="error: cogbox: skill 'overview' is provided by 2 cogbox.contents roots (plugin 'obs-plugin', plugin 'demo-plugin')"
+
+STUB_INIT_RC=70
+STUB_INIT_OUT="$INIT_CANARY
+$INIT_ERR
+- cogbox: rename that skill or set cogbox.skills"
+rc=$(run_boot initfail "${BASE_ATTRS[@]}")
+md="$ROOT/initfail/md"
+n=$(evcount "$md" 'cogbox start')
+if [ "$rc" != 0 ] && [ "$n" = 0 ]; then
+	ok "a failed cogbox init exits non-zero with zero cogbox start"
+else
+	bad "failed init: rc=$rc, cogbox start invoked $n times"
+fi
+
+# On the STATE DISK, not in /run: the first thing a user does with a box stuck
+# "Booting" is reboot it, and a tmpfs copy would not survive that.
+if grep -qF "$INIT_ERR" "$ROOT/initfail/state/last-init-error.log" 2>/dev/null; then
+	ok "init's combined output is kept on the state disk, where a reboot cannot destroy it"
+else
+	bad "no last-init-error.log on the state disk: $(ls "$ROOT/initfail/state" 2>/dev/null)"
+fi
+
+if grep -q "^cogworx: FAILED: init: .*skill 'overview'" "$ROOT/initfail/serial.log" 2>/dev/null; then
+	ok "the classified summary reaches serial, so the cause is diagnosable from getSerialPortOutput"
+else
+	bad "no classified init line on serial: $(cat "$ROOT/initfail/serial.log" 2>/dev/null)"
+fi
+# The allowlist half. The canary is a line init really can print (the cogbox
+# runtime log's l7 allow/deny decisions have the same shape) and it carries no
+# 'cogbox: ' stamp, so it must not be on serial or in the guest attribute.
+if grep -q 'init-canary-do-not-serialize' "$ROOT/initfail/serial.log" 2>/dev/null; then
+	bad "an unstamped init line reached the serial sink; the summary is filtering, not allowlisting"
+else
+	ok "an unstamped init line never reaches the serial sink"
+fi
+
+ga="$ROOT/initfail/md/ga/cogworx_boot-error"
+if grep -q "^n0nce-aaaa .*skill 'overview'" "$ga" 2>/dev/null \
+	&& ! grep -q 'init-canary-do-not-serialize' "$ga" 2>/dev/null; then
+	ok "the same summary is published nonce-stamped as cogworx/boot-error"
+else
+	bad "cogworx/boot-error is missing, unstamped or carries unstamped output: $(cat "$ga" 2>/dev/null)"
+fi
+
+# DEDUP. Same tag, so the same $XDG_RUNTIME_DIR and the same serial log: this is
+# the restart the unit would perform 1456 more times. An identical failure adds
+# no line; a DIFFERENT one does, because that is a state change an operator
+# needs to see.
+rc=$(run_boot initfail "${BASE_ATTRS[@]}")
+n=$(grep -c '^cogworx: FAILED: init' "$ROOT/initfail/serial.log" 2>/dev/null || true)
+if [ "$n" = 1 ]; then
+	ok "an identical repeat failure emits no second serial line"
+else
+	bad "expected 1 classified init line after a repeat, got $n"
+fi
+
+STUB_INIT_OUT="error: cogbox: config.json is empty"
+rc=$(run_boot initfail "${BASE_ATTRS[@]}")
+n=$(grep -c '^cogworx: FAILED: init' "$ROOT/initfail/serial.log" 2>/dev/null || true)
+if [ "$n" = 2 ] && grep -q 'config.json is empty' "$ROOT/initfail/serial.log"; then
+	ok "a CHANGED failure emits a fresh serial line"
+else
+	bad "expected 2 classified init lines after the summary changed, got $n"
+fi
+
+# HEARTBEAT. Dedup must not make a permanently-wedged box go silent: an
+# operator arriving later has to be able to tell "stuck since boot" from
+# "stopped failing an hour ago". Every 20th restart says so, with the count.
+for _ in $(seq 19); do rc=$(run_boot initfail "${BASE_ATTRS[@]}"); done
+if grep -q '^cogworx: FAILED: init still failing after 20 attempts: .*config.json is empty' \
+	"$ROOT/initfail/serial.log" 2>/dev/null; then
+	ok "a permanently-failing init re-announces itself every 20th restart, with the count"
+else
+	bad "no heartbeat line after 20 identical failures: $(grep -c '^cogworx: FAILED: init' "$ROOT/initfail/serial.log")"
+fi
+
+# NOTHING MATCHED. An init that fails without printing a cogbox-stamped line
+# must still say something, and it must still say only that -- falling back to
+# the generic string rather than to whatever the last line happened to be.
+STUB_INIT_OUT="$INIT_CANARY"
+rc=$(run_boot initopaque "${BASE_ATTRS[@]}")
+if grep -q '^cogworx: FAILED: init: cogbox init failed$' "$ROOT/initopaque/serial.log" 2>/dev/null \
+	&& ! grep -q 'init-canary-do-not-serialize' "$ROOT/initopaque/serial.log" 2>/dev/null; then
+	ok "an init failure with no cogbox-stamped line falls back to the generic string"
+else
+	bad "opaque init failure did not fall back cleanly: $(cat "$ROOT/initopaque/serial.log" 2>/dev/null)"
+fi
+unset STUB_INIT_RC STUB_INIT_OUT
+
+# CLEARED ON SUCCESS. A boot-error that outlives its failure is worse than
+# none: it would be read as the reason for the next problem.
+rc=$(run_boot initclear "${BASE_ATTRS[@]}")
+md="$ROOT/initclear/md"
+if [ -n "$(evline "$md" 'DELETE instance/guest-attributes/cogworx/boot-error')" ]; then
+	ok "a boot that gets past init clears cogworx/boot-error"
+else
+	bad "a successful init left cogworx/boot-error in place; events: $(cat "$md/events")"
+fi
+if [ ! -e "$ROOT/initclear/state/last-init-error.log" ]; then
+	ok "a successful init leaves no stale error log on the state disk"
+else
+	bad "last-init-error.log survived a successful init"
+fi
+
+# PRESERVED BY A MAINTENANCE BOOT. Clearing the diagnostic is the job of an
+# init that RAN and SUCCEEDED, not of "any boot that got past leg (b)" -- a
+# maintenance boot deliberately skips init, and it is the boot class an operator
+# reaches for to investigate a box wedged on a failing init. Deleting the
+# state-disk log and the guest attribute there would destroy the evidence this
+# leg exists to preserve, and then hold at `sleep infinity` with nothing
+# recorded anywhere.
+rc=$(run_boot maintkeep "${BASE_ATTRS[@]}")
+printf "error: cogbox: skill 'overview' is provided by 2 cogbox.contents roots\n" \
+	> "$ROOT/maintkeep/state/last-init-error.log"
+printf "n0nce-aaaa cogbox: skill 'overview' collides\n" \
+	> "$ROOT/maintkeep/md/ga/cogworx_boot-error"
+rc=$(run_boot maintkeep "${BASE_ATTRS[@]}" "cogworx-maintenance=true")
+md="$ROOT/maintkeep/md"
+if [ "$(evcount "$md" 'cogbox init')" = 0 ]; then
+	ok "the maintenance boot skipped init, as this case requires"
+else
+	bad "maintenance boot re-ran init; the preservation assertions below prove nothing"
+fi
+if [ -s "$ROOT/maintkeep/state/last-init-error.log" ]; then
+	ok "a maintenance boot preserves the state-disk init error log"
+else
+	bad "a maintenance boot deleted last-init-error.log, the evidence it exists to let an operator read"
+fi
+if [ -z "$(evline "$md" 'DELETE instance/guest-attributes/cogworx/boot-error')" ]; then
+	ok "a maintenance boot preserves cogworx/boot-error"
+else
+	bad "a maintenance boot cleared cogworx/boot-error without having run init"
+fi
+
+# --- 9. restart backoff lives HERE, and only on the failure path ------------
+#
+# The unit's RestartSec is flat on purpose: systemd never resets its restart
+# counter after a successful run, and leg (j) exits non-zero on every ordinary
+# sandbox exit -- an in-guest `reboot` included -- so RestartSteps= there would
+# throttle the NORMAL restart path and leave a healthy box waiting minutes with
+# nothing to explain it. This script can tell a failed boot from a finished one,
+# so the doubling delay is here. (`sleep` is stubbed at the top of this file, so
+# these assertions read the ANNOUNCED delay rather than wall-clock time.)
+delay_of() { sed -n 's/.*delaying \([0-9]*\)s before this exit.*/\1/p' "$1" | tail -1; }
+
+STUB_INIT_RC=70
+STUB_INIT_OUT="error: cogbox: skill 'overview' collides"
+rc=$(run_boot backoff "${BASE_ATTRS[@]}"); d1=$(delay_of "$ROOT/backoff/out.log")
+rc=$(run_boot backoff "${BASE_ATTRS[@]}"); d2=$(delay_of "$ROOT/backoff/out.log")
+rc=$(run_boot backoff "${BASE_ATTRS[@]}"); d3=$(delay_of "$ROOT/backoff/out.log")
+if [ "$d1" = 5 ] && [ "$d2" = 10 ] && [ "$d3" = 20 ]; then
+	ok "consecutive failed boots back off 5s -> 10s -> 20s"
+else
+	bad "expected a 5/10/20 backoff across three failed boots, got $d1/$d2/$d3"
+fi
+unset STUB_INIT_RC STUB_INIT_OUT
+
+# A boot that actually STARTED the sandbox is the proof this box got somewhere,
+# so it resets the counter -- and its own leg (j) exit announces no delay at all.
+rc=$(run_boot backoff "${BASE_ATTRS[@]}")
+if [ -z "$(delay_of "$ROOT/backoff/out.log")" ]; then
+	ok "an ordinary sandbox exit (leg j) is never delayed"
+else
+	bad "leg (j) delayed a normal restart by $(delay_of "$ROOT/backoff/out.log")s"
+fi
+STUB_INIT_RC=70
+STUB_INIT_OUT="error: cogbox: skill 'overview' collides"
+rc=$(run_boot backoff "${BASE_ATTRS[@]}")
+if [ "$(delay_of "$ROOT/backoff/out.log")" = 5 ]; then
+	ok "a successful start resets the backoff, so the next failure starts over at 5s"
+else
+	bad "the backoff was not reset by a successful start: $(delay_of "$ROOT/backoff/out.log")s"
+fi
+unset STUB_INIT_RC STUB_INIT_OUT
 
 if [ "$fails" -gt 0 ]; then
 	echo "$fails check(s) failed" >&2

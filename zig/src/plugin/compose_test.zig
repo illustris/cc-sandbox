@@ -26,8 +26,8 @@ test "golden render: one plugin (hydrated -> path: input)" {
 		"\toutputs = { self, user, ... }@inputs: {\n" ++
 		"\t\tnixosModules.default = {\n" ++
 		"\t\t\timports = [\n" ++
-		"\t\t\t\t(inputs.\"p-myplugin\".cogboxPlugins.\"default\".module or {})\n" ++
-		"\t\t\t\tuser.nixosModules.default\n" ++
+		"\t\t\t\t{ _file = \"p-myplugin\"; imports = [ (inputs.\"p-myplugin\".cogboxPlugins.\"default\".module or {}) ]; }\n" ++
+		"\t\t\t\t{ _file = \"cogbox-user\"; imports = [ user.nixosModules.default ]; }\n" ++
 		"\t\t\t];\n" ++
 		"\t\t};\n" ++
 		"\t};\n" ++
@@ -65,12 +65,32 @@ test "two plugins keep config order, user module last" {
 	const b_in = std.mem.indexOf(u8, out, "\"p-beta\".url").?;
 	try t.expect(a_in < b_in);
 
-	const a_imp = std.mem.indexOf(u8, out, "(inputs.\"p-alpha\".cogboxPlugins.\"default\".module or {})").?;
-	const b_imp = std.mem.indexOf(u8, out, "(inputs.\"p-beta\".cogboxPlugins.\"default\".module or {})").?;
-	const user_imp = std.mem.indexOf(u8, out, "user.nixosModules.default\n\t\t\t];").?;
+	const a_imp = std.mem.indexOf(u8, out, "{ _file = \"p-alpha\"; imports = [ (inputs.\"p-alpha\".cogboxPlugins.\"default\".module or {}) ]; }").?;
+	const b_imp = std.mem.indexOf(u8, out, "{ _file = \"p-beta\"; imports = [ (inputs.\"p-beta\".cogboxPlugins.\"default\".module or {}) ]; }").?;
+	const user_imp = std.mem.indexOf(u8, out, "{ _file = \"cogbox-user\"; imports = [ user.nixosModules.default ]; }\n\t\t\t];").?;
 	try t.expect(a_imp < b_imp);
 	try t.expect(b_imp < user_imp);
 	try t.expect(std.mem.indexOf(u8, out, "instance 'work'") != null);
+}
+
+test "every import is _file-tagged with its plugin's install name" {
+	// The guest brain reads these tags back out of
+	// options.cogbox.contents.definitionsWithLocations to attribute a
+	// colliding skill/agent/command/rule to a plugin, so the tag must match
+	// the input attr name exactly (`p-<name>`) and the user flake must carry
+	// the distinct `cogbox-user` marker that keeps its content unqualified.
+	const out = try compose.render(t.allocator, "default", "/cfg/flake", "/cfg/plugin-sources", &.{
+		.{ .name = "obs-plugin", .locked_url = "path:/a?narHash=sha256-A" },
+		.{ .name = "demo-plugin", .locked_url = "path:/b?narHash=sha256-B", .attr = "extra" },
+	});
+	defer t.allocator.free(out);
+
+	try t.expect(std.mem.indexOf(u8, out, "{ _file = \"p-obs-plugin\"; imports = [ (inputs.\"p-obs-plugin\".cogboxPlugins.\"default\".module or {}) ]; }") != null);
+	try t.expect(std.mem.indexOf(u8, out, "{ _file = \"p-demo-plugin\"; imports = [ (inputs.\"p-demo-plugin\".cogboxPlugins.\"extra\".module or {}) ]; }") != null);
+	try t.expect(std.mem.indexOf(u8, out, "{ _file = \"cogbox-user\"; imports = [ user.nixosModules.default ]; }") != null);
+	// No untagged import may survive: an untagged root cannot be qualified.
+	try t.expect(std.mem.indexOf(u8, out, "\t\t\t\t(inputs.") == null);
+	try t.expect(std.mem.indexOf(u8, out, "\t\t\t\tuser.nixosModules.default\n") == null);
 }
 
 test "non-default module attrs are emitted quoted" {

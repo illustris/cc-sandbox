@@ -15,6 +15,7 @@ pub const cli = @import("cli.zig");
 pub const name_mod = @import("name.zig");
 pub const compose = @import("compose.zig");
 pub const mutate = @import("mutate.zig");
+pub const units = @import("units.zig");
 pub const nix = @import("nix.zig");
 pub const gitcred = @import("gitcred.zig");
 
@@ -408,6 +409,22 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 		warn(ctx, "could not materialize plugin source (launch may need network): {s}", .{@errorName(err)}) catch {};
 	};
 
+	// Now that this plugin's contents/ is on disk next to every installed
+	// plugin's, say what its unit names will collide with -- and refuse the add
+	// outright for the shapes the build cannot resolve. Deliberately BEFORE the
+	// rule/inject confirmation below: there is no point asking an operator to
+	// approve firewall rules for a plugin that would make the guest system
+	// unbuildable. The plugin being added is not in `plugins_arr` yet, so its
+	// `?dir=` subdir comes straight off the locked URL (regenComposition reads
+	// the same param off the stored entry for every installed plugin).
+	const add_root = try std.fs.path.join(allocator, &.{ ctx.sources_dir, plugin_name, nix.dirParam(meta.locked_url) orelse "." });
+	defer allocator.free(add_root);
+	// Exiting here is the whole point: nothing about this add has been written
+	// yet (config.json, the composition and the lock are all still the state the
+	// instance booted with), and lintUnitNames has already torn the freshly
+	// materialized source down, so the refusal costs the instance nothing.
+	if (try lintUnitNames(ctx, plugins_arr, plugin_name, add_root, true)) std.process.exit(65);
+
 	archiveFlake(ctx, meta.locked_url);
 
 	// Optional plugin contributions: L4 CIDR + L7 vhost rules, plus credential
@@ -511,6 +528,131 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 		defer allocator.free(line);
 		try writeStdout(io, line);
 	}
+}
+
+/// Unit-name lint for an incoming plugin version, shared by `add` and
+/// `update`. Compares the incoming plugin's `contents/` against the
+/// already-materialized `contents/` of every installed plugin (units.zig),
+/// then:
+///
+///   - REFUSES anything the composed guest would decline to evaluate. That is
+///     the whole reason this exists: until the build resolved collisions
+///     itself, a same-named skill in two plugins meant the guest system did not
+///     evaluate at all -- `cogbox init` non-zero, the GCE supervisor
+///     restart-looping, and the one line of Nix error that explained it visible
+///     only from inside the VM. The messages mirror flake.nix's throws word for
+///     word so the CLI and the build can never disagree;
+///   - otherwise ANNOUNCES the names cogbox will qualify. Both sides stay
+///     installed and usable, so this is information the operator wants at
+///     install time, not a refusal.
+///
+/// A refusal RETURNS TRUE with every fatal already printed, rather than exiting
+/// here: what it costs is the caller's to decide, because the two verbs sit at
+/// different points in their own state machines. `add` has written nothing yet,
+/// so it exits 65 on the spot. `update` is part-way through a loop over several
+/// plugins, and exiting from the middle of it would strand the ones already
+/// re-materialized -- their new tree on disk, `config.json` and the composition
+/// lock still naming the old rev, and nix honouring the stale lock rather than
+/// erroring -- so it marks the plugin failed and lets the loop finish.
+///
+/// Nothing is persisted. Qualification is derived in Nix from the installed
+/// set, so `del`/`update` recompute it for free and there is no host-side
+/// state to drift out of step with config.json.
+///
+/// `plugins_arr` is the array as it stands BEFORE this mutation. The incoming
+/// plugin is appended LAST, matching where mutate.appendPlugin puts it and
+/// therefore the order the composition flake imports the modules in; an entry
+/// already carrying `new_name` (the update path) is dropped from the pre-state
+/// so the old and new copies are never counted as two roots of one plugin.
+///
+/// `new_root` is the directory that CONTAINS the incoming plugin's `contents/`
+/// -- for a `?dir=` monorepo flake that is `<tree>/<dir>`, not `<tree>`, and
+/// getting it wrong makes the whole lint a silent no-op. Every installed
+/// plugin's is recovered the same way, from its stored lockedUrl.
+///
+/// `remove_on_refusal` tears the materialized source down again when the lint
+/// refuses. True for `add` (the plugin was never installed, so an orphan
+/// plugin-sources/<name>/ only confuses the next reader); false for `update`,
+/// which lints the incoming version straight out of the store BEFORE it
+/// replaces anything, and must leave the installed old version intact.
+fn lintUnitNames(ctx: *const Ctx, plugins_arr: *std.json.Array, new_name: []const u8, new_root: []const u8, remove_on_refusal: bool) !bool {
+	var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+	defer arena_state.deinit();
+	const arena = arena_state.allocator();
+
+	var providers: std.ArrayList(units.Provider) = .empty;
+	for (plugins_arr.items) |item| {
+		if (item != .object) continue;
+		const nm = mutate.entryField(item.object, "name") orelse continue;
+		// The incoming plugin's OWN entry, on the update path. It is appended
+		// below from the new version; counting it here as well would read as one
+		// plugin providing the same unit from two of its own roots, which is a
+		// refusal rather than a collision.
+		if (std.mem.eql(u8, nm, new_name)) continue;
+		const dir = nix.dirParam(mutate.entryField(item.object, "lockedUrl") orelse "");
+		const root = try std.fs.path.join(arena, &.{ ctx.sources_dir, nm, dir orelse "." });
+		try providers.append(arena, .{ .plugin = nm, .units = try pluginUnits(ctx, arena, root) });
+	}
+	// The state BEFORE this mutation, so the diff below can tell what this
+	// mutation is responsible for from what the instance was already carrying.
+	const before = try units.analyze(arena, providers.items);
+	try providers.append(arena, .{ .plugin = new_name, .units = try pluginUnits(ctx, arena, new_root) });
+	const report = try units.delta(arena, before, try units.analyze(arena, providers.items), new_name);
+
+	if (report.fatals.len > 0) {
+		// Leave nothing behind on an ADD: the source was materialized moments
+		// ago, and an orphan plugin-sources/<name>/ for a plugin that was never
+		// installed only confuses the next reader.
+		if (remove_on_refusal) removeSource(ctx, new_name);
+		// Every unresolvable name, not just the first -- flake.nix throws them
+		// as one joined message, so an operator gets the same set either way.
+		// Printed with `die`'s own prefix, since the caller does the exiting.
+		for (report.fatals) |m| {
+			const line = try std.fmt.allocPrint(ctx.allocator, "cogbox plugin: error: {s}\n", .{m});
+			defer ctx.allocator.free(line);
+			try writeStderr(ctx.io, line);
+		}
+		return true;
+	}
+
+	if (report.collisions.len == 0) return false;
+	try announce(ctx, "Name collisions with installed plugins (cogbox qualifies both sides):", .{});
+	for (report.collisions) |c| {
+		// "also provided by" lists the OTHER side; the arrow line lists every
+		// final name, in install order, because neither side keeps the bare one.
+		// The final names come from the report, never re-derived here -- one
+		// place owns the qualification rule.
+		var others: std.ArrayList(u8) = .empty;
+		for (c.plugins) |p| {
+			if (std.mem.eql(u8, p, new_name)) continue;
+			if (others.items.len > 0) try others.appendSlice(arena, ", ");
+			try others.appendSlice(arena, try std.fmt.allocPrint(arena, "'{s}'", .{p}));
+		}
+		var finals: std.ArrayList(u8) = .empty;
+		for (c.finals) |f| {
+			if (finals.items.len > 0) try finals.appendSlice(arena, ", ");
+			try finals.appendSlice(arena, f);
+		}
+		try announce(ctx, "  ~ {s} '{s}' also provided by {s}", .{ c.kind.label(), c.name, others.items });
+		try announce(ctx, "      -> {s}", .{finals.items});
+	}
+	return false;
+}
+
+/// The units one plugin contributes, read from `<flake_root>/contents`.
+/// `contents/` is the conventional root docs/plugins.md documents; the CLI
+/// never evaluates the plugin module, so a plugin that points cogbox.contents
+/// somewhere else is invisible here and the build stays the authority
+/// (units.zig says why that trade is the right one).
+///
+/// `flake_root` is the directory holding the plugin's flake.nix, which for a
+/// `?dir=` monorepo plugin is a SUBDIRECTORY of the materialized tree (that
+/// tree is always the repo root). Passing the repo root there instead makes
+/// enumerate() open nothing and the lint pass everything -- including the
+/// refusals, which then surface as a guest that will not evaluate.
+fn pluginUnits(ctx: *const Ctx, arena: std.mem.Allocator, flake_root: []const u8) ![]units.Unit {
+	const root = try std.fs.path.join(arena, &.{ flake_root, "contents" });
+	return units.enumerate(arena, ctx.io, root);
 }
 
 /// Build the one-line deferred-rules JSON the control plane consumes:
@@ -754,6 +896,48 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 		if (std.mem.eql(u8, meta.nar_hash, old_hash)) {
 			try announce(ctx, "{s}: up to date ({s})", .{ n, pinLabel(meta) });
 			continue;
+		}
+
+		// The SAME lint `add` runs, and BEFORE materializeSource replaces the
+		// installed copy. An update installs code nobody has seen: a new version
+		// can rename a skill onto the reserved index name, or onto a name cogbox
+		// qualifies something else to, and until this ran the update simply
+		// succeeded -- leaving a config.json whose very next `cogbox start`
+		// cannot evaluate the guest, which on GCE is the restart loop this whole
+		// mechanism exists to prevent. Read out of the STORE, not out of
+		// plugin-sources/, precisely so that refusing is safe: at this point
+		// config.json, the on-disk source and the composition are all still the
+		// working old pin, and exit 65 leaves all three that way. `source_path`
+		// resolution mirrors materializeSource's; an empty one (nix did not
+		// report `.path` and the lazy lookup failed) means there is nothing to
+		// read, so the build stays the only authority for this one update.
+		var owned_src: ?[]u8 = null;
+		defer if (owned_src) |s| allocator.free(s);
+		const new_src: []const u8 = blk: {
+			if (meta.source_path.len > 0) break :blk meta.source_path;
+			owned_src = nix.flakeSourcePath(allocator, io, ctx.fetch_env, url) catch null;
+			break :blk owned_src orelse "";
+		};
+		if (new_src.len > 0) {
+			const new_root = try std.fs.path.join(allocator, &.{ new_src, nix.dirParam(meta.locked_url) orelse "." });
+			defer allocator.free(new_root);
+			// A refusal is this PLUGIN's failure, not the run's: skip it the same
+			// way a bad entry or an unresolvable ref is skipped above. Exiting
+			// from inside the loop instead would strand every plugin already
+			// updated in this run -- materializeSource has replaced their trees
+			// and relockPlugin has moved their JSON, but config.save and the
+			// regenComposition/finalizeComposition self-heal all run AFTER the
+			// loop, so config.json would keep reporting the old rev/narHash and
+			// the composition lock the old path: narHash. nix honours a stale
+			// lock rather than erroring, so the guest would go on building the
+			// old tree until some later add/del/update silently jumped it to a
+			// version `cogbox plugin list` never recorded. `failed` still exits
+			// 65 at the tail, so a refused update keeps the add path's code.
+			if (try lintUnitNames(ctx, plugins_arr, n, new_root, false)) {
+				try warn(ctx, "{s}: not updated; the new version's unit names cannot be composed (pin, source and composition left on the working version)", .{n});
+				failed = true;
+				continue;
+			}
 		}
 
 		// Re-materialize this plugin's source at the new rev so its path: input

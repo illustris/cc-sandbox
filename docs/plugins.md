@@ -83,9 +83,35 @@ The base declares one option tree; each plugin module fills in its slice, and th
 | `cogbox.packages` | list of packages | Tools placed on the sandbox PATH. **Use this, not `environment.systemPackages`, for a plugin's CLIs.** The base folds them into `environment.systemPackages` on the VM (baked into the runner) **and** into the brain's `$out/bin` prepended to PATH on the container — so tools reach *both* backends. `environment.systemPackages` alone reaches only the VM (the container image is built plugin-less), so a plugin that ships tools that way has them silently missing on the container even though its skills materialize. |
 | `cogbox.settings.<harness>` | `{ model; reasoningEffort }` | Per-harness settings. **Allowlist: `model`, `reasoningEffort` only** (enforced by the option type) — never permissions/auth/providers. Keyed `claude-code` / `opencode` / `codex`. |
 
-**Discovery.** A skill is a directory containing `SKILL.md`; an agent/command/rule is a `<name>.md` file. The skill's `name:` frontmatter must equal its directory name (opencode requirement). Non-conforming entries (`README.md`, a dir without `SKILL.md`) are skipped.
+**Discovery.** A skill is a directory containing `SKILL.md`; an agent/command/rule is a `<name>.md` file. A unit's name is its **basename**, never its frontmatter. The skill's `name:` frontmatter must still equal its directory name (opencode requirement) — but where that used to be an unchecked assertion in this document, it is now **repaired**: when cogbox qualifies a colliding unit it rewrites the `name:` line of its copy to the new name, so the frontmatter and the directory cannot drift apart. Only the *leading* `---` block is touched, and only when the unit already has one; a `name:` line further down is prose. Non-conforming entries (`README.md`, a dir without `SKILL.md`) are skipped.
 
-**Names are natural — no namespacing.** A skill is `/druid-rca`, not `/druid-es-druid-rca`. Uniqueness, not prefixing, is the invariant: a discovered-name collision across `contents` roots, or two plugins defining the same explicit name, **fails the build** with a plugin-attributed message. Name generically-named units distinctly.
+**Names are natural — cogbox resolves collisions.** A skill is `/druid-rca`, not `/druid-es-druid-rca`. Prefixing is not the author's job: plugins live in independently-owned repos and get installed in arbitrary combinations, so no author can see what their names will be paired with. Two plugins each shipping `skills/overview` is normal, and cogbox disambiguates it instead of refusing to build:
+
+- a discovered name provided by exactly **one** root is installed unchanged;
+- a name provided by **two or more plugin** roots is installed once per plugin as `<plugin>-<unit>` — both stay usable, neither keeps the bare name — with each copy's frontmatter `name:` rewritten to match;
+- if one of the colliding roots is the **instance's own flake**, that one keeps the bare name and only the plugin copies are qualified: cogbox never renames a user's own content behind their back;
+- an explicit `cogbox.<kind>.<name>` still overrides discovery, applied *after* qualification, so it can target either the bare or the qualified name.
+
+Attribution comes from the generated composition flake, which stamps every import with the plugin's install name (`_file = "p-<name>"`; `"cogbox-user"` for the instance's own flake). What cogbox genuinely cannot resolve still **fails the build**, with a message naming the plugins, the unit and what to do: one plugin providing the same name from two of its *own* `contents` roots; a qualified name that is itself already taken; a collision involving a root with no provenance (any `cogbox plugin add/del/update` regenerates the composition and fixes that); and a unit named `cogbox-plugins`, which is reserved for the generated index. Failing the build is the accepted outcome for those four — *"fail to boot, but show a useful error message"* — because there is no correct rename cogbox could pick on the author's behalf.
+
+A fifth refusal differs in kind, and is called out separately because it surfaces differently. Qualification COPIES a unit in order to rewrite its frontmatter, and re-takes a skill's `SKILL.md` from the source so that an intra-tree symlink is not flattened into a dangling one. When that leaf cannot be read at all — a link resolving nowhere even at the source — the copy is refused with the same `cogbox: ` wording. But this one is a **builder** failure rather than an eval throw, so unlike the four above it never reaches `system.build.cogboxBrainCollisions`: on the container backend it lands in the generic `reason=rebuild-failed` fallback, and only the nix build log names the plugin. Such a skill is already broken *without* a collision — the unqualified path symlinks a store copy whose leaf dangles — it merely fails silently there and loudly once qualified.
+
+**Add-time lint.** `cogbox plugin add` does not wait for the next start to tell you any of this. Once the new plugin's source is materialized it enumerates that source's `contents/` the same way the build does, compares it against the already-materialized `contents/` of every installed plugin, and prints what will be qualified:
+
+```
+Name collisions with installed plugins (cogbox qualifies both sides):
+  ~ skill 'overview' also provided by 'obs-plugin'
+      -> obs-plugin-overview, demo-plugin-overview
+```
+
+That is **advisory** — the build resolves it and both plugins install. For the NAME-level shapes the build *refuses*, the add itself fails with exit 65 and the build's own wording, so the CLI and the build agree about what installs. Three caveats, all deliberate: the lint reads the conventional `contents/` root because the CLI never evaluates the plugin module (a plugin that points `cogbox.contents` elsewhere is invisible to it); it reports only what **this** add is responsible for, so an instance already carrying an unresolvable pair is not blocked from installing something unrelated; and it compares NAMES only, never the readability of a unit's leaf — so the fifth refusal above is the one shape that passes `plugin add` and can still fail the build later, once a collision makes that plugin's copy qualify. Nothing is written host-side: qualification is derived in Nix from the installed set, so `del`/`update` recompute it for free.
+
+**Migration.** Qualification needs the `_file` stamps, and those come from the composition flake. An instance whose `plugins-flake/flake.nix` was generated by an older CLI has *untagged* roots, so a collision there is unresolvable and lands in the refusal set above. That is intended, and there is no migration code — the next `cogbox plugin add`, `del` or `update` on that instance regenerates the composition and the stamps arrive with it.
+
+**What "fails the build" means on each backend**, because the two differ and the difference is what you are looking at when a sandbox misbehaves:
+
+- **microVM**: the guest system *is* the build, so the refusal is the boot failure. `cogbox init` exits non-zero carrying the message; on GCE the supervisor additionally puts a one-line summary on the serial console and in the `cogworx/boot-error` guest attribute, so the control plane can say why instead of showing "Booting" forever.
+- **container**: the per-instance brain is rebuilt at boot and that rebuild is best-effort by design (it has to survive an offline pod), so a refusal does **not** stop the sandbox. It starts on the image's plugin-less *base* brain — no plugin skills, agents, commands, rules or `cogbox.packages` tools — and says so in two places: the `cogbox-brain-materialize` unit's journal, and `~/.config/cogbox/instances/<name>/brain.fallback` (`reason=unit-name-collision`, followed by the messages themselves). A container sandbox that has suddenly lost all of its plugin content is this case; read that file.
 
 **Two deliberate non-features**, enforced by the contract shape:
 
@@ -169,16 +195,16 @@ Plugin state is materialized as a generated flake at `~/.config/cogbox/instances
     outputs = { self, user, ... }@inputs: {
         nixosModules.default = {
             imports = [
-                (inputs."p-mimir".cogboxPlugins."default".module or {})
-                (inputs."p-loki".cogboxPlugins."loki".module or {})
-                user.nixosModules.default
+                { _file = "p-mimir"; imports = [ (inputs."p-mimir".cogboxPlugins."default".module or {}) ]; }
+                { _file = "p-loki"; imports = [ (inputs."p-loki".cogboxPlugins."loki".module or {}) ]; }
+                { _file = "cogbox-user"; imports = [ user.nixosModules.default ]; }
             ];
         };
     };
 }
 ```
 
-`(... .module or {})` makes the module optional (a pure-policy plugin omits it). At launch, when `.plugins` is non-empty, the wrapper points `--override-input userExtensions` at this flake, so plugins and manual flake.nix edits compose. Because the inputs are pinned and pre-fetched by `nix flake archive`, restarts of a plugin-bearing instance work offline once the runner is built.
+`(... .module or {})` makes the module optional (a pure-policy plugin omits it). The `_file` wrapper carries provenance: nixpkgs passes a module's `_file` down as the fallback file of every inline module it imports, and a plugin's module is a bare function out of a flake output with no `_file` of its own, so it inherits `p-<name>`. That is what lets the guest brain read `options.cogbox.contents.definitionsWithLocations` and attribute a colliding unit to a plugin instead of to an anonymous `/nix/store/...-source` path. At launch, when `.plugins` is non-empty, the wrapper points `--override-input userExtensions` at this flake, so plugins and manual flake.nix edits compose. Because the inputs are pinned and pre-fetched by `nix flake archive`, restarts of a plugin-bearing instance work offline once the runner is built.
 
 ## Preview before install: `cogbox plugin resolve`
 
@@ -193,7 +219,7 @@ Adding a plugin evaluates third-party nix code at add time (pure eval, IFD disab
 | Form | Description |
 |---|---|
 | `cogbox plugin list [-n NAME]` | List installed plugins with their pinned revision and rule count |
-| `cogbox plugin add FLAKE_URL[#ATTR] [--as PLUGIN] [-y] [-n NAME]` | Resolve, pin, and install. `#ATTR` selects `cogboxPlugins.<attr>` (default: `default`). `--as` overrides the derived name; `-y` skips the confirmation. |
+| `cogbox plugin add FLAKE_URL[#ATTR] [--as PLUGIN] [-y] [-n NAME]` | Resolve, pin, and install. `#ATTR` selects `cogboxPlugins.<attr>` (default: `default`). `--as` overrides the derived name; `-y` skips the confirmation. Reports unit-name collisions with the installed plugins, and refuses (65) the ones the build cannot resolve. |
 | `cogbox plugin resolve FLAKE_URL[#ATTR] [--git-credential-stdin]` | Preview (JSON) the contract + host-side rules/inject without installing |
 | `cogbox plugin del PLUGIN [-y] [-n NAME]` | Remove a plugin and exactly the network rules it brought in |
 | `cogbox plugin update [PLUGIN] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules |

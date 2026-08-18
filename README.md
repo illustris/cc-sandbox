@@ -534,7 +534,7 @@ Units, all root-owned:
 | `cogworx-guest-disk.service` | Carve `/dev/disk/by-id/google-cogworx-guest` into a volume group with two logical volumes -- the guest's data pool and its writable `/nix/store` overlay -- keep them grown to the disk, and put a labelled ext4 on each. It NEVER MOUNTS a guest filesystem; the volumes are handed straight to QEMU. Five cases: absent (exit 0, a resolver VM has no such disk), unreadable (exit 1, a fault), already-LVM (recognised, nothing re-created), a foreign filesystem or volume group (left alone), and provably blank (carved). The pool's `mkfs` is guarded by the same three probes as the disk, because it holds the user's only copy of their work tree: blankness must be PROVED by a successful read, then left unrefuted by `blkid -p` (exit 2, no TYPE) and by `wipefs --no-act` (exit 0, no signature) -- a read proof is required because a device that errors on read looks identical to a blank one through either signature probe. The store overlay's `mkfs` is deliberately unconditional: it holds no user data, and remaking it is both how it stays ephemeral and how it grows. Pulled in and ordered by the supervisor (`Wants=`/`After=`, deliberately not `Requires=`), since with no host mount unit there is no `x-systemd.before=` seam and neither `mkfs` nor a grow may race the VM launch |
 | `cogworx-attr-scrub.service` | Delete the previous boot's readiness/host-key guest attributes. Retries forever, and is deliberately independent of the floor unit |
 | `cogworx-floor.service` | Install the nftables floor, then verify it with seven live connect probes -- three of them against a listener the probe binds itself -- and refuse the boot if the self-address set is empty |
-| `cogworx-supervisor.service` | The sandbox lifecycle. `Requires=` both of the above, so a failed floor or scrub can never yield a running sandbox |
+| `cogworx-supervisor.service` | The sandbox lifecycle. `Requires=` both of the above, so a failed floor or scrub can never yield a running sandbox. Restarts forever and at a FLAT `RestartSec=5` (`StartLimitIntervalSec=0`); the exponential backoff a permanently-failing boot needs -- so it cannot restart without bound -- lives in `gce/supervise.sh` (`backoff_sleep`, 5s doubling to 300s) and NOT in the unit, because systemd never resets its restart counter after a successful run while leg (j) exits non-zero on every ordinary sandbox exit, an in-guest `reboot` included. Script-side, the backoff applies only to boots that FAILED and resets once one gets past init, so a user rebooting inside their sandbox is never throttled. See the comment at `gce/supervisor.nix` |
 | `cogworx-cogbox-log.service` | Tail the cogbox runtime log into the JOURNAL. It is a separate unit so that log can never reach serial, which on GCE is provider-retained |
 | `cogworx-nix-gc.service`/`.timer` | Collect the in-VM store when the boot disk runs low |
 | `cogworx-resolver-deadline.service` | Power a resolver VM off after its deadline, independently of the provider-side field |
@@ -631,9 +631,16 @@ code or install a login key.
 | `cogworx-resolver-deadline` | resolver self-destruct timer |
 | `cogworx-ssh-ca-pub`, `cogworx-ssh-principal` | supervisor: the gateway user CA staged for the guest, and the control certificate principal sshd accepts |
 
-Guest attributes published back, both stamped `<nonce> <payload>`:
-`cogworx/vm-host-key` (every boot class, before any sandbox start) and
-`cogworx/ready` (level-held; deleted when the sandbox stops).
+Guest attributes published back, each stamped `<nonce> <payload>`:
+`cogworx/vm-host-key` (every boot class, before any sandbox start),
+`cogworx/ready` (level-held; deleted when the sandbox stops), and
+`cogworx/boot-error` (an allowlisted one-line summary of why `cogbox init`
+failed -- only `cogbox: `-stamped lines, capped, never the guest's own output --
+deleted again by any boot that gets past init). The last one is what turns a
+sandbox stuck "Booting" into a reason without reading a console dump; the full
+init output is kept on the state disk at `last-init-error.log`, and the same
+summary reaches serial once per DISTINCT failure so a restart loop cannot
+overwrite the ring buffer with 1300 copies of one line.
 
 Three things the image cannot supply and the operator must:
 `cogworx.gce.controlCAPublicKey` (empty means sshd trusts no control CA and

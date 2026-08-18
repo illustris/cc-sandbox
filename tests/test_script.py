@@ -523,6 +523,171 @@ NIX_EOF"""))
         "cogbox plugin add 'path:/home/testuser/cogbox-test-plugin#nonexistent' -y --name plug"
     ))
 
+    # Q3b: the add-time unit-name lint.
+    #
+    # Plugins live in independently-owned repos and get installed in arbitrary
+    # combinations, so two of them shipping skills/overview is normal. Until
+    # the build resolved that itself, the composed guest would not EVALUATE:
+    # `cogbox init` exited non-zero, the supervisor restart-looped, and the one
+    # line of Nix error that explained it never left the VM. `plugin add` and
+    # `plugin update` now report it at install time -- advisorily for what the
+    # build qualifies, fatally for what it still refuses, so a refused shape
+    # never reaches a boot through either mutation. (The lint reads the
+    # conventional contents/ root and never evaluates the module, so a plugin
+    # that points cogbox.contents elsewhere is still the build's problem alone.)
+    #
+    # A DEDICATED instance, never booted: adding these to `plug` would change
+    # its composition and cost Q4 its cache hit against the pre-built fixture.
+    def mk_lint_plugin(pname, units):
+        """A minimal plugin flake at /home/testuser/<pname> whose contents/
+        ships `units` -- (kind_dir, unit_name) pairs. The module is empty on
+        purpose: the lint reads contents/ off the MATERIALIZED SOURCE and never
+        evaluates the module, which is the property under test."""
+        d = f"/home/testuser/{pname}"
+        machine.succeed(as_user(f"mkdir -p {d}"))
+        machine.succeed(as_user("cat > " + d + """/flake.nix <<'NIX_EOF'
+{
+    description = "cogbox lint fixture";
+    outputs = { self }: {
+        nixosModules.default = { ... }: { };
+        cogboxPlugins.default = { module = self.nixosModules.default; };
+    };
+}
+NIX_EOF"""))
+        for kind, unit in units:
+            if kind == "skills":
+                leaf = f"{d}/contents/skills/{unit}/SKILL.md"
+                machine.succeed(as_user(f"mkdir -p {d}/contents/skills/{unit}"))
+            else:
+                leaf = f"{d}/contents/{kind}/{unit}.md"
+                machine.succeed(as_user(f"mkdir -p {d}/contents/{kind}"))
+            machine.succeed(as_user(
+                f"printf -- '---\\nname: {unit}\\n---\\n' > {leaf}"
+            ))
+        return d
+
+    machine.succeed(as_user("cogbox init -y --name collide --network rules"))
+    collide_cfg = "/home/testuser/.config/cogbox/instances/collide/config.json"
+    mk_lint_plugin("collide-a", [("skills", "overview"), ("agents", "triage")])
+    mk_lint_plugin("collide-b", [("skills", "overview"), ("agents", "triage")])
+    # Reserved: cogbox links its own generated capability index in at
+    # claude/skills/cogbox-plugins, so a plugin shipping that name has nowhere
+    # to go. It used to surface as a bare `ln: File exists` naming nobody.
+    mk_lint_plugin("collide-reserved", [("skills", "cogbox-plugins")])
+    # Taken: once collide-b's `overview` is qualified to `collide-b-overview`,
+    # a plugin shipping that literal name claims it twice. Last-wins there
+    # would reintroduce exactly the failure mode qualification removes.
+    mk_lint_plugin("collide-taken", [("skills", "collide-b-overview")])
+
+    machine.succeed(as_user("cogbox plugin add path:/home/testuser/collide-a -y --name collide"))
+    out = machine.succeed(as_user("cogbox plugin add path:/home/testuser/collide-b -y --name collide"))
+    assert "Name collisions with installed plugins" in out, out
+    assert "~ skill 'overview' also provided by 'collide-a'" in out, out
+    assert "-> collide-a-overview, collide-b-overview" in out, out
+    assert "~ agent 'triage' also provided by 'collide-a'" in out, out
+    assert "-> collide-a-triage, collide-b-triage" in out, out
+    # ADVISORY, not a refusal: the build resolves this, so both install.
+    n = machine.succeed(f"jq -r '.plugins | length' {collide_cfg}").strip()
+    assert n == "2", f"the advisory blocked the add: {n!r}"
+
+    # The residue, refused with the build's own wording so the CLI and the
+    # build can never disagree about what installs.
+    out = machine.fail(as_user(
+        "cogbox plugin add path:/home/testuser/collide-reserved -y --name collide 2>&1"
+    ))
+    assert "cogbox plugin: error:" in out and "cogbox-plugins" in out, out
+    assert "reserves for its own generated capability index" in out, out
+    out = machine.fail(as_user(
+        "cogbox plugin add path:/home/testuser/collide-taken -y --name collide 2>&1"
+    ))
+    assert "skill name 'collide-b-overview' is claimed twice" in out, out
+    # Refused AND clean: neither is in config.json, and neither left an orphan
+    # source tree behind for the next reader to puzzle over.
+    n = machine.succeed(f"jq -r '.plugins | length' {collide_cfg}").strip()
+    assert n == "2", f"a refused add still mutated config.json: {n!r}"
+    machine.fail(as_user(
+        "test -e /home/testuser/.config/cogbox/instances/collide"
+        "/plugin-sources/collide-reserved"
+    ))
+
+    # THE UPDATE PATH runs the same lint, and that is not symmetry for its own
+    # sake: an update installs a version nobody has reviewed, so it is the one
+    # mutation that can introduce an unresolvable name into a set that was fine
+    # yesterday. It is linted from the STORE before anything on the instance is
+    # replaced, so a refusal leaves the old pin, the old source and the old
+    # composition exactly as they were -- the box keeps booting.
+    def pin_of(pname):
+        return machine.succeed(
+            "jq -r '.plugins[] | select(.name==\"" + pname + "\") | .narHash' " + collide_cfg
+        ).strip()
+
+    old_pin = pin_of("collide-a")
+    machine.succeed(as_user(
+        "mkdir -p /home/testuser/collide-a/contents/skills/cogbox-plugins"
+    ))
+    machine.succeed(as_user(
+        "printf -- '---\\nname: cogbox-plugins\\n---\\n' > "
+        "/home/testuser/collide-a/contents/skills/cogbox-plugins/SKILL.md"
+    ))
+    out = machine.fail(as_user("cogbox plugin update collide-a --name collide 2>&1"))
+    assert "reserves for its own generated capability index" in out, out
+    assert pin_of("collide-a") == old_pin, (
+        f"a refused update still re-pinned collide-a: {old_pin!r} -> {pin_of('collide-a')!r}"
+    )
+    # ...and the installed source is still the OLD version, so the composition's
+    # path: input keeps resolving to something that builds.
+    machine.fail(as_user(
+        "test -e /home/testuser/.config/cogbox/instances/collide"
+        "/plugin-sources/collide-a/contents/skills/cogbox-plugins"
+    ))
+
+    # THE MULTI-PLUGIN SHAPE, where the refusal lands MID-LOOP. `update` with no
+    # argument walks every installed plugin: collide-a resolves and has its
+    # source replaced, then collide-b's new version trips the lint. Exiting
+    # there would strand collide-a -- its new tree on disk, but config.json (and
+    # the composition lock, both written after the loop) still naming the old
+    # rev. nix honours a stale lock rather than erroring, so the guest would go
+    # on building the old plugin until some later add/del/update silently jumped
+    # it to a version `plugin list` never recorded, all while the operator was
+    # told the update was refused. The loop has to finish instead: what updated
+    # is saved, what refused is left exactly as it was, and the run still exits
+    # non-zero.
+    machine.succeed(as_user(
+        "rm -rf /home/testuser/collide-a/contents/skills/cogbox-plugins"
+    ))
+    machine.succeed(as_user(
+        "mkdir -p /home/testuser/collide-a/contents/skills/alpha"
+    ))
+    machine.succeed(as_user(
+        "printf -- '---\\nname: alpha\\n---\\n' > "
+        "/home/testuser/collide-a/contents/skills/alpha/SKILL.md"
+    ))
+    machine.succeed(as_user(
+        "mkdir -p /home/testuser/collide-b/contents/skills/cogbox-plugins"
+    ))
+    machine.succeed(as_user(
+        "printf -- '---\\nname: cogbox-plugins\\n---\\n' > "
+        "/home/testuser/collide-b/contents/skills/cogbox-plugins/SKILL.md"
+    ))
+    a_pin, b_pin = pin_of("collide-a"), pin_of("collide-b")
+    out = machine.fail(as_user("cogbox plugin update --name collide 2>&1"))
+    assert "reserves for its own generated capability index" in out, out
+    assert "collide-b: not updated" in out, out
+    assert "collide-a: updated to" in out, out
+    assert pin_of("collide-a") != a_pin, (
+        f"collide-a's new source is installed but config.json still pins {a_pin!r}"
+    )
+    assert pin_of("collide-b") == b_pin, f"a refused update re-pinned collide-b: {out}"
+    # The saved pin and the tree on disk agree, on both sides.
+    machine.succeed(as_user(
+        "test -e /home/testuser/.config/cogbox/instances/collide"
+        "/plugin-sources/collide-a/contents/skills/alpha"
+    ))
+    machine.fail(as_user(
+        "test -e /home/testuser/.config/cogbox/instances/collide"
+        "/plugin-sources/collide-b/contents/skills/cogbox-plugins"
+    ))
+
     # Q4: boot. The wrapper sees .plugins non-empty, re-execs with the
     # composition flake; the rebuilt runner resolves as a cache hit against
     # the pre-built test-plugin fixture. Both modules AND both merged rules
@@ -1364,6 +1529,14 @@ with subtest("Phase M: terminate-by-default + --passthrough + --insecure-upstrea
     #    (verify on) -> 502 over a TRUSTED client TLS leg.
     machine.succeed(as_user("printf '' | cogbox l7 set --name work"))
     boot_and_wait("cc-work", "--name work", ssh_port=2223)
+    # No launch flags here: neither Phase D's work grant nor Phase E's
+    # edited-runner grant may survive into this fresh work VM.
+    machine.succeed(as_user(
+        "cogbox ssh --name work " + shlex.quote(
+            f"test ! -e {shlex.quote(rw_host_dir)} && "
+            f"test ! -e {shlex.quote(ro_host_dir)}"
+        )
+    ))
     # Backend up + CA injected even though the instance booted with no rules.
     machine.succeed(f"test -f {rt}/l7mitm.pid && kill -0 $(cat {rt}/l7mitm.pid)")
     machine.succeed(as_user("cogbox ssh --name work 'test -s /run/cogbox/l7-ca.crt'"))

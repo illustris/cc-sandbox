@@ -15,6 +15,12 @@
 #       resolver). BEFORE (d2): a maintenance boot exists precisely so a
 #       mutation can run against a STOPPED instance, and a mutation needs a
 #       config.json to mutate. Initializing is host-half work, not starting.
+#       A FAILED init is classified rather than swallowed: the combined output
+#       is kept on the state disk, an allowlisted summary goes to serial
+#       (deduplicated) and to the cogworx/boot-error guest attribute. Both are
+#       cleared only by an init that RUNS and SUCCEEDS -- a maintenance boot
+#       skips init, and is the boot an operator uses to investigate a wedged
+#       box, so it must preserve them.
 #   d2  maintenance short-circuit: initialized, but the sandbox guest is
 #       deliberately never started
 #   c   stage the gateway SSH CA + principal before the guest boots
@@ -25,13 +31,20 @@
 #   i   hold the unit open for the sandbox's lifetime
 #   j   delete readiness FIRST, then exit non-zero so Restart=always re-runs
 #
+# Failure backoff: every exit that means "this boot FAILED" sleeps first
+# (backoff_sleep, doubling per consecutive failed boot), because the unit's own
+# RestartSec is flat. Leg (j) is not one of those -- a sandbox that merely
+# stopped restarts immediately -- and a sandbox that started resets the counter.
+#
 # Serial discipline: this script's stdout and stderr go to the
 # JOURNAL. Only classified boot/lifecycle lines reach serial, and only through
 # emit(). Nothing here inherits a file descriptor pointing at the serial port,
 # because on GCE serial output is provider-retained state outside the VM
 # boundary, readable under a coarser grant than the control channel -- and
 # cogbox.log carries l7proxy's per-request allow/deny decisions and the
-# mitmproxy credential-injection addon's output.
+# mitmproxy credential-injection addon's output. The one place a child's output
+# informs a serial line -- leg (b)'s init classification -- goes through an
+# ALLOWLIST (init_error_summary), never a filter.
 
 set -uo pipefail
 
@@ -52,9 +65,56 @@ HOSTKEY_TIMEOUT="${COGWORX_HOSTKEY_TIMEOUT:-60}"
 # it spawns -- writes to the journal.
 emit() { printf 'cogworx: %s\n' "$*" >>"$SERIAL" 2>/dev/null || true; }
 note() { printf 'cogworx-supervisor: %s\n' "$*"; }
+
+# --- restart backoff, on the FAILURE path only ------------------------------
+#
+# The unit is Restart=always with a FLAT RestartSec, because systemd's own
+# RestartSteps= backoff cannot tell these two apart: leg (j) exits non-zero on
+# every ordinary sandbox exit (an in-guest `reboot` included) and systemd never
+# resets its restart counter after a successful run, so a unit-level backoff
+# would make the ninth reboot of a healthy box wait five minutes. This script
+# knows the difference, so the backoff lives here.
+#
+# The counter is restart-scoped: /run is a tmpfs, so a real VM reboot starts
+# clean while the Restart=always cycle keeps counting -- the window in which a
+# permanently-failing boot restarts without bound, which is what the init
+# classification below exists for. Doubling BACKOFF_BASE to BACKOFF_MAX means a
+# transient failure (a resolv.conf race, a guest disk that has not appeared
+# yet) still retries within seconds, while a permanent one settles at one
+# attempt per BACKOFF_MAX. The unit is never given up on: StartLimitIntervalSec
+# stays 0, so this only ever stretches the interval.
+BACKOFF_STATE="${XDG_RUNTIME_DIR:-/run}/cogworx-supervisor-backoff"
+BACKOFF_BASE="${COGWORX_BACKOFF_BASE:-5}"
+BACKOFF_MAX="${COGWORX_BACKOFF_MAX:-300}"
+
+backoff_sleep() {
+	local n=0 d i
+	if [ -r "$BACKOFF_STATE" ]; then
+		read -r n < "$BACKOFF_STATE" 2>/dev/null || n=0
+	fi
+	case "$n" in ''|*[!0-9]*) n=0 ;; esac
+	printf '%s\n' "$(( n + 1 ))" > "$BACKOFF_STATE" 2>/dev/null || true
+	d="$BACKOFF_BASE"
+	i=0
+	while [ "$i" -lt "$n" ] && [ "$d" -lt "$BACKOFF_MAX" ]; do
+		d=$(( d * 2 ))
+		i=$(( i + 1 ))
+	done
+	[ "$d" -le "$BACKOFF_MAX" ] || d="$BACKOFF_MAX"
+	note "delaying ${d}s before this exit so the unit's restart is not a hot loop (consecutive failed boots: $(( n + 1 )))"
+	if [ "$d" -gt 0 ]; then sleep "$d"; fi
+}
+
+# Cleared by the one thing that proves this boot got somewhere: a sandbox that
+# actually started. A boot that only reached a short-circuit (resolver,
+# maintenance) never clears it, because those hold the unit open forever and
+# never restart at all.
+backoff_reset() { rm -f "$BACKOFF_STATE" 2>/dev/null || true; }
+
 fatal() {
 	note "$*"
 	emit "FAILED: $*"
+	backoff_sleep
 	exit 1
 }
 
@@ -67,6 +127,78 @@ md_path() { curl -fsS -H "$MDHDR" --max-time 10 "$MD/$1" 2>/dev/null; }
 md_has() { curl -fsS -o /dev/null -H "$MDHDR" --max-time 10 "$MD/instance/attributes/$1" 2>/dev/null; }
 ga_put() { curl -fsS -o /dev/null -X PUT --data-binary "$2" -H "$MDHDR" --max-time 10 "$GA/$1" 2>/dev/null; }
 ga_del() { curl -fsS -o /dev/null -X DELETE -H "$MDHDR" --max-time 10 "$GA/$1" 2>/dev/null; }
+
+# --- init-failure classification (used by leg (b)) --------------------------
+#
+# `cogbox init` is where a boot dies when the guest system itself is the
+# problem: a plugin pair whose skill names cogbox cannot resolve, a corrupt
+# config.json, a flake that will not evaluate. Its output used to exist ONLY in
+# this unit's journal, which is unreachable from outside a box that never came
+# up, while serial got the bare string "cogbox init failed" -- so diagnosing a
+# sandbox stuck "Booting" meant getting a shell on it first.
+
+# The full combined output, kept on the STATE DISK rather than in /run, because
+# the state disk survives the reboot a user reaches for first and a tmpfs does
+# not. Written on every init and REMOVED on success, so its presence means the
+# last init failed and its contents are that failure.
+INIT_LOG="$STATE_DIR/last-init-error.log"
+# Restart-scoped dedup state for the serial line below. /run is a tmpfs, so
+# this resets on a real reboot but survives the Restart=always cycle -- exactly
+# the window the dedup is about.
+INIT_STATE="${XDG_RUNTIME_DIR:-/run}/cogworx-init-error.state"
+
+# Reduce init's output to something serial may carry.
+#
+# An ALLOWLIST, not a filter, and that distinction is load-bearing: serial on
+# GCE is provider-retained state outside the VM boundary, readable under a
+# coarser grant than the control channel (see the header). So the rule is "only
+# lines cogbox stamped with its own prefix get out" -- which covers both the
+# `error: cogbox: ...` throw shape and the `- cogbox: ...` assertion shape --
+# rather than "strip the lines we currently believe to be sensitive", which
+# would leak the first shape nobody thought of. Capped at 3 lines x 200 chars
+# so one failure cannot overwrite the 1 MB serial ring buffer, stripped of
+# anything outside printable ASCII, and falling back to today's generic string
+# when nothing matched.
+init_error_summary() {
+	local s
+	s=$(awk '
+		/cogbox: / && n < 3 {
+			line = substr($0, 1, 200)
+			gsub(/[^ -~]/, " ", line)
+			out = out sep line
+			sep = " | "
+			n++
+		}
+		END { print out }
+	' "$1" 2>/dev/null)
+	[ -n "$s" ] || s="cogbox init failed"
+	printf '%s' "$s"
+}
+
+# One serial line per DISTINCT failure. Undeduplicated, this leg writes one
+# line per restart, overrunning the ring buffer within hours and destroying
+# the earlier maintenance-boot output -- real forensic damage, on the one
+# channel available for a box that never came up. So: emit the first
+# failure, then only when the summary CHANGES, plus a heartbeat every 20th
+# restart so a permanently-stuck box still says it is still stuck.
+emit_init_failure() {
+	local summary="$1" hash prev="" count=0
+	hash=$(printf '%s' "$summary" | sha256sum | cut -c1-16)
+	if [ -r "$INIT_STATE" ]; then
+		read -r prev count < "$INIT_STATE" 2>/dev/null || true
+	fi
+	case "$count" in ''|*[!0-9]*) count=0 ;; esac
+	if [ "$hash" != "$prev" ]; then
+		count=1
+		emit "FAILED: init: $summary"
+	else
+		count=$((count + 1))
+		if [ $((count % 20)) -eq 0 ]; then
+			emit "FAILED: init still failing after $count attempts: $summary"
+		fi
+	fi
+	printf '%s %s\n' "$hash" "$count" > "$INIT_STATE" 2>/dev/null || true
+}
 
 # --- (a) the per-start nonce, read exactly once per boot --------------------
 #
@@ -254,7 +386,39 @@ else
 		init_args+=(--self-addr "$cidr")
 	done
 	emit "initializing instance $INSTANCE"
-	cogbox "${init_args[@]}" || fatal "cogbox init failed"
+	# Tee'd, not swallowed: the journal still gets every line, and the state
+	# disk keeps a copy that outlives the reboot. The status has to come from
+	# PIPESTATUS -- `set -o pipefail` at the top of this file reports the
+	# rightmost failure, so a full state disk would let tee's status stand in
+	# for init's and turn a failed init into a "successful" one.
+	cogbox "${init_args[@]}" 2>&1 | tee "$INIT_LOG"
+	init_rc=${PIPESTATUS[0]}
+	if [ "$init_rc" -ne 0 ]; then
+		init_summary="$(init_error_summary "$INIT_LOG")"
+		# Published as a guest attribute as well as emitted to serial: the
+		# control plane already polls cogworx/ready, so this is the channel that
+		# turns "Booting forever" into a reason without anyone reading a console
+		# dump. Guest-attribute values are size-limited, so only the head of the
+		# summary goes out; the full text is in $INIT_LOG and the journal.
+		ga_put cogworx/boot-error "$NONCE ${init_summary:0:200}" \
+			|| note "warning: could not publish the cogworx/boot-error guest attribute"
+		emit_init_failure "$init_summary"
+		note "cogbox init failed (rc=$init_rc); combined output kept at $INIT_LOG"
+		backoff_sleep
+		exit 1
+	fi
+	# Cleared only by an init that RAN and SUCCEEDED. Deliberately inside this
+	# branch rather than past the whole if/else: the `if` above skips init
+	# entirely on an already-initialized maintenance boot, and a maintenance boot
+	# is exactly the boot an operator reaches for to investigate a box that is
+	# stuck on a failing init. Clearing there would delete the state-disk log and
+	# the guest attribute -- the two things this leg exists to preserve -- before
+	# anyone read them, and then hold at `sleep infinity` with no recorded
+	# reason. Conversely a stale boot-error outliving its failure is worse than
+	# none, since it would be read as the reason for the NEXT problem; an init
+	# that just succeeded is the one event that proves it stale.
+	rm -f "$INIT_LOG"
+	ga_del cogworx/boot-error || true
 fi
 
 # --- (d2) maintenance short-circuit -----------------------------------------
@@ -403,8 +567,16 @@ start_args=(start --no-ssh -y -n "$INSTANCE")
 if ! cogbox "${start_args[@]}"; then
 	emit "sandbox start failed"
 	ga_del cogworx/ready || true
+	backoff_sleep
 	exit 1
 fi
+# A sandbox that started is the proof this boot got somewhere, so the failure
+# backoff resets here and NOT at leg (j): leg (j) fires on every ordinary
+# sandbox exit, an in-guest `reboot` included, which is not a failure and must
+# never be delayed. The one shape this leaves un-backed-off -- start succeeds,
+# guest never becomes ready -- needs none: that cycle already costs a full
+# READY_TIMEOUT (300 s by default) before it can exit, which IS the cap.
+backoff_reset
 
 # --- (h) + (i) readiness, then hold the unit open ---------------------------
 #
@@ -442,6 +614,12 @@ while :; do
 done
 
 # --- (j) unpublish, THEN fail so Restart=always re-runs the sequence --------
+#
+# NO backoff here, on purpose. This exit is the NORMAL path: a user typing
+# `reboot` inside their sandbox, or a guest that stopped for any other reason,
+# lands on exactly this line, and the whole point of Restart=always is that the
+# sandbox comes straight back. Delaying it would turn an in-guest reboot into a
+# multi-minute "Booting" with nothing to explain it.
 ga_del cogworx/ready || true
 note "sandbox is no longer running; exiting so the unit restarts"
 exit 1

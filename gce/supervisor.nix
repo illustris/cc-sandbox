@@ -138,6 +138,19 @@ in
 				ExecStart = "${supervise}/bin/cogworx-supervise";
 				ExecStopPost = "${stopPost}/bin/cogworx-supervisor-stop";
 				Restart = "always";
+				# FLAT, and deliberately so. The obvious way to stop a permanently
+				# broken box that restarts without bound (the failure mode
+				# behind gce/supervise.sh's init classification) is
+				# RestartSteps= + RestartMaxDelaySec= here -- but systemd's restart
+				# counter is NOT reset by a run that succeeded, and leg (j) of
+				# supervise.sh exits 1 on EVERY ordinary sandbox exit, an in-guest
+				# `reboot` included. Measured on systemd 257: after four one-second
+				# runs the delay pins to the cap, and a subsequent 30 s healthy run
+				# still restarts at the cap. So a unit-level backoff throttles the
+				# NORMAL restart path -- a user who has rebooted inside their
+				# sandbox eight times would wait five minutes for the ninth, with
+				# nothing anywhere saying why. The backoff therefore lives in
+				# supervise.sh, which can tell a failed boot from a finished one.
 				RestartSec = 5;
 				# journal, NOT journal+console. See the header.
 				StandardOutput = "journal";
@@ -147,7 +160,11 @@ in
 			};
 			unitConfig = {
 				# Keep retrying instead of allowing a systemd start limit to
-				# silently stop the supervisor.
+				# silently stop the supervisor. This stays 0 even with the
+				# script-side backoff: the INTERVAL between failed attempts may
+				# grow, but a box that would eventually recover must never be
+				# given up on -- the supervisor is the only thing that starts the
+				# sandbox.
 				StartLimitIntervalSec = 0;
 			};
 		};
