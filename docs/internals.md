@@ -44,7 +44,7 @@ The keypair sits in the data-dir root, a sibling of `instances/`. Only `instance
 
 ## Runtime directory and 9p shares
 
-QEMU's 9p share sources must be absolute paths known at build time. The wrapper creates a per-instance symlink directory pointing to the user's actual paths, so the built VM image works for any user. Runtime state lives under `$XDG_RUNTIME_DIR/cogbox` (typically `/run/user/$UID/cogbox`); named instances append a `-<name>` suffix. Each has its own symlinks and PID lock:
+Static QEMU 9p share sources use build-time sentinel paths that the wrapper rewrites into a per-instance symlink directory, so the built VM image works for any user. Launch-only `--add-dir` and `--add-dir-ro` grants use the MicroVM runner's runtime argument hook instead: the wrapper canonicalizes each selected source, stages it behind a numeric alias, and passes only fixed alias-based QEMU tokens. Runtime state lives under `$XDG_RUNTIME_DIR/cogbox` (typically `/run/user/$UID/cogbox`); named instances append a `-<name>` suffix. Each has its own symlinks and PID lock:
 
 ```
 $XDG_RUNTIME_DIR/cogbox[-<name>]/
@@ -57,6 +57,11 @@ $XDG_RUNTIME_DIR/cogbox[-<name>]/
   hermes-agent-home      -> $COGBOX_HERMES_HOME
   omp-home               -> $COGBOX_OMP_HOME
   pi-home                -> $COGBOX_PI_HOME
+  additional-dirs/
+    0                   -> first canonical --add-dir/--add-dir-ro source
+    1                   -> second canonical source
+  additional-dir-args   # executable producing fixed alias-based -fsdev/-device tokens
+  system-additional-dirs # fw_cfg JSON: tag, same-path guest target, read-only mode
   .harness-stubs/        # empty stubs for inactive harnesses (so QEMU
                          # 9p sources resolve even when the host has no
                          # state for a given harness)
@@ -70,13 +75,19 @@ $XDG_RUNTIME_DIR/cogbox[-<name>]/
 
 If `$XDG_RUNTIME_DIR` is unset and `/run/user/$UID` doesn't exist (no active logind session), the wrapper falls back to `/tmp/cogbox-runtime-$UID/` per the XDG spec.
 
+The numeric aliases and their manifest exist for one VM lifetime. Cleanup waits for QEMU to exit before deleting `additional-dirs/`, `additional-dir-args`, and `system-additional-dirs`, even when a crashed launch retains the rest of the runtime directory for logs. A later flagless launch stages an empty manifest and exposes none of the prior paths.
+
 `cogbox delete [-n <name>]` removes all three of these per-instance trees -- the config dir, the data dir, and the runtime dir -- for one instance. It refuses while the instance is running (stop it first) and prompts before removing anything unless `-y` is given.
 
 ## Launch-time patching
 
-Runtime settings (vcpu, memory, ports) are applied by patching the microvm runner script's QEMU arguments at launch time. Settings that affect the guest (overlay sizes, SSH keys) are written to the instance's data directory where systemd services inside the VM pick them up at boot. The wrapper patches the QEMU runner's 9p share source paths to point at the instance-specific runtime directory, so the same VM image serves all instances.
+Runtime settings (vcpu, memory, ports) are applied by patching the microvm runner script's QEMU arguments at launch time. Settings that affect the guest (overlay sizes, SSH keys) are written to the instance's data directory where systemd services inside the VM pick them up at boot. The wrapper patches the static QEMU runner's 9p share source paths to point at the instance-specific runtime directory, so the same VM image serves all instances.
 
-Single-file injections (harness auth tokens, the L7 CA certificate) go through QEMU's `fw_cfg` instead of 9p: the wrapper passes `-fw_cfg name=opt/<tag>,file=<source>` and a guest systemd service copies the blob out of `/sys/firmware/qemu_fw_cfg` at boot.
+Additional host directories avoid runner text injection. Cogbox owns `microvm.extraArgsScript`, which executes `additional-dir-args` after the sentinel rewrite; every generated `-fsdev` references only `additional-dirs/N`. The paired `system-additional-dirs` fw_cfg manifest carries the canonical target and access mode. `cogbox-additional-dirs.service` validates the complete manifest, rejects guest-state and special-filesystem collisions, and mounts each 9p tag at the same canonical absolute path before sshd. Read-only grants are enforced both by QEMU's `readonly=true` export and the guest's `ro` mount option.
+
+Single-file injections (harness auth tokens, the L7 CA certificate, and the additional-directory manifest) go through QEMU's `fw_cfg` instead of a static 9p share: the wrapper passes `-fw_cfg name=opt/<tag>,file=<source>` and a guest systemd service consumes the blob from `/sys/firmware/qemu_fw_cfg` at boot.
+
+Dynamic host-directory grants apply to both workstation and hosted QEMU runners because this plumbing lives in the shared VM module. The container target deliberately has no equivalent: OCI and Kubernetes deployments must select host-directory mounts in their orchestrator, and `cogbox-container` has no VM runner.
 
 ## Guest extension re-exec
 

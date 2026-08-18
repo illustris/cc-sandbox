@@ -58,6 +58,8 @@ pub fn run(
 		.{ .long = "vcpu", .kind = .value },
 		.{ .long = "mem", .kind = .value },
 		.{ .long = "network", .kind = .value },
+		.{ .long = "add-dir", .kind = .value_multi },
+		.{ .long = "add-dir-ro", .kind = .value_multi },
 		.{ .long = "no-auto-keys", .kind = .bool },
 		.{ .long = "yes", .short = 'y', .kind = .bool },
 		.{ .long = "foreground", .short = 'f', .kind = .bool },

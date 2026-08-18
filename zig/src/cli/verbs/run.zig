@@ -75,6 +75,10 @@ pub fn launchInPlace(
 		.{ .long = "no-implicit-dns", .kind = .bool },
 		.{ .long = "dns-host", .kind = .value },
 		.{ .long = "self-addr", .kind = .value_multi },
+		// Launch-only host grants. Direct `init` deliberately does not declare
+		// these; hidden `__launch` receives them after a custom-flake re-exec.
+		.{ .long = "add-dir", .kind = .value_multi },
+		.{ .long = "add-dir-ro", .kind = .value_multi },
 		.{ .long = "no-auto-keys", .kind = .bool },
 		.{ .long = "yes", .short = 'y', .kind = .bool },
 	};
@@ -127,6 +131,23 @@ pub fn validate(
 
 	// Caller-owned (the process execs immediately after; tests free it).
 	const self_addrs = parsed.getAll(allocator, "self-addr") catch &.{};
+	var additional_dirs: std.ArrayList(launch.AdditionalDir) = .empty;
+	errdefer additional_dirs.deinit(allocator);
+	for (parsed.multi.items) |m| {
+		const read_only = if (std.mem.eql(u8, m.name, "add-dir"))
+			false
+		else if (std.mem.eql(u8, m.name, "add-dir-ro"))
+			true
+		else
+			continue;
+		validateAdditionalDirPath(allocator, io, verb_name, m.value);
+		try additional_dirs.append(allocator, .{ .path = m.value, .read_only = read_only });
+	}
+	const additional_dirs_owned: []const launch.AdditionalDir = if (additional_dirs.items.len == 0) blk: {
+		additional_dirs.deinit(allocator);
+		break :blk &.{};
+	} else try additional_dirs.toOwnedSlice(allocator);
+
 
 	return .{
 		.name = name,
@@ -139,7 +160,30 @@ pub fn validate(
 		.no_implicit_dns = parsed.isSet("no-implicit-dns"),
 		.dns_host = parsed.get("dns-host"),
 		.self_addrs = self_addrs,
+		.additional_dirs = additional_dirs_owned,
 		.foreground = parsed.isSet("foreground"),
 		.no_ssh = parsed.isSet("no-ssh"),
 	};
+}
+
+fn validateAdditionalDirPath(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	verb_name: []const u8,
+	path: []const u8,
+) void {
+	for (path) |c| {
+		if (std.ascii.isControl(c)) {
+			util.die(allocator, io, verb_name, exit_codes.dataerr, "additional directory path contains an ASCII control character", .{});
+		}
+	}
+
+	// The default follows a top-level symlink. Canonicalization and protected
+	// path checks happen in the bash launcher, still relative to the caller's cwd.
+	const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+		util.die(allocator, io, verb_name, exit_codes.noinput, "additional directory is missing or inaccessible: {s}", .{path});
+	};
+	if (stat.kind != .directory) {
+		util.die(allocator, io, verb_name, exit_codes.dataerr, "additional directory option requires a directory: {s}", .{path});
+	}
 }

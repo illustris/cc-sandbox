@@ -70,8 +70,8 @@ pub const TOP_LEVEL =
     \\  0   success
     \\  3   status: instance is stopped
     \\  64  bad CLI args, unknown verb or flag (EX_USAGE)
-    \\  65  bad data: invalid CIDR, integer, name (EX_DATAERR)
-    \\  66  missing/unreadable input: instance never inited, or --from-file unreadable (EX_NOINPUT)
+    \\  65  bad data: invalid value or wrong-type directory input (EX_DATAERR)
+    \\  66  missing/unreadable input: config, file, or directory (EX_NOINPUT)
     \\  70  internal/system error (EX_SOFTWARE)
     \\  73  cannot write file: secret store write failed (EX_CANTCREAT)
     \\  75  already running, port collision (EX_TEMPFAIL)
@@ -94,6 +94,10 @@ pub const START =
     \\  --vcpu N              vCPU count (default: 16; or value from config.json)
     \\  --mem N               RAM in megabytes (default: 32768; or from config.json)
     \\  --network MODE        Network mode: full, none, or rules (default: rules)
+    \\  --add-dir DIR         Mount an existing host directory read-write at its
+    \\                        canonical absolute path in the guest. Repeatable.
+    \\  --add-dir-ro DIR      Mount an existing host directory read-only at its
+    \\                        canonical absolute path in the guest. Repeatable.
     \\  --no-auto-keys        On first init, leave authorized_keys empty instead of
     \\                        seeding from ~/.ssh/*.pub and ssh-add -L, and skip
     \\                        generating cogbox's own SSH key
@@ -110,6 +114,8 @@ pub const START =
     \\output goes to <runtime>/cogbox.log, and the guest serial console is
     \\captured to <runtime>/console.log. Exits 75 if an instance with the same
     \\name is already running.
+    \\Additional directory grants apply only to this launch and are not written
+    \\to config.json. Repeat them on every later `start` or `restart`.
     \\
     \\Examples:
     \\  cogbox                           Start the default instance and SSH in
@@ -118,6 +124,8 @@ pub const START =
     \\  cogbox --name work               Start the "work" instance and SSH in
     \\  cogbox --vcpu 8 --mem 16384      Start with custom resources, then SSH in
     \\  cogbox --network none --no-ssh   Start fully isolated, don't connect
+    \\  cogbox --add-dir ./src --add-dir-ro '/opt/shared docs'
+    \\                                    Mount two host trees with mixed access
     \\
     \\See also: cogbox ssh, cogbox console, cogbox monitor, cogbox status, cogbox stop
     \\

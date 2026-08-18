@@ -2400,6 +2400,11 @@
 
 				microvm = lib.mkIf isVm {
 					writableStoreOverlay = "/nix/.rw-store";
+					# Cogbox owns the singular runtime hook. A user extension that
+					# defines a different extraArgsScript gets a normal Nix conflicting-
+					# definitions error instead of silently disabling dynamic shares;
+					# extension-owned static arguments belong in qemu.extraArgs.
+					extraArgsScript = "${runtimeDir}/additional-dir-args";
 					forwardPorts = [
 						{ from = "host"; host.port = 2222; host.address = "127.0.0.1"; guest.port = 22; }
 						{ from = "host"; host.port = 8080; host.address = "127.0.0.1"; guest.port = 8080; }
@@ -2501,12 +2506,13 @@
 						"-fw_cfg"
 						"name=opt/${tag p.harness p.pathkey},file=${sentinel p.harness p.pathkey}"
 					]) fwCfgPaths ++ [
-						# System (instance-level, not per-harness) fw_cfg carrying
-						# the L7 terminate CA cert. ALWAYS emitted -- the launcher
-						# stages an empty stub when terminate is off -- so the guest
-						# image stays byte-identical regardless of L7 state.
+						# System (instance-level, not per-harness) fw_cfg payloads.
+						# Both are always emitted and staged, including empty forms, so
+						# the guest closure is independent of per-launch state.
 						"-fw_cfg"
 						"name=opt/system-l7ca,file=${runtimeDir}/system-l7ca"
+						"-fw_cfg"
+						"name=opt/system-additional-dirs,file=${runtimeDir}/system-additional-dirs"
 					];
 				};
 				# re-run the L7 trust assembly whenever the enforcer (re)publishes
@@ -2547,6 +2553,129 @@
 						};
 					}
 				) fwCfgPaths)) // {
+					cogbox-additional-dirs = {
+						description = "Validate and mount launch-only host directories";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "multi-user.target" "sshd.service" ];
+						after = [ "systemd-modules-load.service" ];
+						path = [ pkgs.jq pkgs.coreutils pkgs.util-linux ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							TimeoutStartSec = 120;
+							ExecStart = pkgs.writeShellScript "cogbox-additional-dirs-start" ''
+								set -euo pipefail
+
+								manifest=/sys/firmware/qemu_fw_cfg/by_name/opt/system-additional-dirs/raw
+								mounted=()
+
+								fail() {
+									echo "cogbox-additional-dirs: $*" >&2
+									exit 1
+								}
+								path_at_or_below() {
+									[ "$1" = "$2" ] || [[ "$1" == "$2/"* ]]
+								}
+								paths_overlap() {
+									[ "$1" = "$2" ] || [[ "$1" == "$2/"* ]] || [[ "$2" == "$1/"* ]]
+								}
+								rollback() {
+									local rc=$?
+									if [ "$rc" -ne 0 ]; then
+										for ((i = ''${#mounted[@]} - 1; i >= 0; i--)); do
+											if mountpoint -q -- "''${mounted[i]}"; then
+												umount -- "''${mounted[i]}" || true
+											fi
+										done
+									fi
+								}
+								trap rollback EXIT
+
+								jq -e '
+									type == "array"
+									and all(.[];
+										type == "object"
+										and (keys == ["readOnly", "tag", "target"])
+										and (.tag | type == "string")
+										and (.target | type == "string")
+										and (.readOnly | type == "boolean")
+									)
+								' "$manifest" >/dev/null \
+									|| fail "firmware payload must be an array of exact tag/target/readOnly objects"
+
+								mapfile -t entries < <(jq -c '.[]' "$manifest")
+								protected_targets=( ${lib.escapeShellArgs ([
+									"/var/lib/cogbox"
+									poolMount
+									"/var/lib/harness-lower"
+									"/var/lib/harness-rw"
+									"/root/work"
+								] ++ map (p: p.guest) allPaths)} )
+
+								# Validate the complete manifest before creating a target or
+								# mounting anything. The rollback trap still protects the
+								# mount loop against a later runtime failure.
+								for i in "''${!entries[@]}"; do
+									entry="''${entries[i]}"
+									tag=$(jq -r '.tag' <<<"$entry")
+									target=$(jq -r '.target' <<<"$entry")
+									read_only=$(jq -r '.readOnly' <<<"$entry")
+									[ "$tag" = "cogbox-add-dir-$i" ] \
+										|| fail "non-contiguous or invalid mount tag at index $i"
+									[ "$target" != / ] \
+										|| fail "target / is not permitted"
+									for special_root in /dev /proc /sys /run /nix; do
+										if path_at_or_below "$target" "$special_root"; then
+											fail "target $target is at or below protected path $special_root"
+										fi
+									done
+									for protected in "''${protected_targets[@]}"; do
+										if paths_overlap "$target" "$protected"; then
+											fail "target $target overlaps protected guest path $protected"
+										fi
+									done
+									canonical=$(realpath -m -- "$target") \
+										|| fail "cannot resolve target $target"
+									[ "$canonical" = "$target" ] \
+										|| fail "target is not canonical or crosses an existing symlink: $target"
+									case "$read_only" in
+										true|false) ;;
+										*) fail "readOnly is not boolean at index $i" ;;
+									esac
+								done
+
+								for i in "''${!entries[@]}"; do
+									entry="''${entries[i]}"
+									tag=$(jq -r '.tag' <<<"$entry")
+									target=$(jq -r '.target' <<<"$entry")
+									read_only=$(jq -r '.readOnly' <<<"$entry")
+									mkdir -p -- "$target"
+									[ "$(realpath -m -- "$target")" = "$target" ] \
+										|| fail "target changed through a symlink before mount: $target"
+									mode=rw
+									[ "$read_only" = true ] && mode=ro
+									mount -t 9p \
+										-o "trans=virtio,version=9p2000.L,msize=65536,$mode" \
+										"$tag" "$target"
+									mounted+=("$target")
+								done
+							'';
+							ExecStop = pkgs.writeShellScript "cogbox-additional-dirs-stop" ''
+								set -uo pipefail
+
+								manifest=/sys/firmware/qemu_fw_cfg/by_name/opt/system-additional-dirs/raw
+								[ -r "$manifest" ] || exit 0
+								mapfile -t targets < <(jq -r 'reverse[].target' "$manifest")
+								rc=0
+								for target in "''${targets[@]}"; do
+									if mountpoint -q -- "$target"; then
+										umount -- "$target" || rc=1
+									fi
+								done
+								exit "$rc"
+							'';
+						};
+					};
 					cogbox-brain-materialize = let
 						# The mount this unit writes THROUGH: hermes skills are linked into
 						# the overlay UPPER, so linking before the mount writes to the

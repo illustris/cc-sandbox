@@ -140,15 +140,17 @@ Run `cogbox VERB --help` for verb-specific options.
 | `--mem N` | `start`, `init` | RAM in MB (default: config.json or 32768) |
 | `--network MODE` | `start`, `init` | `full`, `none`, or `rules` (default: rules) |
 | `--no-auto-keys` | `start`, `init` | Leave `authorized_keys` empty instead of seeding, and skip generating cogbox's own SSH key |
+| `--add-dir DIR` | `start`, `restart` | Mount an existing host directory read-write at the same canonical absolute path in the guest. Repeatable. |
+| `--add-dir-ro DIR` | `start`, `restart` | Mount an existing host directory read-only at the same canonical absolute path in the guest. Repeatable. |
 | `--bind-addr ADDR` | `init` | Seed `bindAddr` (default `127.0.0.1`) |
 | `--no-implicit-dns` | `init` | Seed `network.implicitDns = false`, so port 53 stops escaping the L4 rule walk. Rules mode only -- see [network filtering](docs/network-filtering.md) |
 | `--self-addr CIDR` | `init` | Seed one `network.selfAddrs` entry (repeatable): an address of the enclosing host, added to the L7 proxy's non-overridable floor. Rules mode only |
 | `--force` | `stop` | Send SIGKILL after 10s if SIGTERM doesn't exit the process |
 | `--json` | `list` | Emit one JSON object per instance |
 
-When an instance is first created, `--vcpu`, `--mem`, and `--network` are
-saved to its `config.json`. On subsequent runs they override the config for
-that run only.
+When an instance is first created, `--vcpu`, `--mem`, and `--network` are saved to its `config.json`. On subsequent runs they override the config for that run only.
+
+Additional-directory grants are launch-only and do not change the `config.json` schema. Repeat `--add-dir` and `--add-dir-ro` on every later `start` or `restart`; a flagless launch inherits none. `--add-dir` lets guest root modify the selected host tree with the permissions of the launcher user. Use `--add-dir-ro` unless host writes are required.
 
 ### Exit codes
 
@@ -157,8 +159,8 @@ that run only.
 | 0 | success |
 | 3 | `status`: instance is stopped |
 | 64 | EX_USAGE: bad CLI args, unknown verb, unknown flag |
-| 65 | EX_DATAERR: invalid CIDR, integer, name |
-| 66 | EX_NOINPUT: missing config (instance never inited) |
+| 65 | EX_DATAERR: invalid value or wrong-type directory input |
+| 66 | EX_NOINPUT: missing or inaccessible config, file, or directory |
 | 70 | EX_SOFTWARE: internal/system error |
 | 75 | EX_TEMPFAIL: already running, port collision |
 
@@ -173,6 +175,10 @@ cogbox ssh -- tmux ls -F '#{session_name}'   # words stay literal (argv form)
 cogbox ssh -- sh -c 'ls /root/*'    # shell syntax: one string, or sh -c
 cogbox status --name work
 cogbox stop --name work
+
+# Launch-only host directories, preserving mixed access modes
+cd /home/me
+cogbox start --name work --add-dir ./src --add-dir-ro '/opt/shared docs'
 cogbox delete --name work            # remove its config + persistent files
 
 # Console access

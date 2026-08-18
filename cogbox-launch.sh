@@ -35,6 +35,10 @@
 #   --self-addr CIDR      Seed one `.network.selfAddrs` entry (repeatable): an
 #                         address of the ENCLOSING host, which the L7 proxy
 #                         adds to its non-overridable floor.
+#   --add-dir DIR        Grant read-write access to one host directory for this
+#                        launch only (repeatable; order is preserved).
+#   --add-dir-ro DIR     Grant read-only access to one host directory for this
+#                        launch only (repeatable; order is preserved).
 # The last four seed config.json on FIRST init only, like every other init
 # flag. All four are absent by default, so a config written without them is
 # byte-identical to one written before they existed.
@@ -46,6 +50,8 @@ FLAG_BIND_ADDR=""
 FLAG_NO_IMPLICIT_DNS=0
 FLAG_DNS_HOST=""
 FLAG_SELF_ADDRS=()
+FLAG_ADDITIONAL_DIR_PATHS=()
+FLAG_ADDITIONAL_DIR_MODES=()
 INSTANCE_NAME=""
 AUTO_KEYS=1
 ASSUME_YES=0
@@ -62,6 +68,8 @@ while [ $# -gt 0 ]; do
 		--no-implicit-dns) FLAG_NO_IMPLICIT_DNS=1; shift ;;
 		--dns-host) FLAG_DNS_HOST="$2"; shift 2 ;;
 		--self-addr) FLAG_SELF_ADDRS+=("$2"); shift 2 ;;
+		--add-dir) FLAG_ADDITIONAL_DIR_PATHS+=("$2"); FLAG_ADDITIONAL_DIR_MODES+=(rw); shift 2 ;;
+		--add-dir-ro) FLAG_ADDITIONAL_DIR_PATHS+=("$2"); FLAG_ADDITIONAL_DIR_MODES+=(ro); shift 2 ;;
 		*) echo "cogbox-launch: error: unexpected argument $1 (Zig wrapper should have rejected this)" >&2; exit 70 ;;
 	esac
 done
@@ -86,6 +94,16 @@ fi
 [ -n "$FLAG_DNS_HOST" ] && ORIG_ARGS+=(--dns-host "$FLAG_DNS_HOST")
 for _self_addr in "${FLAG_SELF_ADDRS[@]}"; do
 	ORIG_ARGS+=(--self-addr "$_self_addr")
+done
+FLAG_ADDITIONAL_DIR_ORIG_INDEXES=()
+for _additional_i in "${!FLAG_ADDITIONAL_DIR_PATHS[@]}"; do
+	if [ "${FLAG_ADDITIONAL_DIR_MODES[_additional_i]}" = ro ]; then
+		ORIG_ARGS+=(--add-dir-ro)
+	else
+		ORIG_ARGS+=(--add-dir)
+	fi
+	FLAG_ADDITIONAL_DIR_ORIG_INDEXES+=("${#ORIG_ARGS[@]}")
+	ORIG_ARGS+=("${FLAG_ADDITIONAL_DIR_PATHS[_additional_i]}")
 done
 [ "$AUTO_KEYS" -eq 0 ]  && ORIG_ARGS+=(--no-auto-keys)
 [ "$ASSUME_YES" -eq 1 ] && ORIG_ARGS+=(--yes)
@@ -525,6 +543,75 @@ if [ -n "$INSTANCE_NAME" ]; then
 	RUNTIME="${BASE_RUNTIME}-${INSTANCE_NAME}"
 else
 	RUNTIME="$BASE_RUNTIME"
+fi
+
+# Resolve launch-only directory grants while the caller's cwd is still active,
+# before either custom-runner re-exec. Paths are replaced in ORIG_ARGS so every
+# later pass sees one canonical absolute source and the original mixed mode
+# order. This is also the host-side security boundary: no grant may overlap
+# Cogbox state, harness material, credentials, or host-special filesystems.
+has_ascii_control() {
+	local LC_ALL=C value=$1 i code
+	for ((i = 0; i < ${#value}; i++)); do
+		printf -v code '%d' "'${value:i:1}"
+		if [ "$code" -lt 32 ] || [ "$code" -eq 127 ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+path_at_or_below() {
+	[ "$1" = "$2" ] || [[ "$1" == "$2/"* ]]
+}
+paths_overlap() {
+	[ "$1" = "$2" ] || [[ "$1" == "$2/"* ]] || [[ "$2" == "$1/"* ]]
+}
+
+if [ "$INIT_ONLY" -eq 0 ] && [ "${#FLAG_ADDITIONAL_DIR_PATHS[@]}" -gt 0 ]; then
+	PROTECTED_ADDITIONAL_DIR_PATHS=("$CONFIG_DIR" "$BASE_DATA" "$RUNTIME")
+	for _host_path in "${H_HOST[@]}"; do
+		PROTECTED_ADDITIONAL_DIR_PATHS+=("$_host_path")
+	done
+	[ -n "${COGBOX_L7_INJECT_CONF:-}" ] && PROTECTED_ADDITIONAL_DIR_PATHS+=("$COGBOX_L7_INJECT_CONF")
+	[ -n "${COGBOX_NETRC_FILE:-}" ] && PROTECTED_ADDITIONAL_DIR_PATHS+=("$COGBOX_NETRC_FILE")
+
+	for _additional_i in "${!FLAG_ADDITIONAL_DIR_PATHS[@]}"; do
+		_raw_path=${FLAG_ADDITIONAL_DIR_PATHS[_additional_i]}
+		if has_ascii_control "$_raw_path"; then
+			die "additional directory path contains an ASCII control character" 65
+		fi
+		if ! _canonical_path=$(realpath -e -- "$_raw_path" 2>/dev/null); then
+			die "additional directory is missing or inaccessible: $_raw_path" 66
+		fi
+		if [ ! -d "$_canonical_path" ]; then
+			die "additional directory option requires a directory: $_raw_path" 65
+		fi
+		if [ "$_canonical_path" = / ]; then
+			die "additional directory is not permitted: $_canonical_path" 65
+		fi
+		for _special_root in /dev /proc /sys /run /nix; do
+			if path_at_or_below "$_canonical_path" "$_special_root"; then
+				die "additional directory is at or below protected host path $_special_root: $_canonical_path" 65
+			fi
+		done
+		for _prior_i in "${!FLAG_ADDITIONAL_DIR_PATHS[@]}"; do
+			[ "$_prior_i" -ge "$_additional_i" ] && break
+			if paths_overlap "$_canonical_path" "${FLAG_ADDITIONAL_DIR_PATHS[_prior_i]}"; then
+				die "additional directory selections overlap: ${FLAG_ADDITIONAL_DIR_PATHS[_prior_i]} and $_canonical_path" 65
+			fi
+		done
+		for _protected_path in "${PROTECTED_ADDITIONAL_DIR_PATHS[@]}"; do
+			if ! _protected_canonical=$(realpath -m -- "$_protected_path" 2>/dev/null); then
+				die "cannot resolve protected host path $_protected_path" 70
+			fi
+			if paths_overlap "$_canonical_path" "$_protected_canonical"; then
+				die "additional directory overlaps protected host path $_protected_canonical: $_canonical_path" 65
+			fi
+		done
+
+		FLAG_ADDITIONAL_DIR_PATHS[_additional_i]="$_canonical_path"
+		ORIG_ARGS[${FLAG_ADDITIONAL_DIR_ORIG_INDEXES[_additional_i]}]="$_canonical_path"
+	done
 fi
 
 # Detect pre-fix layouts where the default instance's config and data
@@ -1462,6 +1549,11 @@ cogbox_cleanup() {
 	[ -n "$PASST_PID" ] && kill "$PASST_PID" 2>/dev/null
 	[ -n "$L7PROXY_PID" ] && kill "$L7PROXY_PID" 2>/dev/null
 	[ -n "$L7MITM_PID" ] && kill "$L7MITM_PID" 2>/dev/null
+	# Dynamic 9p sources and their manifest may contain caller path bytes. QEMU
+	# is dead before these are removed; retained failed-launch runtimes keep only
+	# diagnostics, never stale grants for a later launch.
+	rm -rf "$RUNTIME/additional-dirs"
+	rm -f "$RUNTIME/additional-dir-args" "$RUNTIME/system-additional-dirs"
 	# Remove this instance's sanitized cred-inject mirrors (QEMU is dead now, so
 	# the 9p source is no longer in use). The mirror is hardlinks/no secret, but
 	# tidy it rather than leave it under the data root until the next boot.
@@ -1496,6 +1588,65 @@ trap cogbox_cleanup EXIT
 # SIGTERM/SIGINT -> exit -> EXIT trap fires cogbox_cleanup. Interrupts the
 # `wait "$QEMU_PID"` at the end of the script.
 trap 'exit 143' TERM INT
+
+# Stage dynamic sources behind numeric aliases. Caller paths appear only as
+# symlink targets and JSON strings; QEMU's unquoted extra-argument expansion
+# sees fixed tokens containing relative aliases, never caller-controlled bytes.
+mkdir -m 0700 "$RUNTIME/additional-dirs" \
+	|| die "cannot create additional-directory staging area" 70
+_additional_qemu_tokens=()
+_additional_manifest='[]'
+for _additional_i in "${!FLAG_ADDITIONAL_DIR_PATHS[@]}"; do
+	_additional_path=${FLAG_ADDITIONAL_DIR_PATHS[_additional_i]}
+	if ! _staged_canonical=$(realpath -e -- "$_additional_path" 2>/dev/null); then
+		die "additional directory is missing or inaccessible: $_additional_path" 66
+	fi
+	if [ ! -d "$_staged_canonical" ]; then
+		die "additional directory option requires a directory: $_additional_path" 65
+	fi
+	if [ "$_staged_canonical" != "$_additional_path" ]; then
+		die "additional directory changed while the launch was being prepared: $_additional_path" 65
+	fi
+	ln -s -- "$_additional_path" "$RUNTIME/additional-dirs/$_additional_i" \
+		|| die "cannot stage additional directory $_additional_path" 70
+
+	_readonly=false
+	[ "${FLAG_ADDITIONAL_DIR_MODES[_additional_i]}" = ro ] && _readonly=true
+	_additional_qemu_tokens+=(
+		"-fsdev"
+		"local,id=cogboxadddir${_additional_i},path=additional-dirs/${_additional_i},security_model=none,readonly=${_readonly}"
+		"-device"
+		"virtio-9p-pci,fsdev=cogboxadddir${_additional_i},mount_tag=cogbox-add-dir-${_additional_i}"
+	)
+	if ! _additional_manifest=$(jq -cn \
+		--argjson entries "$_additional_manifest" \
+		--arg tag "cogbox-add-dir-${_additional_i}" \
+		--arg target "$_additional_path" \
+		--argjson readOnly "$_readonly" \
+		'$entries + [{tag: $tag, target: $target, readOnly: $readOnly}]'); then
+		die "cannot encode additional-directory manifest" 70
+	fi
+done
+
+_args_tmp="$RUNTIME/.additional-dir-args.tmp"
+{
+	echo '#!/usr/bin/env bash'
+	if [ "${#_additional_qemu_tokens[@]}" -gt 0 ]; then
+		printf "printf '%%s\\n' '%s'\n" "${_additional_qemu_tokens[*]}"
+	else
+		echo ':'
+	fi
+} > "$_args_tmp" || die "cannot write additional-directory QEMU arguments" 70
+chmod 0700 "$_args_tmp" || die "cannot protect additional-directory QEMU arguments" 70
+mv "$_args_tmp" "$RUNTIME/additional-dir-args" \
+	|| die "cannot install additional-directory QEMU arguments" 70
+
+_manifest_tmp="$RUNTIME/.system-additional-dirs.tmp"
+printf '%s\n' "$_additional_manifest" > "$_manifest_tmp" \
+	|| die "cannot write additional-directory manifest" 70
+chmod 0600 "$_manifest_tmp" || die "cannot protect additional-directory manifest" 70
+mv "$_manifest_tmp" "$RUNTIME/system-additional-dirs" \
+	|| die "cannot install additional-directory manifest" 70
 
 ln -sfn "$REAL_DATA" "$RUNTIME/data"
 

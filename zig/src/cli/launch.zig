@@ -15,6 +15,11 @@
 
 const std = @import("std");
 
+
+pub const AdditionalDir = struct {
+	path: []const u8,
+	read_only: bool,
+};
 pub const LaunchOpts = struct {
 	name: ?[]const u8,
 	vcpu: ?u32,
@@ -41,6 +46,9 @@ pub const LaunchOpts = struct {
 	/// (`--dns-forward` -> `--dns-host`), so the guest resolves what the host
 	/// resolves without any other loopback listener becoming reachable.
 	dns_host: ?[]const u8 = null,
+	/// Host directories granted to this launch only. The paths remain individual
+	/// argv elements; the bash launcher canonicalizes and stages them.
+	additional_dirs: []const AdditionalDir = &.{},
 	/// Zig-side only (never forwarded to the bash script): attach the serial
 	/// console after the VM comes up instead of returning immediately.
 	foreground: bool,
@@ -93,6 +101,12 @@ pub fn buildLaunchArgs(
 	for (opts.self_addrs) |s| {
 		try args.append(allocator, try allocator.dupe(u8, "--self-addr"));
 		try args.append(allocator, try allocator.dupe(u8, s));
+	}
+	if (!init_only) {
+		for (opts.additional_dirs) |dir| {
+			try args.append(allocator, try allocator.dupe(u8, if (dir.read_only) "--add-dir-ro" else "--add-dir"));
+			try args.append(allocator, try allocator.dupe(u8, dir.path));
+		}
 	}
 	if (!opts.auto_keys) try args.append(allocator, try allocator.dupe(u8, "--no-auto-keys"));
 	if (opts.yes) try args.append(allocator, try allocator.dupe(u8, "--yes"));
@@ -173,6 +187,49 @@ test "buildLaunchArgs omits the seeds entirely when unset" {
 	try std.testing.expectEqualStrings("4", argv[2]);
 	try std.testing.expectEqualStrings("--mem", argv[3]);
 	try std.testing.expectEqualStrings("2048", argv[4]);
+}
+
+test "buildLaunchArgs forwards every additional host directory in argv order" {
+	const gpa = std.testing.allocator;
+	const additional_dirs = [_]AdditionalDir{
+		.{ .path = "./read write", .read_only = false },
+		.{ .path = "/tmp/read,only", .read_only = true },
+		.{ .path = "../again", .read_only = false },
+	};
+	const opts: LaunchOpts = .{
+		.name = null,
+		.vcpu = null,
+		.mem = null,
+		.network = null,
+		.auto_keys = true,
+		.yes = false,
+		.additional_dirs = &additional_dirs,
+		.foreground = false,
+		.no_ssh = false,
+	};
+
+	const argv = try buildLaunchArgs(gpa, opts, "/libexec/cogbox-launch.sh", false);
+	defer {
+		for (argv) |a| gpa.free(a);
+		gpa.free(argv);
+	}
+	const expected = [_][]const u8{
+		"/libexec/cogbox-launch.sh",
+		"--add-dir",    "./read write",
+		"--add-dir-ro", "/tmp/read,only",
+		"--add-dir",    "../again",
+	};
+	try std.testing.expectEqual(expected.len, argv.len);
+	for (expected, argv) |want, got| try std.testing.expectEqualStrings(want, got);
+
+	const init_argv = try buildLaunchArgs(gpa, opts, "/libexec/cogbox-launch.sh", true);
+	defer {
+		for (init_argv) |a| gpa.free(a);
+		gpa.free(init_argv);
+	}
+	try std.testing.expectEqual(@as(usize, 2), init_argv.len);
+	try std.testing.expectEqualStrings("/libexec/cogbox-launch.sh", init_argv[0]);
+	try std.testing.expectEqualStrings("--init-only", init_argv[1]);
 }
 
 /// Resolve the absolute path to a sibling libexec script by reading

@@ -275,6 +275,55 @@ HOME="/nonexistent-home-for-cogbox-test" \
 	bash "$LAUNCH" --init-only --yes >"$WORK/canary-c.log" 2>&1
 canary_free "unwritable-home failure" "$WORK/canary-c.log" "$?" "is not writable"
 
+# --- 7. launch-only directory grants fail before runner/QEMU setup ----------
+
+rc=$(run_init add-dir-reject --name demo --network rules)
+[ "$rc" = 0 ] || bad "add-dir rejection fixture init exited $rc (log: $(cat "$WORK/add-dir-reject.log"))"
+home="$WORK/add-dir-reject"
+runner_probe="$WORK/runner-must-not-be-read"
+
+check_add_dir_rejection() {
+	local tag=$1 expected_rc=$2 marker=$3 rejected_path=$4 payload_canary=$5
+	local log="$WORK/$tag.log"
+	shift 5
+	HOME="$home" COGBOX_DATA="$home/data" XDG_CONFIG_HOME="$home/config" \
+		RUNNER_DIR="$runner_probe" \
+		bash "$LAUNCH" --yes --name demo "$@" >"$log" 2>&1
+	local rc=$?
+	[ "$rc" = "$expected_rc" ] \
+		|| bad "$tag exited $rc, expected $expected_rc (log: $(cat "$log"))"
+	grep -Fq "$marker" "$log" \
+		|| bad "$tag did not reach the intended diagnostic '$marker' (log: $(cat "$log"))"
+	grep -Fq "$rejected_path" "$log" \
+		|| bad "$tag diagnostic did not name the rejected path $rejected_path"
+	if [ -n "$payload_canary" ] && grep -Fq "$payload_canary" "$log"; then
+		bad "$tag echoed file contents instead of naming only $rejected_path"
+	fi
+	if grep -Fq "$runner_probe" "$log"; then
+		bad "$tag reached the substituted runner path instead of rejecting before QEMU setup"
+	fi
+	ok "$tag rejects before runner/QEMU setup with exit $expected_rc"
+}
+
+missing="$home/does-not-exist-add-dir"
+check_add_dir_rejection "missing additional directory" 66 \
+	"missing or inaccessible" "$missing" "" \
+	--add-dir "$missing"
+
+regular="$home/not-a-directory-add-dir"
+regular_canary="regular-file-payload-must-not-be-logged"
+printf '%s' "$regular_canary" > "$regular"
+check_add_dir_rejection "regular-file additional directory" 65 \
+	"requires a directory" "$regular" "$regular_canary" \
+	--add-dir-ro "$regular"
+
+overlap="$home/data"
+overlap_canary="overlap-payload-must-not-be-logged"
+printf '%s' "$overlap_canary" > "$overlap/secret-payload"
+check_add_dir_rejection "Cogbox-data overlap" 65 \
+	"overlaps protected host path" "$overlap" "$overlap_canary" \
+	--add-dir "$overlap"
+
 if [ "$fails" -gt 0 ]; then
 	echo "$fails check(s) failed" >&2
 	exit 1

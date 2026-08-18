@@ -223,8 +223,52 @@ with subtest("Phase D: --network rules with dynamic reload"):
     # work instance carries the seeded bogon-deny ruleset; 10.99.0.0/8
     # falls inside `deny 10.0.0.0/8`, so we need an explicit allow at the
     # front for 10.99.0.1/32 to be reachable.
+    rw_host_dir = "/home/testuser/cogbox-pass-rw"
+    ro_host_dir = "/home/testuser/cogbox pass,ro"
+    rw_payload = rw_host_dir + "/nested/payload"
+    ro_payload = ro_host_dir + "/nested/payload"
+    machine.succeed(as_user(
+        f"mkdir -p {shlex.quote(rw_host_dir + '/nested')} "
+        f"{shlex.quote(ro_host_dir + '/nested')} && "
+        f"printf %s {shlex.quote('rw-payload-exact-v1')} > {shlex.quote(rw_payload)} && "
+        f"printf %s {shlex.quote('ro-payload-exact-v1')} > {shlex.quote(ro_payload)}"
+    ))
+    rw_host_hash = machine.succeed(
+        f"sha256sum -- {shlex.quote(rw_payload)}"
+    ).split()[0]
+    ro_host_hash = machine.succeed(
+        f"sha256sum -- {shlex.quote(ro_payload)}"
+    ).split()[0]
     machine.succeed(as_user("cogbox rules add allow 10.99.0.1/32 --at 1 --name work"))
-    boot_and_wait("cc-work", "--name work", ssh_port=2223)
+    boot_and_wait(
+        "cc-work",
+        f"--name work --add-dir ./cogbox-pass-rw --add-dir-ro {shlex.quote(ro_host_dir)}",
+        ssh_port=2223,
+    )
+
+    # Both launch-only grants are mounted at their canonical host paths. The
+    # source containing a comma and space proves caller bytes never enter the
+    # QEMU argument grammar.
+    for guest_path in (rw_host_dir, ro_host_dir):
+        quoted = shlex.quote(guest_path)
+        machine.succeed(as_user(
+            "cogbox ssh --name work " + shlex.quote(
+                f"mountpoint -q {quoted} && "
+                f'test "$(findmnt -n -o FSTYPE --target {quoted})" = 9p'
+            )
+        ))
+    rw_guest_hash = machine.succeed(as_user(
+        "cogbox ssh --name work " + shlex.quote(
+            f"sha256sum -- {shlex.quote(rw_payload)}"
+        )
+    )).split()[0]
+    ro_guest_hash = machine.succeed(as_user(
+        "cogbox ssh --name work " + shlex.quote(
+            f"sha256sum -- {shlex.quote(ro_payload)}"
+        )
+    )).split()[0]
+    assert rw_guest_hash == rw_host_hash, (rw_guest_hash, rw_host_hash)
+    assert ro_guest_hash == ro_host_hash, (ro_guest_hash, ro_host_hash)
 
     # Initial policy: .1 allowed, .2 denied
     machine.succeed(probe("work", "10.99.0.1"))
@@ -241,7 +285,42 @@ with subtest("Phase D: --network rules with dynamic reload"):
     machine.fail(probe("work", "10.99.0.1"))
     machine.succeed(probe("work", "10.99.0.2"))
 
+    guest_write = "guest-write-through-exact-v1"
+    guest_write_path = rw_host_dir + "/nested/from-guest"
+    machine.succeed(as_user(
+        "cogbox ssh --name work " + shlex.quote(
+            f"printf %s {shlex.quote(guest_write)} > {shlex.quote(guest_write_path)}"
+        )
+    ))
+    expected_write_hash = machine.succeed(
+        f"printf %s {shlex.quote(guest_write)} | sha256sum"
+    ).split()[0]
+    actual_write_hash = machine.succeed(
+        f"sha256sum -- {shlex.quote(guest_write_path)}"
+    ).split()[0]
+    assert actual_write_hash == expected_write_hash, (actual_write_hash, expected_write_hash)
+
+    # Guest `ro` is not the security boundary: even after guest root attempts a
+    # rw remount, QEMU's readonly=true export must still reject the write.
+    machine.execute(as_user(
+        "cogbox ssh --name work " + shlex.quote(
+            f"mount -o remount,rw {shlex.quote(ro_host_dir)}"
+        )
+    ))
+    machine.fail(as_user(
+        "cogbox ssh --name work " + shlex.quote(
+            f"printf blocked > {shlex.quote(ro_host_dir + '/nested/from-guest')}"
+        )
+    ))
+    ro_host_hash_after = machine.succeed(
+        f"sha256sum -- {shlex.quote(ro_payload)}"
+    ).split()[0]
+    assert ro_host_hash_after == ro_host_hash, (ro_host_hash_after, ro_host_hash)
+
     stop_instance("cc-work", name="work")
+    machine.fail("test -e /run/user/1000/cogbox-work/additional-dirs")
+    machine.fail("test -e /run/user/1000/cogbox-work/additional-dir-args")
+    machine.fail("test -e /run/user/1000/cogbox-work/system-additional-dirs")
 
 with subtest("Phase E: per-instance flake adds package + nix DB registers it"):
     flake_path = "/home/testuser/.config/cogbox/instances/default/flake/flake.nix"
@@ -266,7 +345,20 @@ NIX_EOF"""))
     # Boot default (still in --network full from Phase C). The wrapper
     # detects the edited flake.nix, re-execs via nix run with the override,
     # rebuilds the microvm runner with hello in the closure.
-    boot_and_wait("cc-default", "", ssh_port=2222)
+    boot_and_wait(
+        "cc-default",
+        f"--add-dir-ro {shlex.quote(ro_host_dir)}",
+        ssh_port=2222,
+    )
+    # This start crosses the edited-flake nix re-exec and hidden `__launch`
+    # parser. The grant must retain its mode and payload through both hops.
+    machine.succeed(as_user(
+        "cogbox ssh " + shlex.quote(
+            f"mountpoint -q {shlex.quote(ro_host_dir)} && "
+            f"test \"$(sha256sum -- {shlex.quote(ro_payload)} | cut -d' ' -f1)\" "
+            f"= {shlex.quote(ro_host_hash)}"
+        )
+    ))
     hello_path = machine.succeed(
         as_user("cogbox ssh 'readlink -f $(command -v hello)'")
     ).strip()
@@ -1619,6 +1711,23 @@ with subtest("Phase G: CLI parser regressions and stub-friendly verbs"):
     rc, out = run_cli("cogbox start --vcpu abc")
     assert rc == 65, f"expected exit 65, got {rc}; out={out!r}"
     assert "positive integer" in out, out
+
+    # G4b: launch-only directory validation runs before foreground init or
+    # daemonization while every selected instance is stopped.
+    missing_add_dir = "/home/testuser/does-not-exist-add-dir"
+    rc, out = run_cli(f"cogbox start --add-dir {missing_add_dir}")
+    assert rc == 66, f"expected exit 66 for missing add-dir, got {rc}; out={out!r}"
+    assert missing_add_dir in out and "missing or inaccessible" in out, out
+
+    not_a_dir = "/home/testuser/not-a-directory-add-dir"
+    machine.succeed(as_user(f"printf fixture > {not_a_dir}"))
+    rc, out = run_cli(f"cogbox start --add-dir-ro {not_a_dir}")
+    assert rc == 65, f"expected exit 65 for non-directory add-dir, got {rc}; out={out!r}"
+    assert not_a_dir in out and "requires a directory" in out, out
+
+    rc, out = run_cli("cogbox init --add-dir /tmp")
+    assert rc == 64, f"expected exit 64 for init-only add-dir, got {rc}; out={out!r}"
+    assert "unknown flag --add-dir" in out, out
 
     # G5: unknown flag for a verb -- per-verb scoping, not silent passthrough.
     rc, out = run_cli("cogbox rules list --vcpu 8 --name work")

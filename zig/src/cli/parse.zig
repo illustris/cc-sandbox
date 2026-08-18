@@ -299,9 +299,9 @@ test "isValidName" {
 	try std.testing.expect(!isValidName("a b"));
 }
 
-// `.value_multi` exists for one caller: `cogbox init --self-addr`, where the
-// enclosing host may have more than one address and dropping all but the last
-// would silently shrink a security floor to one entry.
+// `.value_multi` serves security-sensitive repeatable inputs. Keeping the
+// original mixed-flag order matters for launch-time directory grants, while
+// retaining every self-address prevents silently shrinking the L7 floor.
 test "value_multi retains every occurrence in argv order" {
 	const flags = [_]Flag{
 		.{ .long = "self-addr", .kind = .value_multi },
