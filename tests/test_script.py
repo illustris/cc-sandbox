@@ -117,6 +117,7 @@ with subtest("Phase A: CLI / state without booting"):
     machine.succeed("test -d /home/testuser/.local/share/opencode")
     machine.succeed("test -d /home/testuser/.hermes")
     machine.succeed("test -d /home/testuser/.omp")
+    machine.succeed("test -d /home/testuser/.dsh")
     # Codex and pi are opt-in and not built by default, so their host dirs
     # are not seeded.
     machine.fail("test -d /home/testuser/.codex")
@@ -129,6 +130,7 @@ with subtest("Phase A: CLI / state without booting"):
     ).strip().splitlines()
     assert "claude-code" in active and "opencode" in active, active
     assert "hermes-agent" in active and "omp" in active, active
+    assert "dsh" in active, active
     assert "codex" not in active, active
     assert "pi" not in active, active
     # Old top-level default config must NOT be created any more.
@@ -876,7 +878,11 @@ with subtest("Phase F: default harnesses wired into the VM (codex/pi opt-in, exc
     h_path = machine.succeed(as_user("cogbox ssh 'command -v h'")).strip()
     assert h_path, h_path
     om_version = machine.succeed(as_user("cogbox ssh 'om --version'")).strip()
-    assert om_version == "17.1.5", om_version
+    assert om_version == "17.4.0", om_version
+    ds_path = machine.succeed(as_user("cogbox ssh 'command -v ds'")).strip()
+    assert ds_path, ds_path
+    ds_version = machine.succeed(as_user("cogbox ssh 'ds --version'")).strip()
+    assert "0.1.0-rc.7" in ds_version, ds_version
     machine.succeed(as_user(
         "cogbox ssh 'om auth-broker --help | grep -q \"Manage the omp auth-broker\"'"
     ))
@@ -902,6 +908,9 @@ with subtest("Phase F: default harnesses wired into the VM (codex/pi opt-in, exc
     ))
     machine.succeed(as_user(
         "cogbox ssh 'mountpoint -q /root/.omp'"
+    ))
+    machine.succeed(as_user(
+        "cogbox ssh 'mountpoint -q /root/.dsh'"
     ))
     # The materializer must fail closed if the Hermes overlay mount fails:
     # ordering alone is insufficient because systemd can continue after a

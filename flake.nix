@@ -284,6 +284,39 @@
 					};
 				};
 			};
+			dsh = {
+				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				package = inputs.llm-agents.packages.${system}.dsh;
+				launcher = {
+					name = "ds";
+					# DSH_PERMISSION_MODE=danger-full-access is dsh's own
+					# full-auto seam: the base bundle derives sandbox-policy
+					# mode from it and sets approval to 'never' for that mode,
+					# so tools never prompt and dsh's bwrap/Landlock runner is
+					# bypassed -- the outer microvm is the containment, same
+					# deal as --dangerously-skip-permissions / HERMES_YOLO_MODE.
+					# Sessions can still switch presets at runtime in the UI.
+					flags = [];
+					env = {
+						DSH_PERMISSION_MODE = "danger-full-access";
+						# Session telemetry ships disabled; hard-opt-out so
+						# neither the model nor a discovered .env can stream
+						# unredacted session content out of the sandbox.
+						DSH_TELEMETRY_DISABLED = "1";
+					};
+				};
+				paths = {
+					# dsh keeps settings.yaml, .credentials.yaml (API keys),
+					# profiles/, sessions/, and storages/ together under
+					# $DSH_HOME (default ~/.dsh). One overlay covers it all,
+					# matching codex/hermes/omp/pi. Credentials stay
+					# guest-carries-token (no harness_inject_specs arm).
+					home = {
+						guest = "/root/.dsh";
+						kind = "overlay";
+					};
+				};
+			};
 		};
 
 		macFromName = name: let
@@ -1492,7 +1525,7 @@
 								${unflaggedPattern}) ${command} "$@" ;;
 							esac
 						'';
-					# Land non-login `cogbox ssh -- c/oc/om/cx/h/p` in the standardized
+					# Land non-login `cogbox ssh -- c/oc/om/cx/h/p/ds` in the standardized
 					# workdir too (loginShellInit covers the interactive login path).
 					# Prepend the brain's plugin-tool bin to PATH so the harness AND its
 					# tool subprocesses (e.g. claude-code's Bash) resolve cogbox.packages
@@ -2696,6 +2729,12 @@
 					moreutils
 				]
 				++ lib.concatMap (h: [ h.package (mkLauncher h) ]) (lib.attrValues harnesses)
+				++ lib.optionals (harnesses ? "dsh") [
+					# `dsh plugin --profile <name> <pnpm args>` forwards to
+					# pnpm; without it the only broken surface is plugin
+					# management (web/headless profiles self-initialize).
+					pkgs.pnpm
+				]
 				++ lib.optionals hasNixMcp [
 					nix-mcp.packages.${system}.default
 				]
@@ -4909,6 +4948,7 @@
 				codex = inputs.llm-agents.packages.${system}.codex;
 				hermes-agent = enabledHarnesses.hermes-agent.package;
 				omp = enabledHarnesses.omp.package;
+				dsh = enabledHarnesses.dsh.package;
 				# pi is opt-out of the default image (enablePi above), so it is no longer
 				# in enabledHarnesses. Reference the BASE numtide pi (not the overridden
 				# one we've stopped shipping) so the release version gate stays a cache
@@ -5284,24 +5324,26 @@
 					esac
 				}
 
-				test '${releaseHarnesses.claude-code.version}' = '2.1.220'
-				test '${releaseHarnesses.opencode.version}' = '1.18.7'
-				test '${releaseHarnesses.codex.version}' = '0.145.0'
-				test '${releaseHarnesses.hermes-agent.version}' = '2026.7.20'
-				test '${releaseHarnesses.omp.version}' = '17.1.5'
-				test '${releaseHarnesses.pi.version}' = '0.82.1'
+				test '${releaseHarnesses.claude-code.version}' = '2.1.238'
+				test '${releaseHarnesses.opencode.version}' = '1.18.19'
+				test '${releaseHarnesses.codex.version}' = '0.149.0'
+				test '${releaseHarnesses.hermes-agent.version}' = '2026.8.18'
+				test '${releaseHarnesses.omp.version}' = '17.4.0'
+				test '${releaseHarnesses.pi.version}' = '0.84.2'
+				test '${releaseHarnesses.dsh.version}' = '0.1.0-rc.7'
 
-				assert_version '2.1.220' ${releaseHarnesses.claude-code}/bin/claude --version
-				assert_version '1.18.7' ${releaseHarnesses.opencode}/bin/opencode --version
-				assert_version '0.145.0' ${releaseHarnesses.codex}/bin/codex --version
-				assert_version '17.1.5' ${releaseHarnesses.omp}/bin/omp --version
-				assert_version '0.82.1' ${releaseHarnesses.pi}/bin/pi --version
+				assert_version '2.1.238' ${releaseHarnesses.claude-code}/bin/claude --version
+				assert_version '1.18.19' ${releaseHarnesses.opencode}/bin/opencode --version
+				assert_version '0.149.0' ${releaseHarnesses.codex}/bin/codex --version
+				assert_version '17.4.0' ${releaseHarnesses.omp}/bin/omp --version
+				assert_version '0.84.2' ${releaseHarnesses.pi}/bin/pi --version
+				assert_version '0.1.0-rc.7' ${releaseHarnesses.dsh}/bin/dsh --version
 
 				if ! hermes_output=$(${releaseHarnesses.hermes-agent}/bin/hermes --version 2>&1); then
 					printf 'version command failed: hermes --version\n%s\n' "$hermes_output" >&2
 					exit 1
 				fi
-				for expected in 'v0.19.0' '(2026.7.20)'; do
+				for expected in 'v0.20.4' '(2026.8.18)'; do
 					case "$hermes_output" in
 					*"$expected"*) ;;
 					*)

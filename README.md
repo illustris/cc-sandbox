@@ -11,7 +11,7 @@ Each harness's host config and auth tokens are mounted into an isolated
 QEMU guest where the agent can read, write, and run commands without
 prompting -- without that blast radius reaching the host.
 
-Currently supported harnesses: `claude-code` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)), `opencode` ([opencode](https://github.com/sst/opencode)), `omp` ([Oh My Pi](https://github.com/can1357/oh-my-pi)), `codex` ([OpenAI Codex CLI](https://github.com/openai/codex)), `hermes-agent` ([Hermes Agent](https://github.com/NousResearch/hermes-agent)), and `pi` ([pi coding agent](https://github.com/earendil-works/pi)). Codex and pi are opt-in and **disabled by default**; enable them by setting `enableCodex = true` or `enablePi = true` in `flake.nix`. The architecture is harness-agnostic; see [Harnesses](docs/harnesses.md) for the model and how to add more.
+Currently supported harnesses: `claude-code` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)), `opencode` ([opencode](https://github.com/sst/opencode)), `omp` ([Oh My Pi](https://github.com/can1357/oh-my-pi)), `codex` ([OpenAI Codex CLI](https://github.com/openai/codex)), `hermes-agent` ([Hermes Agent](https://github.com/NousResearch/hermes-agent)), `dsh` ([DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)), and `pi` ([pi coding agent](https://github.com/earendil-works/pi)). Codex and pi are opt-in and **disabled by default**; enable them by setting `enableCodex = true` or `enablePi = true` in `flake.nix`. The architecture is harness-agnostic; see [Harnesses](docs/harnesses.md) for the model and how to add more.
 
 ## Quick start
 
@@ -27,11 +27,12 @@ touching anything (the list reflects which harnesses were built in, so
 ```
 No harness state detected. Set up which?
   [1] claude-code     (creates ~/.claude/, ~/.claude.json)
-  [2] hermes-agent     (creates ~/.hermes/)
-  [3] omp     (creates ~/.omp/)
-  [4] opencode     (creates ~/.config/opencode/, ~/.local/share/opencode/)
-  [5] all
-Choice [1-5, comma-separated for multiple]:
+  [2] dsh     (creates ~/.dsh/)
+  [3] hermes-agent     (creates ~/.hermes/)
+  [4] omp     (creates ~/.omp/)
+  [5] opencode     (creates ~/.config/opencode/, ~/.local/share/opencode/)
+  [6] all
+Choice [1-6, comma-separated for multiple]:
 
 The following paths will be created:
   ~/.config/cogbox/instances/default/config.json  (default settings)
@@ -54,7 +55,7 @@ The package installs the CLI as both `cogbox` and `cbx` (a short alias
 symlink); once it's on your `PATH`, the two names are interchangeable
 (`cbx stop`, `cbx list`, ...).
 
-Each enabled harness ships a full-auto launcher inside the VM: `c` for `claude-code`, `oc` for `opencode`, `om` for `omp`, `cx` for `codex`, `h` for `hermes-agent`, and `p` for `pi`. Every enabled harness binary is installed regardless of which host-state directories you select, so once the VM boots its launcher is on `$PATH`.
+Each enabled harness ships a full-auto launcher inside the VM: `c` for `claude-code`, `oc` for `opencode`, `om` for `omp`, `cx` for `codex`, `h` for `hermes-agent`, `ds` for `dsh`, and `p` for `pi`. Every enabled harness binary is installed regardless of which host-state directories you select, so once the VM boots its launcher is on `$PATH`.
 
 ## Documentation
 

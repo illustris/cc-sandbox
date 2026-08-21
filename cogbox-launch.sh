@@ -235,6 +235,8 @@ H_HOST[pi:home]="${COGBOX_PI_HOME:-$REAL_HOME/.pi}"
 
 H_KIND[omp:home]=overlay
 H_HOST[omp:home]="${COGBOX_OMP_HOME:-$REAL_HOME/.omp}"
+H_KIND[dsh:home]=overlay
+H_HOST[dsh:home]="${COGBOX_DSH_HOME:-$REAL_HOME/.dsh}"
 
 # Path keys per harness, in declared order.
 harness_pathkeys() {
@@ -245,6 +247,7 @@ harness_pathkeys() {
 		hermes-agent) printf '%s\n' home ;;
 		omp) printf '%s\n' home ;;
 		pi) printf '%s\n' home ;;
+		dsh) printf '%s\n' home ;;
 	esac
 }
 
@@ -258,6 +261,7 @@ harness_summary() {
 		hermes-agent) echo "creates ~/.hermes/" ;;
 		omp)           echo "creates ~/.omp/" ;;
 		pi)           echo "creates ~/.pi/" ;;
+		dsh)          echo "creates ~/.dsh/" ;;
 	esac
 }
 

@@ -133,6 +133,7 @@ Override where data lives on the host with environment variables:
 | `COGBOX_CODEX_HOME` | `$HOME/.codex` | Host codex home (config, auth, sessions; overlay lower in VM) |
 | `COGBOX_HERMES_HOME` | `$HOME/.hermes` | Host hermes-agent home (config.yaml, `.env` credentials, skills; overlay lower in VM) |
 | `COGBOX_PI_HOME` | `$HOME/.pi` | Host pi home (`agent/` holds auth.json, settings, sessions; overlay lower in VM) |
+| `COGBOX_DSH_HOME` | `$HOME/.dsh` | Host dsh home (settings.yaml, .credentials.yaml, sessions/, profiles/; overlay lower in VM) |
 
 ```sh
 COGBOX_DATA=/mnt/fast/cogbox nix run .

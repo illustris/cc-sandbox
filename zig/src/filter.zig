@@ -1011,6 +1011,7 @@ const harness_passthrough_hosts = [_][]const u8{
 	"api.openai.com", // codex
 	"chatgpt.com", // codex (ChatGPT auth/backend)
 	"auth.openai.com", // codex auth
+	"api.deepseek.com", // dsh
 };
 
 pub fn isHarnessPassthroughHost(host: []const u8) bool {
@@ -2039,6 +2040,7 @@ test "L7 terminate-by-default + passthrough opt-out + harness safety" {
 		\\allow plain.test
 		\\allow pinned.test passthrough
 		\\allow api.anthropic.com
+		\\allow api.deepseek.com
 		\\allow api.openai.com terminate
 	, &rs);
 	try std.testing.expect(rs.mode_terminate); // default tier is terminate
@@ -2048,6 +2050,7 @@ test "L7 terminate-by-default + passthrough opt-out + harness safety" {
 	try std.testing.expect(!rs.needsTerminate("pinned.test"));
 	// a harness API endpoint stays passthrough automatically...
 	try std.testing.expect(!rs.needsTerminate("api.anthropic.com"));
+	try std.testing.expect(!rs.needsTerminate("api.deepseek.com"));
 	try std.testing.expect(isHarnessPassthroughHost("API.Anthropic.Com")); // case-insensitive
 	// ...unless explicitly --terminate'd
 	try std.testing.expect(rs.needsTerminate("api.openai.com"));

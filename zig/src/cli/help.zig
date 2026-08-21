@@ -7,7 +7,7 @@ const std = @import("std");
 const util = @import("util.zig");
 
 pub const TOP_LEVEL =
-    \\cogbox - run coding-agent harnesses (claude-code, opencode, omp, hermes-agent; codex/pi opt-in) in an isolated QEMU microvm
+    \\cogbox - run coding-agent harnesses (claude-code, opencode, omp, hermes-agent, dsh; codex/pi opt-in) in an isolated QEMU microvm
     \\
     \\Usage:
     \\  cogbox [VERB] [OPTIONS]            (cbx is a short alias for cogbox)
@@ -63,6 +63,7 @@ pub const TOP_LEVEL =
     \\  COGBOX_OPENCODE_CONFIG   Host opencode config dir
     \\  COGBOX_OPENCODE_DATA     Host opencode data dir, includes auth.json
     \\  COGBOX_CODEX_HOME        Host codex home dir (default: ~/.codex), includes auth.json
+    \\  COGBOX_DSH_HOME          Host dsh home dir (default: ~/.dsh)
     \\  COGBOX_L7_INJECT_CONF    Override the generated host-side credential-injection
     \\                           conf (advanced/testing; see docs/network-filtering.md)
     \\
@@ -463,7 +464,7 @@ pub const L7 =
     \\  passthrough (--passthrough)  TLS not intercepted (cert pinning preserved);
     \\                       the proxy trusts the SNI and cannot see URL paths.
     \\
-    \\Harness API endpoints (api.anthropic.com, api.openai.com, chatgpt.com, ...):
+    \\Harness API endpoints (api.anthropic.com, api.openai.com, chatgpt.com, api.deepseek.com, ...):
     \\for a harness you're logged into on the host, `cogbox init` seeds a
     \\terminate rule + credential injection (.network.l7.inject) so the real
     \\token is swapped in host-side and the guest carries only a stub -- the
