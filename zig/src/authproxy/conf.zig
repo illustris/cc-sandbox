@@ -302,9 +302,16 @@ pub const Store = struct {
 
 	/// Rate-gated poll: at most one stat per second (the accept-loop tick, and
 	/// a worker about to serve a request on a connection that sat idle).
+	///
+	/// The sentinel is tested FIRST and the subtraction only reached once a
+	/// real timestamp is in hand (the shape main.zig's stats tick uses): `and`
+	/// short-circuits its RIGHT operand only, so testing it second still
+	/// evaluated `now_ms - minInt(i64)` on the very first tick -- an i64
+	/// overflow that killed the proxy on every launch before it accepted a
+	/// connection.
 	pub fn maybePoll(self: *Store, now_ms: i64) void {
 		const last = self.last_poll_ms.load(.monotonic);
-		if (now_ms - last < 1000 and last != std.math.minInt(i64)) return;
+		if (last != std.math.minInt(i64) and now_ms - last < 1000) return;
 		self.last_poll_ms.store(now_ms, .monotonic);
 		_ = self.poll();
 	}
@@ -706,6 +713,65 @@ test "Store.poll: loads, skips on unchanged (mtime,size), falls to empty on a ba
 		const g = store.acquire().?;
 		defer store.release(g);
 		try t.expectEqual(@as(usize, 1), g.entries.len);
+	}
+}
+
+test "Store.maybePoll: the FIRST tick polls instead of trapping on the minInt sentinel (field: the proxy died on every launch)" {
+	const gpa = t.allocator;
+	var threaded = testIo();
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const dir = try tmpName(gpa, io, "zig-authproxy-maybepoll-test");
+	defer gpa.free(dir);
+	try cwd.createDirPath(io, dir);
+	defer cwd.deleteTree(io, dir) catch {};
+	const path = try std.fs.path.join(gpa, &.{ dir, "l7-auth-conf.json" });
+	defer gpa.free(path);
+	try writeFileRaw(io, path, test_conf_json);
+
+	var store = Store.init(gpa, io, path, null);
+	store.bundle_mode = .skip;
+	defer store.deinit();
+
+	// The failing shape: a FRESH store (last_poll_ms still the sentinel) ticked
+	// with the very clock the accept loop feeds it. The first tick must poll,
+	// not subtract.
+	const now = upstream_mod.nowMs(io);
+	try t.expect(now > 0);
+	store.maybePoll(now);
+	try t.expectEqual(now, store.last_poll_ms.load(.monotonic));
+	const gen_first = store.gen_counter;
+	try t.expect(gen_first > 0); // it really polled
+
+	// Inside the second: no re-poll. The conf is changed underneath first, so
+	// a poll would be VISIBLE as a generation bump rather than inferred.
+	try writeFileRaw(io, path, "{\"version\":1,\"providers\":[]}");
+	store.maybePoll(now + 999);
+	try t.expectEqual(now, store.last_poll_ms.load(.monotonic));
+	try t.expectEqual(gen_first, store.gen_counter);
+
+	// A second on, it polls again and picks the new conf up.
+	store.maybePoll(now + 1000);
+	try t.expectEqual(now + 1000, store.last_poll_ms.load(.monotonic));
+	try t.expectEqual(gen_first + 1, store.gen_counter);
+	{
+		const g = store.acquire().?;
+		defer store.release(g);
+		try t.expectEqual(@as(usize, 0), g.entries.len);
+	}
+
+	// The sentinel is arithmetic-free from either end of the clock: a fresh
+	// store must poll, never subtract, whatever `now` it is handed -- an
+	// epoch-scale wall clock, zero, or a far-negative one.
+	for ([_]i64{ 1_756_000_000_000, 0, std.math.minInt(i64) + 1 }) |clock| {
+		var fresh = Store.init(gpa, io, path, null);
+		fresh.bundle_mode = .skip;
+		defer fresh.deinit();
+		fresh.maybePoll(clock);
+		try t.expectEqual(clock, fresh.last_poll_ms.load(.monotonic));
+		try t.expect(fresh.gen_counter > 0);
 	}
 }
 

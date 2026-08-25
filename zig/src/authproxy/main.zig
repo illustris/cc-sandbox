@@ -921,16 +921,23 @@ fn listenLoopback(port: u16) !c_int {
 	return fd;
 }
 
+/// One accept tick's housekeeping, run before the poll(2): it doubles as the
+/// conf-poll tick (at most once/second), the pid-file gate (a first successful
+/// parse after a failed one, or a write that failed last tick) and the counters
+/// rollup tick (H#27). Factored out of the loop so a test can run the tick the
+/// loop runs -- the FIRST tick, against a fresh store, is the one that trapped
+/// in the field, and no in-memory request test reaches it.
+fn tickOnce(ctx: *Context, store: *conf.Store, runtime_dir: []const u8, pid_written: *bool, pid_report: *PidFileReport) void {
+	const now = ctx.now_ms(ctx.io);
+	store.maybePoll(now);
+	_ = pid_report.note(maybeWritePidFile(ctx.io, runtime_dir, store.has_cache, pid_written), runtime_dir);
+	_ = ctx.maybeEmitStats(now);
+}
+
 fn acceptLoop(ctx: *Context, store: *conf.Store, listen_fd: c_int, runtime_dir: []const u8, pid_written: *bool, pid_report: *PidFileReport) void {
 	var pfd = [_]c.struct_pollfd{.{ .fd = listen_fd, .events = c.POLLIN, .revents = 0 }};
 	while (true) {
-		// The accept tick doubles as the conf-poll tick (at most once/second),
-		// the pid-file gate (a first successful parse after a failed one, or a
-		// write that failed last tick) and the counters rollup tick (H#27).
-		const now = ctx.now_ms(ctx.io);
-		store.maybePoll(now);
-		_ = pid_report.note(maybeWritePidFile(ctx.io, runtime_dir, store.has_cache, pid_written), runtime_dir);
-		_ = ctx.maybeEmitStats(now);
+		tickOnce(ctx, store, runtime_dir, pid_written, pid_report);
 		const pr = c.poll(&pfd, 1, 1000);
 		if (pr <= 0) continue;
 		if ((pfd[0].revents & c.POLLIN) == 0) continue;
@@ -1151,6 +1158,50 @@ test "maybeWritePidFile: a write that fails is reported as a WRITE failure, neve
 	try t.expect(!rep.note(.parse_pending, dir));
 	try t.expect(!rep.note(.already_written, dir));
 	try t.expect(rep.note(.written, dir));
+}
+
+test "tickOnce: the accept loop's FIRST tick on a fresh store polls and opens the pid gate, it does not trap" {
+	var threaded: std.Io.Threaded = .init(t.allocator, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	// The launcher's shape: a runtime dir holding a parseable conf.
+	var rnd: [8]u8 = undefined;
+	io.random(&rnd);
+	var hexb: [16]u8 = undefined;
+	_ = std.fmt.bufPrint(&hexb, "{x}", .{&rnd}) catch unreachable;
+	const dir = try std.fmt.allocPrint(t.allocator, "zig-authproxy-tick-test-{s}", .{&hexb});
+	defer t.allocator.free(dir);
+	try cwd.createDirPath(io, dir);
+	defer cwd.deleteTree(io, dir) catch {};
+	const conf_path = try std.fs.path.join(t.allocator, &.{ dir, "l7-auth-conf.json" });
+	defer t.allocator.free(conf_path);
+	try writeTestFile(io, conf_path, "{\"version\":1,\"providers\":[]}");
+
+	var store = conf.Store.init(t.allocator, io, conf_path, null);
+	store.bundle_mode = .skip;
+	defer store.deinit();
+	var ctx = Context{ .gpa = t.allocator, .io = io, .store = &store, .transport = &upstream.real_transport };
+	var pid_written = false;
+	var pid_report: PidFileReport = .{};
+
+	// The real clock against a store that has never polled: `run` polls once
+	// itself but never records the time, so this tick is always the first one
+	// to meet the sentinel.
+	tickOnce(&ctx, &store, dir, &pid_written, &pid_report);
+	try t.expect(store.has_cache); // it polled...
+	try t.expect(pid_written); // ...and the parse gate released the pid file
+	const pid_path = try std.fs.path.join(t.allocator, &.{ dir, "authproxy.pid" });
+	defer t.allocator.free(pid_path);
+	try t.expect((try cwd.statFile(io, pid_path, .{})).size > 1);
+
+	// Every later tick is a no-op on an unchanged conf and never rewrites the
+	// pid file.
+	tickOnce(&ctx, &store, dir, &pid_written, &pid_report);
+	try t.expect(store.has_cache);
+	try t.expect(!pid_report.write_failed_logged);
+	try t.expect(!pid_report.parse_pending_logged);
 }
 
 fn writeTestFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
