@@ -194,6 +194,30 @@ The current deployment's provider is plain HTTP, so none of these affects it, bu
 - **Health, v1: a pid file only** (`<runtime>/authproxy.pid`), whose contents are written by the auth proxy **itself**, once, only after its listener has bound **and** its first conf parse has succeeded (a failed first parse leaves it empty/absent until a later poll parses one). **Healthy means the file exists AND is non-empty (`test -s`), never mere existence**: the VM launcher pre-creates it *empty*, owned by the `COGBOX_PROXY_RUNAS` uid, because under that uid the auth proxy cannot create anything in the root-owned runtime dir on GCE (only `l7-ca` is handed to that uid), while truncate-writing into an existing owned file needs no directory permission; the enforcer path (no runas) pre-creates it too, un-chowned, so both paths share one contract and a supervised restart truncates the dead child's stale pid away rather than leaving it to be read as live. Neither launch script ever writes a pid into it — a pid taken from `$!` would name a process that may already have died on a bind failure, exactly what the file exists to rule out; the VM launcher's warn branch removes the file. The auth proxy logs the two failure causes separately and once each: a withheld file names the failed conf parse, a failed write names the write error (never the other way round). No `readinessProbe` change — adding one would strand every old enforcer pod NotReady and has no enforcer-image freshness gate.
 - **Reload is mtime polling, not SIGHUP** — zero changes to the reload paths, and a missed signal cannot leave stale policy. Both readers re-stat `(mtime, size)` after reading (a non-atomic truncate-then-rewrite of the same length within one tick moves neither mtime nor ctime but moves size), never cache a failed parse, and fall to the empty set.
 
+## Verifying a build before it ships
+
+`zig build test` covers the canonicalizer, the route engine, the framing pre-parse and an in-memory end-to-end (a fake client and a fake upstream behind the transport seam) — but none of that runs the **process** on the real clock. An early build passed 506 tests and died on its first accept-loop tick: `Store.maybePoll` subtracted `now_ms - last` before testing that `last` was still the `minInt(i64)` startup sentinel, an i64 overflow no in-memory test reached because every test drove `poll()` directly. Fail-closed held (every request 502, nothing reached the origin), but every migrated provider was dead on every launch. The accept tick is now factored into `tickOnce` with a test that runs the real first tick against a fresh store, and the gate for this component additionally includes running the binary once, locally, on the real clock:
+
+```sh
+cd zig && zig build
+rt=$(mktemp -d); echo '{"version":1,"providers":[]}' > "$rt/l7-auth-conf.json"; : > "$rt/authproxy.pid"
+timeout 12 ./zig-out/bin/cogbox __authproxy "$rt" 18443 &   # listens on 127.0.0.1:18043
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: x' http://127.0.0.1:18043/api/v4/version           # 400 (reserved_header)
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: git.example.com' -H 'X-Cogbox-Host: git.example.com' \
+     -H 'X-Cogbox-Vetted: 192.0.2.10:80' http://127.0.0.1:18043/api/v4/version                        # 403 (no-policy)
+wait; test -s "$rt/authproxy.pid"                           # pid written; the log must show no `panic`
+```
+
+The process must survive the whole window (its exit is the `timeout`'s 124, never a trap), the pid file must be non-empty, and both probes must be refused with the audit line's fixed reason — a machine that boots the proxy for ten seconds catches the class of bug the suite structurally cannot.
+
+## Known residuals
+
+Found on the first live run and deliberately not fixed in v1; none is an authorization gap.
+
+- A request carrying a forbidden query key (`private_token`, `access_token`, `job_token`, `_method`) is refused with **400**, not the 403 the design text predicts. Denied and never forwarded either way; the status code is the only difference.
+- A path carrying a literal `..` component (`/api/v4/projects/1/access_tokens/..%2Fissues` and the like) never reaches the auth proxy: l7proxy's request-line classifier rejects it one layer earlier (`reason=unclassifiable-or-no-sni`) with a bare connection close. Fail-closed and nothing reaches the origin — but there is **no `authproxy request` audit line** for such a request, so the auth proxy's audit trail alone under-counts these attempts; correlate with l7proxy's `reject` lines.
+- An auth proxy killed from outside (a signal, an OOM) leaves its non-empty `authproxy.pid` in place: on the VM path nothing supervises it, so `test -s authproxy.pid` reads as healthy over a dead process until the sandbox restarts. `test -s` is a *started-and-parsed* signal, not liveness; a liveness probe needs `kill -0` on the recorded pid.
+
 ## Deliberately deferred
 
 - No live project-identity resolution in v1 — the namespace snapshot stays the numeric-form authorizer; path-form addressing is *better* than today with no resolver.
