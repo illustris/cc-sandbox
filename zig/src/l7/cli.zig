@@ -9,6 +9,7 @@
 //   cogbox l7 --config CFG --runtime RT clear --plugin TAG  (drop all TAG rules)
 //   cogbox l7 --config CFG --runtime RT set                 (reads stdin)
 //   cogbox l7 --config CFG --runtime RT replace --plugin TAG --from-stdin
+//   cogbox l7 --config CFG --runtime RT policy --from-stdin
 //   cogbox l7 --config CFG --runtime RT mode passthrough|terminate
 
 const std = @import("std");
@@ -23,6 +24,12 @@ pub const Cmd = union(enum) {
 	clear: ClearArgs,
 	set,
 	replace: ReplaceArgs,
+	// `policy --from-stdin`: replace `.network.l7.authpolicy` (the per-instance
+	// auth-proxy policy document) with the JSON document on stdin. A subcommand
+	// of `l7` ON PURPOSE: an OLD binary answers exit 64 with stderr exactly
+	// `cogbox l7: error: UnknownSubcommand` -- the byte-exact payload the
+	// control plane already classifies as "fall back to the legacy path".
+	policy,
 	mode: ModeArgs,
 };
 
@@ -127,6 +134,7 @@ pub fn parse(argv: []const []const u8) ParseError!Args {
 	if (std.mem.eql(u8, sub, "del")) return parseDel(cfg_path, rt_path, sub_args);
 	if (std.mem.eql(u8, sub, "clear")) return parseClear(cfg_path, rt_path, sub_args);
 	if (std.mem.eql(u8, sub, "replace")) return parseReplace(cfg_path, rt_path, sub_args);
+	if (std.mem.eql(u8, sub, "policy")) return parsePolicy(cfg_path, rt_path, sub_args);
 	if (std.mem.eql(u8, sub, "mode")) return parseMode(cfg_path, rt_path, sub_args);
 	return error.UnknownSubcommand;
 }
@@ -450,6 +458,18 @@ fn parseReplace(cfg: []const u8, rt: []const u8, args: []const []const u8) Parse
 	};
 }
 
+/// `policy --from-stdin`. The flag is required (and not a default) for the same
+/// reason parseReplace's is: the verb replaces the WHOLE policy document, so it
+/// must never be invocable in a form that silently wipes it from an empty argv.
+fn parsePolicy(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseError!Args {
+	if (args.len != 1 or !std.mem.eql(u8, args[0], "--from-stdin")) return error.InvalidArgs;
+	return .{
+		.config_path = cfg,
+		.runtime_path = rt,
+		.cmd = .policy,
+	};
+}
+
 fn parseDel(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseError!Args {
 	if (args.len != 1) return error.InvalidArgs;
 	const idx = std.fmt.parseInt(usize, args[0], 10) catch return error.InvalidIndex;
@@ -675,6 +695,20 @@ test "unknown subcommand" {
 	// `replace` is now known, but a genuinely unknown verb must still produce the
 	// exact exit-64 UnknownSubcommand signature the control plane classifies on.
 	try t.expectError(error.UnknownSubcommand, parse(&.{ "--config", "/c", "--runtime", "/r", "reeplace" }));
+	// Same guard for a near-miss of `policy` -- the verb the classified
+	// old-binary refusal is FOR, so its own typo class must keep the signature.
+	try t.expectError(error.UnknownSubcommand, parse(&.{ "--config", "/c", "--runtime", "/r", "policyy" }));
+}
+
+test "policy --from-stdin parses; the flag is mandatory and exclusive" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "policy", "--from-stdin" });
+	try t.expect(a.cmd == .policy);
+	// --from-stdin is required (never a default), and nothing else is accepted:
+	// the verb replaces the WHOLE document, so a stray argv form must not be
+	// able to invoke it.
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "policy" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "policy", "--from-stdin", "extra" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "policy", "--plugin", "gitlab" }));
 }
 
 test "replace --plugin --from-stdin parses; rejects missing/empty flags" {

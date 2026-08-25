@@ -1807,6 +1807,139 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token 
         "/home/testuser/.local/share/cogbox/mirrors/injauto"
     ))
 
+with subtest("Phase AP: per-sandbox auth proxy end-to-end (funnel -> addon retarget -> authproxy -> upstream, and fail-closed)"):
+    # The migrated-provider path: a git host bound under the NEW kind
+    # (gitlab-authproxy) and delivered a policy DOCUMENT (`cogbox l7 policy`)
+    # takes the fourth trusted-half process instead of addon injection. The
+    # decisive property proven end to end: the guest holds NO credential, the
+    # mitmproxy addon RETARGETS the flow to 127.0.0.1:<auth-port> (never
+    # injecting), and the auth proxy authenticates the request itself so the
+    # origin observes the REAL owner token -- and if the auth proxy is dead, the
+    # request FAILS CLOSED with no credential upstream.
+    #
+    # Reuses the Phase-K/R hermetic origin on 203.0.113.5 (mapped from
+    # vhost-a.test by the node's /etc/hosts, so the proxy re-resolves it
+    # host-side). The origin's TLS listener echoes the Authorization it received.
+    machine.succeed("systemctl reset-failed l7-origin 2>/dev/null || true")
+    machine.succeed("systemd-run --unit=l7-origin --collect python3 /tmp/l7-origin.py")
+    machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
+
+    apx_host = "vhost-a.test"
+    apx_token = "glpat-AUTHPROXY-REAL-do-not-leak-2c9f"  # fictional owner token (OSS-clean)
+
+    # Fresh rules-mode instance for the migrated provider.
+    machine.succeed(as_user("cogbox init -y --name apx --network rules"))
+    apx_cfg = "/home/testuser/.config/cogbox/instances/apx/config.json"
+
+    # 1) BIND the owner token under the NEW kind. An OLD binary would refuse this
+    #    with exit 65 (validKind) -- the rollout's version gate -- so the bind
+    #    succeeding is itself proof the image carries the auth-proxy support.
+    machine.succeed(as_user(
+        "printf '%s' " + shlex.quote(apx_token) +
+        " | cogbox secret add git-gitlab --kind gitlab-authproxy "
+        "--audience " + apx_host + " --name apx --from-stdin"
+    ))
+
+    # 2) The funnel rule: `allow <host> --path /` (the `--path /` is load-bearing
+    #    -- it forces terminate so the addon runs on a passthrough-mode instance)
+    #    plus --insecure-upstream so the auth proxy's TLS leg reaches the origin's
+    #    self-signed cert (propagated into the auth conf's `insecure` per N2).
+    machine.succeed(as_user("printf '' | cogbox l7 set --name apx"))
+    machine.succeed(as_user(
+        "cogbox l7 add allow " + apx_host + " --path / --insecure-upstream "
+        "--plugin git-grants --name apx"
+    ))
+
+    # 3) DELIVER the policy document. `cogbox l7 policy --from-stdin` validates it
+    #    (an unknown version / malformed doc is refused BEFORE any write) and sets
+    #    .network.l7.authpolicy. One provider entry: the gitlab plugin, scheme
+    #    https, an instance-scope grant carrying `issues` (which authorizes the
+    #    ambient /api/v4/user route).
+    apx_doc = (
+        '{"version":1,"providers":[{'
+        '"provider":"GitLab","plugin":"gitlab","hosts":["' + apx_host + '"],'
+        '"secret":"git-gitlab","git_user":"oauth2","scheme":"https",'
+        '"grants":[{"id":"gg-apx","scope":"instance","caps":["git-read","issues"]}]}]}'
+    )
+    machine.succeed(as_user(
+        "printf '%s' " + shlex.quote(apx_doc) + " | cogbox l7 policy --from-stdin --name apx"
+    ))
+    # The document landed in config.json under the contract key.
+    machine.succeed(f"jq -e '.network.l7.authpolicy.version==1' {apx_cfg}")
+    machine.succeed(
+        f"jq -e '.network.l7.authpolicy.providers[0].hosts[0]==\"{apx_host}\"' {apx_cfg}")
+
+    aport = int(machine.succeed(f"jq -r '.sshPort' {apx_cfg}").strip())
+    boot_and_wait("cc-apx", "--name apx", ssh_port=aport)
+    art = "/run/user/1000/cogbox-apx"
+
+    # The render wrote all four wire files. The auth conf names the host + its
+    # cred file, and l7-auth-hosts (the retarget set) carries the host.
+    machine.succeed(
+        f"jq -e '.providers[] | select(.host==\"{apx_host}\") "
+        f"| select(.plugin==\"gitlab\") | select(.insecure==true)' {art}/l7-auth-conf.json")
+    machine.succeed(f"grep -qx '{apx_host}' {art}/l7-auth-hosts")
+    # Finding N1: the host is ALSO in the plain-HTTP routing list, even though no
+    # inject SPEC was seeded for it (the new kind seeds none).
+    machine.succeed(f"grep -qx '{apx_host}' {art}/l7-inject-hosts")
+    # The auth proxy is up and wrote its pid INTO the pid file. `-s`, not `-f`:
+    # the launcher pre-creates the file EMPTY (so a runas uid can write into a
+    # root-owned runtime dir on GCE); only the Zig side fills it, after bind +
+    # first conf parse, so non-empty is the health signal, existence is not.
+    machine.succeed(f"test -s {art}/authproxy.pid")
+    machine.succeed(f"kill -0 $(cat {art}/authproxy.pid)")
+    # NO inject spec for this host: the mitm addon must never double-stamp it.
+    machine.fail(
+        f"jq -e '.[] | select(.host==\"{apx_host}\")' {art}/l7-inject-conf.json")
+
+    # END TO END: the guest presents NO credential. The request funnels to the
+    # proxy, mitmproxy terminates + retargets to the auth proxy, which stamps the
+    # owner token; the origin observes it. (The api-user route takes a Bearer.)
+    apx_curl = (
+        "curl -sS --max-time 12 --cacert /run/cogbox/ca-bundle.crt "
+        "--resolve " + apx_host + ":443:203.0.113.5 "
+        "https://" + apx_host + "/api/v4/user"
+    )
+    machine.wait_until_succeeds(
+        as_user("cogbox ssh --name apx " + shlex.quote(
+            apx_curl + " | grep -q 'auth=Bearer " + apx_token + "'")),
+        timeout=30,
+    )
+    hits = machine.succeed("cat /tmp/origin-hits.log")
+    assert ("auth=Bearer " + apx_token) in hits, \
+        f"auth proxy did not stamp the owner token at the origin: {hits!r}"
+
+    # The token never crossed into the guest: no cred file, no env, nowhere.
+    rc_leak, _ = machine.execute(as_user(
+        "cogbox ssh --name apx " + shlex.quote(
+            "grep -rqsI '" + apx_token + "' /root /etc /var/lib /run/cogbox")))
+    assert rc_leak != 0, "the owner token must not be present anywhere in the guest"
+
+    # FAIL CLOSED: kill the auth proxy, then a request to the migrated host must
+    # FAIL (mitmproxy's retarget to the dead loopback port cannot connect) and
+    # the origin must observe NO new token. Snapshot the hit count first.
+    before = machine.succeed("wc -l < /tmp/origin-hits.log").strip()
+    machine.succeed(f"kill $(cat {art}/authproxy.pid)")
+    # An unusable auth hop yields a proxy error, not a 200 with a token upstream.
+    rc_dead, _ = machine.execute(as_user(
+        "cogbox ssh --name apx " + shlex.quote(
+            apx_curl + " -o /dev/null -w '%{http_code}' | grep -q '^200$'")))
+    assert rc_dead != 0, "a request with the auth proxy dead must not succeed with a 200"
+    after = machine.succeed("wc -l < /tmp/origin-hits.log").strip()
+    # The origin logs a line only when it is actually reached WITH a request; a
+    # fail-closed retarget never reaches it carrying the credential.
+    hits2 = machine.succeed("cat /tmp/origin-hits.log")
+    assert ("auth=Bearer " + apx_token) not in hits2.split("\n")[int(before):], \
+        f"the owner token reached the origin AFTER the auth proxy died: {hits2!r}"
+    _ = after
+
+    stop_instance("cc-apx", name="apx")
+    machine.succeed("systemctl stop l7-origin")
+    machine.succeed(as_user(
+        "rm -rf /home/testuser/.config/cogbox/instances/apx "
+        "/home/testuser/.local/share/cogbox/instances/apx"
+    ))
+
 with subtest("Phase N: per-instance L7 ports (isolation + fail-closed bind)"):
     # The cross-instance bleed bug: with a single shared port, instance B's
     # funnel pointed at instance A's proxy. Per-instance ports fix it. We prove

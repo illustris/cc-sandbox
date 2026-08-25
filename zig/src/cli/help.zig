@@ -419,6 +419,8 @@ pub const L7 =
     \\  cogbox l7 [-n NAME] del INDEX
     \\  cogbox l7 [-n NAME] clear --plugin TAG   (drop every TAG-tagged rule)
     \\  cogbox l7 [-n NAME] replace --plugin TAG --from-stdin
+    \\  cogbox l7 [-n NAME] policy --from-stdin  (replace the auth-proxy policy
+    \\                                            document from JSON on stdin)
     \\  cogbox l7 [-n NAME] set                  (reads HOST rules from stdin)
     \\  cogbox l7 [-n NAME] mode passthrough|terminate
     \\

@@ -21,6 +21,7 @@ const secret_verb = @import("verbs/secret.zig");
 const run_verb = @import("verbs/run.zig");
 const rules_module = @import("rules_module");
 const l7proxy_module = @import("l7proxy_module");
+const authproxy_module = @import("authproxy_module");
 const divertshim_module = @import("divertshim_module");
 const filter_mod = @import("filter");
 const start_verb = @import("verbs/start.zig");
@@ -38,9 +39,11 @@ const KNOWN_VERBS = [_][]const u8{
 	// "__render-rules" (boot-time runtime-file renderer), "enforce" (the
 	// container enforcer sidecar's PID1 supervisor entrypoint),
 	// "__divertshim" (the separate-pod enforcer's in-pod nft-REDIRECT shim),
-	// "__claude-stub" (the container agent's marker-gated Claude stub-staging).
+	// "__claude-stub" (the container agent's marker-gated Claude stub-staging),
+	// "__authproxy" (the per-sandbox pluggable auth proxy for migrated git
+	// providers).
 	"__launch", "__l7proxy", "__render-rules", "enforce", "__divertshim",
-	"__claude-stub",
+	"__claude-stub", "__authproxy",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -115,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "ssh")) return ssh_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "rules")) return rules_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "remap")) return remap_verb.run(allocator, io, &p, rest);
-	if (std.mem.eql(u8, verb, "l7")) return l7_verb.run(allocator, io, &p, rest);
+	if (std.mem.eql(u8, verb, "l7")) return l7_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "plugin")) return plugin_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "secret")) return secret_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "enforce")) return enforce_verb.run(allocator, io, env, rest);
@@ -158,6 +161,19 @@ pub fn main(init: std.process.Init) !void {
 		else
 			300;
 		return l7proxy_module.run(allocator, rest[0], base, accept_mode, listen_addr, funnel_all, peek_ms);
+	}
+	if (std.mem.eql(u8, verb, "__authproxy")) {
+		if (rest.len < 1) util.die(allocator, io, null, exit_codes.usage, "__authproxy requires a runtime dir [l7-base-port]", .{});
+		// Optional L7 port base (default canonical); the launcher passes the
+		// instance's allocated base so the auth listen port (base - 400)
+		// doesn't collide -- mirrors __l7proxy's parse exactly. Unlike
+		// __l7proxy, the auth proxy is threaded std.Io (init.io) for the
+		// trust-store load and the conf/cred file reads.
+		const base: u16 = if (rest.len >= 2)
+			std.fmt.parseInt(u16, rest[1], 10) catch filter_mod.l7_default_base
+		else
+			filter_mod.l7_default_base;
+		return authproxy_module.run(allocator, io, env, rest[0], base);
 	}
 	if (std.mem.eql(u8, verb, "__divertshim")) {
 		// The separate-pod enforcer's in-pod nft-REDIRECT shim. Listens on

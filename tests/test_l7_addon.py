@@ -288,6 +288,11 @@ class CIDict:
     def __contains__(self, k):
         return k.lower() in self._d
 
+    def __iter__(self):
+        # mitmproxy's real Headers multidict is iterable over its field names;
+        # strip_cogbox_headers relies on that to find X-Cogbox-* by prefix.
+        return iter(list(self._d.keys()))
+
     def get(self, k, default=None):
         return self._d.get(k.lower(), default)
 
@@ -1088,6 +1093,219 @@ check(m.evaluate(m.RULES, _ghost, m.normalize_path(
 check(m.evaluate(m.RULES, _ghost, m.normalize_path(
     "/api/v4/projects/1234/issues"), "POST") == "allow",
       "numeric wildcard: the numeric-id form is still allowed")
+
+
+# --- auth-proxy retargeting (X-Cogbox-* strip + retarget + injection skip) ---
+# A host in l7-auth-hosts is steered to the loopback auth-proxy hop instead of
+# being injected here: the addon strips every X-Cogbox-* header, sets the three
+# reserved ones (route key, vetted upstream, original scheme), rewrites the
+# DATA host/port (never the properties), forces scheme=http, and returns BEFORE
+# the injection block. A host NOT in the set takes the unchanged legacy path.
+
+# strip_cogbox_headers: every X-Cogbox-* spelling gone, nothing else touched.
+_ch = CIDict({"X-Cogbox-Host": "forged.test", "x-cogbox-vetted": "1.2.3.4:443",
+              "X-COGBOX-Proto": "https", "Authorization": "Bearer keep",
+              "X-Other": "keep"})
+_removed = m.strip_cogbox_headers(_ch)
+check(sorted(x.lower() for x in _removed) ==
+      ["x-cogbox-host", "x-cogbox-proto", "x-cogbox-vetted"],
+      "strip_cogbox_headers: reports every X-Cogbox-* spelling removed")
+for _h in ("x-cogbox-host", "x-cogbox-vetted", "x-cogbox-proto"):
+    check(_h not in _ch, "strip_cogbox_headers: %s gone" % _h)
+check(_ch.get("authorization") == "Bearer keep" and _ch.get("x-other") == "keep",
+      "strip_cogbox_headers: touches no non-cogbox header")
+check(m.strip_cogbox_headers(CIDict({})) == [], "strip_cogbox_headers: no-op on a clean request")
+
+
+# A fake mitmproxy request .data carrier (the SOCKS5 CONNECT address lives here;
+# transparent mode seeds .data.host/.data.port from it).
+class _Data:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+
+
+class _ARq:
+    def __init__(self, host, method, headers, vetted_ip, vetted_port):
+        self.pretty_host = host
+        self.method = method
+        self.headers = headers
+        self.scheme = "https"
+        self.data = _Data(vetted_ip, vetted_port)
+
+
+class _AFlow:
+    def __init__(self, host, method, headers, sni, vetted_ip, vetted_port):
+        self.client_conn = _GConn(sni)
+        self.server_conn = _GConn(None)
+        self.request = _ARq(host, method, headers, vetted_ip, vetted_port)
+        self.response = None
+
+
+_ad = tempfile.mkdtemp()
+_ahost = "git.example.internal"
+
+# AuthHosts reader: absent path -> empty; a real file -> its hosts; a torn
+# (removed) file falls back to empty and re-reads once it reappears.
+_ah_none = m.AuthHosts("")
+check(not _ah_none.contains(_ahost), "AuthHosts: empty path -> nothing retargeted")
+_ahp = os.path.join(_ad, "l7-auth-hosts")
+_ahr = m.AuthHosts(_ahp)
+check(not _ahr.contains(_ahost), "AuthHosts: missing file -> empty (fail closed)")
+with open(_ahp, "w") as f:
+    f.write("# migrated providers\n" + _ahost + "\n")
+os.utime(_ahp, (2000, 2000))
+check(_ahr.contains(_ahost), "AuthHosts: a listed host is owned by the auth proxy")
+check(_ahr.contains(_ahost.upper() + "."), "AuthHosts: match is case/trailing-dot insensitive")
+check(not _ahr.contains("other.internal"), "AuthHosts: an unlisted host is not owned")
+# A removed file drops the cache and falls to empty (fail closed), not stale.
+os.remove(_ahp)
+check(not _ahr.contains(_ahost), "AuthHosts: a vanished file falls back to empty")
+
+# TORN WRITE (the re-stat-after-read hardening): writeRuntimeFile truncates
+# then rewrites in place, so a read can land between the two. Simulate it by
+# making the PRE-read os.stat of one reload report a different (mtime, size)
+# than the post-read one: the reader must keep its previous set AND its
+# previous key (no cache advance), so the next poll retries on settled bytes.
+with open(_ahp, "w") as f:
+    f.write(_ahost + "\n")
+os.utime(_ahp, (2100, 2100))
+check(_ahr.contains(_ahost), "AuthHosts (torn): the settled file loads")
+_prev_key = _ahr.stat
+_real_stat = m.os.stat
+_stat_calls = {"n": 0}
+
+
+def _torn_stat(p, *a, **kw):
+    st = _real_stat(p, *a, **kw)
+    if p == _ahp:
+        _stat_calls["n"] += 1
+        if _stat_calls["n"] == 1:
+            # the pre-read stat: pretend the file is a NEW, larger version
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
+                                   st.st_uid, st.st_gid, st.st_size + 40,
+                                   st.st_atime, 2200, st.st_ctime))
+    return st
+
+
+m.os.stat = _torn_stat
+try:
+    _ahr.maybe_reload()
+finally:
+    m.os.stat = _real_stat
+check(_ahr.stat == _prev_key,
+      "AuthHosts (torn): a read whose post-read stat disagrees does NOT advance the cache")
+check(_ahr.contains(_ahost) and _ahr.stat == _prev_key,
+      "AuthHosts (torn): the previous (settled) set stays live meanwhile")
+# ...and once the file really changes, the next poll commits the new bytes.
+with open(_ahp, "w") as f:
+    f.write(_ahost + "\nother.example.com\n")
+os.utime(_ahp, (2300, 2300))
+check(_ahr.contains("other.example.com") and _ahr.stat != _prev_key,
+      "AuthHosts (torn): the next settled change is picked up")
+
+
+def _set_auth(port, hosts):
+    p = os.path.join(_ad, "auth-hosts-%s" % ("-".join(hosts) or "none"))
+    with open(p, "w") as f:
+        f.write("".join(h + "\n" for h in hosts))
+    os.utime(p, (3000, 3000))
+    m.AUTH_HOSTS = m.AuthHosts(p)
+    m.AUTH_PORT = str(port)
+
+
+# The retarget decision end to end: a migrated host is retargeted, NOT injected.
+m.RULES_PATH = os.path.join(_ad, "l7-rules")
+with open(m.RULES_PATH, "w") as f:
+    f.write("mode terminate\nallow git.example.internal --path /\n"
+            .replace(" --path /", " /"))  # `allow <host> /` (funnel shape)
+m.RULES = m.Rules()
+# A stale gitlab-oauth spec ALSO names the host (the mode-flip conflict): the
+# retarget must win and NOT inject, and the conflict must be logged once.
+_acred = os.path.join(_ad, "git-gitlab")
+_write_raw(_acred, "glpat-STALE\n", 5000)
+_aconf = os.path.join(_ad, "auth-inject.json")
+_write(_aconf, [{"host": _ahost, "style": "gitlab-oauth", "cred_file": _acred,
+                 "cred_format": "raw", "git_user": "oauth2",
+                 "rules_tag": "git-grants",
+                 "stub_token": "glpat-cogbox-host-injected-placeholder"}],  # gitleaks:allow
+       5000)
+m.CREDS = m.CredStore(_aconf)
+_set_auth(19999, [_ahost])
+
+_conflicts = []
+_orig_cred_log = m._cred_log
+m._cred_log = lambda msg: _conflicts.append(msg)
+try:
+    _afl = _AFlow(_ahost, "GET", CIDict({
+        "Host": _ahost,
+        "X-Cogbox-Host": "forged-by-guest.test",  # must be stripped, then re-set
+    }), sni=_ahost, vetted_ip="203.0.113.9", vetted_port=443)
+    m._enforce_and_inject(_afl, "/api/v4/projects/1234/issues")
+finally:
+    m._cred_log = _orig_cred_log
+
+check(_afl.response is None, "retarget: an allowed migrated host is not denied")
+check(_afl.request.headers.get("x-cogbox-host") == _ahost,
+      "retarget: X-Cogbox-Host is the real host (the guest's forged one was stripped first)")
+check(_afl.request.headers.get("x-cogbox-vetted") == "203.0.113.9:443",
+      "retarget: X-Cogbox-Vetted carries l7proxy's pinned upstream captured before the retarget")
+check(_afl.request.headers.get("x-cogbox-proto") == "https",
+      "retarget: X-Cogbox-Proto records the guest's original (TLS) scheme")
+check(_afl.request.data.host == "127.0.0.1" and _afl.request.data.port == 19999,
+      "retarget: .data host/port point at the loopback auth-proxy hop")
+check(_afl.request.scheme == "http", "retarget: the loopback hop is forced to http")
+check(_afl.request.headers.get("authorization") is None,
+      "retarget: NO credential is injected here (the auth proxy stamps it) even with a stale spec")
+check(any("CONFLICT" in c and _ahost in c for c in _conflicts),
+      "retarget: a host with both a spec and an auth entry logs a one-shot conflict")
+
+# The conflict log is one-shot per conf generation: a second flow does not re-log.
+_conflicts2 = []
+m._cred_log = lambda msg: _conflicts2.append(msg)
+try:
+    _afl2 = _AFlow(_ahost, "GET", CIDict({"Host": _ahost}),
+                   sni=_ahost, vetted_ip="203.0.113.9", vetted_port=443)
+    m._enforce_and_inject(_afl2, "/api/v4/projects/1234/issues")
+finally:
+    m._cred_log = _orig_cred_log
+check(not any("CONFLICT" in c for c in _conflicts2),
+      "retarget: the conflict warning is one-shot per conf generation")
+
+# Auth port unusable / no vetted upstream -> retarget refuses (the caller then
+# fails closed via _deny, which needs mitmproxy; assert the primitive directly).
+m.AUTH_PORT = ""
+_afl3 = _AFlow(_ahost, "GET", CIDict({"Host": _ahost}),
+               sni=_ahost, vetted_ip="203.0.113.9", vetted_port=443)
+check(not m.retarget_to_authproxy(_afl3, _ahost, _ahost),
+      "retarget: an unusable auth port refuses (caller fails closed)")
+check(_afl3.request.data.host == "203.0.113.9",
+      "retarget: a refused retarget leaves the upstream untouched")
+m.AUTH_PORT = "19999"
+_afl4 = _AFlow(_ahost, "GET", CIDict({"Host": _ahost}), sni=_ahost,
+               vetted_ip="", vetted_port=0)
+check(not m.retarget_to_authproxy(_afl4, _ahost, _ahost),
+      "retarget: a flow with no vetted upstream refuses (never resolves the host itself)")
+
+# LEGACY PATH UNCHANGED: with the hosts file absent/empty, a NON-migrated host
+# is injected exactly as before -- byte-identical to Scenario C above, and the
+# request is never retargeted.
+_set_auth(19999, [])  # empty auth set
+_set_spec(with_tag=False)  # from the tag-gate block: a plain whole-host spec
+m.RULES_PATH = os.path.join(_ad, "legacy-rules")
+with open(m.RULES_PATH, "w") as f:
+    f.write("mode terminate\nallow git.example.internal\n")
+m.RULES = m.Rules()
+_leg = _AFlow(_ahost, "GET", CIDict({"Host": _ahost}),
+              sni=_ahost, vetted_ip="203.0.113.9", vetted_port=443)
+m._enforce_and_inject(_leg, "/api/v4/projects/1234/issues")
+check(_leg.response is None, "legacy path: allowed")
+check(_leg.request.data.host == "203.0.113.9" and _leg.request.scheme == "https",
+      "legacy path: a non-migrated host is NOT retargeted (data/scheme untouched)")
+check(_leg.request.headers.get("authorization") == "Bearer " + _GTOK,
+      "legacy path: a non-migrated host is injected here, exactly as before")
+check(_leg.request.headers.get("x-cogbox-host") is None,
+      "legacy path: no reserved header is set on a non-migrated flow")
 
 
 if fails:

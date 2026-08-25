@@ -12,6 +12,7 @@ const l7_module = @import("l7_module");
 pub fn run(
 	allocator: std.mem.Allocator,
 	io: std.Io,
+	env: *std.process.Environ.Map,
 	p: *const paths.Paths,
 	argv: []const []const u8,
 ) !void {
@@ -66,5 +67,8 @@ pub fn run(
 		util.die(allocator, io, "l7", exit_codes.noinput, "no config found at {s}", .{cfg_path});
 	};
 
-	try l7_module.dispatch(allocator, io, cfg_path, inst_runtime, rest.items);
+	// env is threaded through for `l7 policy`, whose render path (renderFiles)
+	// resolves the secret-store dirs from it -- mirroring secret_verb.run. All
+	// other l7 subcommands ignore it.
+	try l7_module.dispatch(allocator, io, env, cfg_path, inst_runtime, rest.items);
 }

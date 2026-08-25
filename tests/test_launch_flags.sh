@@ -324,6 +324,71 @@ check_add_dir_rejection "Cogbox-data overlap" 65 \
 	"overlaps protected host path" "$overlap" "$overlap_canary" \
 	--add-dir "$overlap"
 
+# --- 5. the auth proxy's pid file is pre-created for the proxy uid -----------
+#
+# Under COGBOX_PROXY_RUNAS the auth proxy runs as a uid that cannot create
+# files in $RUNTIME (root-owned 0755 on GCE), so the launcher pre-creates
+# $RUNTIME/authproxy.pid EMPTY and chowns it to that uid; the Zig side then
+# truncate-writes its pid into the existing inode. The function is extracted
+# from the launcher and run here with a recording `chown` on PATH (the test is
+# not root), so the contract is exercised rather than grepped for.
+precreate_src=$(sed -n '/^precreate_authproxy_pidfile() {$/,/^}$/p' "$LAUNCH")
+if [ -z "$precreate_src" ]; then
+	bad "precreate_authproxy_pidfile() not found in the launcher (the extraction anchor moved?)"
+else
+	pc_bin="$WORK/pc-bin"
+	mkdir -p "$pc_bin"
+	# an absolute bash shebang: the nix build sandbox has no /usr/bin/env
+	# (test_enforce.sh's shebang() idiom)
+	{ printf '#!%s\n' "$(command -v bash)"; cat <<'STUB'
+echo "chown $*" >> "$CHOWN_LOG"
+STUB
+	} > "$pc_bin/chown"
+	chmod +x "$pc_bin/chown"
+	run_precreate() {
+		# $1 = COGBOX_PROXY_RUNAS value ("" = unset), $2 = runtime dir
+		local runas="$1" rt="$2"
+		( eval "$precreate_src"
+		  RUNTIME="$rt"
+		  if [ -n "$runas" ]; then export COGBOX_PROXY_RUNAS="$runas"; else unset COGBOX_PROXY_RUNAS; fi
+		  PATH="$pc_bin:$PATH" CHOWN_LOG="$WORK/chown.log" precreate_authproxy_pidfile )
+	}
+	pc_rt="$WORK/pc-rt"
+	mkdir -p "$pc_rt"
+	: > "$WORK/chown.log"
+	# under a runas uid: the file exists, is EMPTY, mode 0644, and was chowned
+	# to exactly the uid:gid the proxy will run as
+	run_precreate "1234:1234" "$pc_rt"
+	if [ -f "$pc_rt/authproxy.pid" ] && [ ! -s "$pc_rt/authproxy.pid" ]; then
+		ok "precreate under COGBOX_PROXY_RUNAS leaves an EMPTY pid file (health is non-empty, not existence)"
+	else
+		bad "precreate under COGBOX_PROXY_RUNAS did not leave an empty pid file"
+	fi
+	[ "$(stat -c %a "$pc_rt/authproxy.pid")" = 644 ] \
+		|| bad "pre-created pid file mode is $(stat -c %a "$pc_rt/authproxy.pid"), expected 644"
+	grep -Fqx "chown 1234:1234 $pc_rt/authproxy.pid" "$WORK/chown.log" \
+		|| bad "pre-created pid file was not chowned to the proxy uid:gid (log: $(cat "$WORK/chown.log"))"
+	# a stale pid from a previous launch is truncated away, never inherited
+	echo 99999 > "$pc_rt/authproxy.pid"
+	run_precreate "1234:1234" "$pc_rt"
+	[ ! -s "$pc_rt/authproxy.pid" ] \
+		|| bad "precreate did not truncate a stale pid file"
+	# no runas: the launching user owns the file already; no chown at all
+	: > "$WORK/chown.log"
+	run_precreate "" "$pc_rt"
+	[ ! -s "$WORK/chown.log" ] || bad "precreate chowned without COGBOX_PROXY_RUNAS (log: $(cat "$WORK/chown.log"))"
+	[ -f "$pc_rt/authproxy.pid" ] && [ ! -s "$pc_rt/authproxy.pid" ] \
+		|| bad "precreate without COGBOX_PROXY_RUNAS did not leave an empty pid file"
+	ok "precreate without COGBOX_PROXY_RUNAS pre-creates without chown"
+	# an unwritable runtime dir warns and returns 0: warn-not-die, like the
+	# rest of start_l7auth
+	pc_out=$(run_precreate "1234:1234" "$WORK/no-such-runtime-dir" 2>&1); pc_rc=$?
+	[ "$pc_rc" = 0 ] || bad "precreate exited $pc_rc on an unwritable runtime dir (must warn, never fail the launch)"
+	grep -Fq "cannot pre-create" <<<"$pc_out" \
+		|| bad "precreate did not warn on an unwritable runtime dir (out: $pc_out)"
+	ok "precreate on an unwritable runtime dir warns and continues"
+fi
+
 if [ "$fails" -gt 0 ]; then
 	echo "$fails check(s) failed" >&2
 	exit 1

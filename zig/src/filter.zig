@@ -824,6 +824,25 @@ pub fn l7PortsForBase(base: u16) L7Ports {
 	return .{ .tls = base, .http = base +| 1, .mitm = base +| 2 };
 }
 
+// The per-sandbox auth proxy's loopback listen port, derived DOWNWARD from the
+// same L7 base: `auth = base - 400`. Downward is collision-free forever --
+// instance k has base = 18443+3k and auth = 18043+3k, so the auth band and the
+// stride-3 triple band both grow upward and cannot meet for any realistic k,
+// while within each band the stride keeps them disjoint. It also stays well
+// below the ephemeral range (an upward offset would race bind() against
+// outbound ephemeral allocation). The port is TOPOLOGY, never policy: it lives
+// only in env (COGBOX_L7_AUTH_PORT), never in config.json or a wire file.
+pub const l7_auth_port_offset: u16 = 400;
+
+/// The auth proxy's listen port for the instance whose L7 base is `base`.
+/// Refuses a base at or below the offset (which would underflow / collide with
+/// the low reserved ports): `cogbox __authproxy` then declines to start and
+/// mitmproxy's retarget fails closed (an error to the guest, no credential).
+pub fn l7AuthPortForBase(base: u16) ?u16 {
+	if (base <= l7_auth_port_offset + 1024) return null; // base <= 1424 is refused
+	return base - l7_auth_port_offset;
+}
+
 pub const L7Rule = struct {
 	action: Action,
 	host: DnsPattern,
@@ -2019,6 +2038,22 @@ test "l7PortsForBase: contiguous triple, no cross-instance overlap" {
 	try std.testing.expectEqual(@as(u16, 18446), b.tls);
 	try std.testing.expectEqual(@as(u16, 18448), b.mitm);
 	try std.testing.expect(b.tls > a.mitm); // no overlap
+}
+
+test "l7AuthPortForBase: downward -400 offset, disjoint across instances, refuses a low base" {
+	try std.testing.expectEqual(@as(?u16, 18043), l7AuthPortForBase(l7_default_base)); // 18443 -> 18043
+	// two consecutive instances (stride 3): their auth ports stay disjoint, and
+	// well below their triple bands.
+	const a = l7AuthPortForBase(l7_default_base).?;
+	const b = l7AuthPortForBase(l7_default_base + 3).?;
+	try std.testing.expectEqual(@as(u16, 18046), b);
+	try std.testing.expect(b > a);
+	try std.testing.expect(a < l7PortsForBase(l7_default_base).tls); // the auth band is below the triple band
+	// a base at or below 1424 has no safe downward offset and is refused.
+	try std.testing.expectEqual(@as(?u16, null), l7AuthPortForBase(1424));
+	try std.testing.expectEqual(@as(?u16, null), l7AuthPortForBase(400));
+	try std.testing.expectEqual(@as(?u16, null), l7AuthPortForBase(0));
+	try std.testing.expectEqual(@as(?u16, 1025), l7AuthPortForBase(1425)); // first accepted base
 }
 
 test "L7 mode terminate floor applies to matched allow hosts only" {

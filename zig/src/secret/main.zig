@@ -63,6 +63,19 @@ pub const gitlab_stub_token = "glpat-cogbox-host-injected-placeholder"; // gitle
 /// as the spec's `git_user` (a per-provider override is deferred to Phase 2).
 pub const default_git_user = "oauth2";
 
+/// The secret `kind` that routes a per-user git credential through the
+/// per-sandbox AUTH PROXY (cogbox __authproxy) instead of addon injection.
+/// It is a CROSS-REPO CONTRACT string doing DOUBLE DUTY by design:
+///   1. the VERSION GATE -- an old binary's validKind refuses it with exit 65,
+///      so on a pre-authproxy image no credential can exist at all (the control
+///      plane's bind fails by the old binary's own hand, no CP bookkeeping);
+///   2. the INJECT SUPPRESSOR -- seedGitInjectSpecs (rules/reload.zig) keys on
+///      gitlab_oauth_kind, so a secret bound under THIS kind is never seeded
+///      into an inject spec: no spec, no whole-host terminate-allow union, and
+///      the mitm addon can never double-stamp a host the auth proxy already
+///      authenticates. renderAuthProxyConf is this kind's only render consumer.
+pub const gitlab_authproxy_kind = "gitlab-authproxy";
+
 /// The reserved secret NAME cogworx binds the per-user Claude setup-token into
 /// kind=anthropic-oauth, audience=api.anthropic.com. // gitleaks:allow
 /// The container enforcer seeds an inject spec referencing THIS name so a bound
@@ -92,11 +105,14 @@ pub fn stubCredentialJson(allocator: std.mem.Allocator) ![]u8 {
 /// The injection styles a `cogbox secret add --kind` may carry. `bearer`,
 /// `cookie` and `basic` are the operator/plugin credential primitives; the
 /// per-user Claude bind adds `anthropic-oauth` (a long-lived setup-token the
-/// enforcer stamps as a Bearer, gated by the redacted in-guest stub). Pure, so
-/// the allowlist is unit-testable without IO.
+/// enforcer stamps as a Bearer, gated by the redacted in-guest stub), and the
+/// auth-proxy git bind adds `gitlab-authproxy` (whose acceptance here IS the
+/// rollout's version gate -- see gitlab_authproxy_kind). Pure, so the allowlist
+/// is unit-testable without IO.
 pub fn validKind(kind: []const u8) bool {
 	return eql(kind, "bearer") or eql(kind, "cookie") or eql(kind, "basic") or
-		eql(kind, anthropic_oauth_kind) or eql(kind, gitlab_oauth_kind);
+		eql(kind, anthropic_oauth_kind) or eql(kind, gitlab_oauth_kind) or
+		eql(kind, gitlab_authproxy_kind);
 }
 
 pub fn dispatch(
@@ -148,7 +164,7 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 		return die(allocator, io, "invalid secret name '{s}' (use [A-Za-z0-9_-], max 64)", .{nm}, 65);
 	}
 	if (!validKind(kind)) {
-		return die(allocator, io, "invalid --kind '{s}' (expected bearer|cookie|basic|anthropic-oauth|gitlab-oauth)", .{kind}, 65);
+		return die(allocator, io, "invalid --kind '{s}' (expected bearer|cookie|basic|anthropic-oauth|gitlab-oauth|gitlab-authproxy)", .{kind}, 65);
 	}
 	if (from_file != null and from_stdin) {
 		return die(allocator, io, "--from-file and --from-stdin are mutually exclusive", .{}, 64);

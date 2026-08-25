@@ -41,6 +41,11 @@ test "validKind allowlist accepts the injection styles incl. anthropic-oauth" {
 	try t.expect(main.validKind("gitlab-oauth"));
 	try t.expectEqualStrings("gitlab-oauth", main.gitlab_oauth_kind);
 	try t.expectEqualStrings("oauth2", main.default_git_user);
+	// The auth-proxy git bind. Acceptance here IS the rollout's version gate:
+	// an OLD binary (whose allowlist lacks this arm) refuses it with exit 65,
+	// so no credential can exist on a pre-authproxy image.
+	try t.expect(main.validKind("gitlab-authproxy"));
+	try t.expectEqualStrings("gitlab-authproxy", main.gitlab_authproxy_kind);
 	// unknown styles are still rejected (fail closed)
 	try t.expect(!main.validKind("oauth"));
 	try t.expect(!main.validKind("anthropic"));

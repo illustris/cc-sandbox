@@ -1248,6 +1248,10 @@ HTTP_PORT=$(jq -r '.httpPort // 8080' "$ACTIVE_CONFIG")
 # reaches the mitmproxy terminate backend on base+2; mirrors filter.l7PortsForBase.
 L7_BASE=$(jq -r '.l7PortBase // 18443' "$ACTIVE_CONFIG")
 L7_MITM_PORT=$(( L7_BASE + 2 ))
+# The per-sandbox auth proxy listens DOWNWARD from the base (mirrors
+# filter.l7AuthPortForBase: auth = base - 400). Topology, never policy: it lives
+# only in env (COGBOX_L7_AUTH_PORT), never in config.json or a wire file.
+L7_AUTH_PORT=$(( L7_BASE - 400 ))
 OVERLAY_SIZE=$(jq -r '.overlaySize // "128M"' "$ACTIVE_CONFIG")
 # Empty, not "16G": the size file this writes is what resize-store-overlay.service
 # remounts /nix/.rw-store to, and 16G exceeds the guest's whole RAM, so the old
@@ -1479,9 +1483,12 @@ next_free_port() {
 }
 next_free_l7_base() {
 	# First base >= $1 (stepping by 3 so triples stay disjoint, mirroring
-	# next_available_ports) whose whole loopback triple base/+1/+2 is free.
+	# next_available_ports) whose whole loopback triple base/+1/+2 AND the auth
+	# proxy's downward port (base-400) are all free. The auth port shares the
+	# loopback with the triple, so a base is only usable when its auth slot is
+	# free too -- otherwise the retarget would collide with a foreign listener.
 	local b=$1
-	while [ "$b" -le 65000 ] && { port_taken 127.0.0.1 "$b" || port_taken 127.0.0.1 $((b + 1)) || port_taken 127.0.0.1 $((b + 2)); }; do
+	while [ "$b" -le 65000 ] && { port_taken 127.0.0.1 "$b" || port_taken 127.0.0.1 $((b + 1)) || port_taken 127.0.0.1 $((b + 2)) || port_taken 127.0.0.1 $((b - 400)); }; do
 		b=$((b + 3))
 	done
 	echo "$b"
@@ -1501,7 +1508,7 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	_new=$(next_free_l7_base "$L7_BASE")
 	if [ "$_new" != "$L7_BASE" ]; then
 		echo "cogbox-launch: L7 port base $L7_BASE in use; using $_new instead." >&2
-		L7_BASE=$_new; L7_MITM_PORT=$((L7_BASE + 2)); PORTS_CHANGED=1
+		L7_BASE=$_new; L7_MITM_PORT=$((L7_BASE + 2)); L7_AUTH_PORT=$((L7_BASE - 400)); PORTS_CHANGED=1
 	fi
 fi
 if [ "$PORTS_CHANGED" -eq 1 ]; then
@@ -1526,6 +1533,7 @@ echo "$SSH_PORT $BIND_ADDR" > "$RUNTIME/ssh-endpoint"
 PASST_PID=""
 L7PROXY_PID=""
 L7MITM_PID=""
+L7AUTH_PID=""
 QEMU_PID=""
 CLEANED=0
 # The VM is always a background daemon now, so this script's only job after
@@ -1553,6 +1561,9 @@ cogbox_cleanup() {
 	[ -n "$PASST_PID" ] && kill "$PASST_PID" 2>/dev/null
 	[ -n "$L7PROXY_PID" ] && kill "$L7PROXY_PID" 2>/dev/null
 	[ -n "$L7MITM_PID" ] && kill "$L7MITM_PID" 2>/dev/null
+	# A leaked auth proxy holds its per-instance loopback port and perturbs the
+	# next start's probe, so tear it down with the other children.
+	[ -n "$L7AUTH_PID" ] && kill "$L7AUTH_PID" 2>/dev/null
 	# Dynamic 9p sources and their manifest may contain caller path bytes. QEMU
 	# is dead before these are removed; retained failed-launch runtimes keep only
 	# diagnostics, never stale grants for a later launch.
@@ -1910,8 +1921,18 @@ start_l7mitm() {
 	# the var so the addon falls back to legacy "guest carries its own token".
 	local inject_conf="${COGBOX_L7_INJECT_CONF:-$RUNTIME/l7-inject-conf.json}"
 	[ -f "$inject_conf" ] || inject_conf=""
+	# The auth-proxy retarget vars are passed UNCONDITIONALLY -- deliberately NOT
+	# blanked the way inject_conf is above. The addon's AuthHosts reader tolerates
+	# a missing l7-auth-hosts (os.stat -> empty set, keeps the path) and mtime-
+	# reloads once a render creates it; blanking the path would wedge it never
+	# reading the file, so a host migrated to the auth proxy after boot would
+	# never be retargeted (the bug cogbox-enforce.sh:93-102 records for the inject
+	# conf). COGBOX_L7_AUTH_PORT is the loopback the addon retargets those hosts
+	# to; the auth proxy listens there (start_l7auth below).
 	COGBOX_L7_RULES="$RUNTIME/l7-rules" \
 	COGBOX_L7_INJECT_CONF="$inject_conf" \
+	COGBOX_L7_AUTH_PORT="$L7_AUTH_PORT" \
+	COGBOX_L7_AUTH_HOSTS="$RUNTIME/l7-auth-hosts" \
 	"${PROXY_RUNAS_ARGS[@]}" \
 	@mitmdump@ --mode "socks5@${L7_MITM_PORT}" --listen-host 127.0.0.1 \
 		--set confdir="$ca_dir" --set http2=false --set connection_strategy=lazy \
@@ -1935,6 +1956,60 @@ start_l7mitm() {
 		die "refusing to stage L7 CA: mitmproxy-ca-cert.pem contains a private key" 70
 	fi
 	cp "$ca_dir/mitmproxy-ca-cert.pem" "$RUNTIME/system-l7ca"
+}
+
+# -- Helper: start the per-sandbox auth proxy ----------------------
+# The fourth trusted-half process (cogbox __authproxy). The mitmproxy addon
+# retargets a host in l7-auth-hosts to 127.0.0.1:$L7_AUTH_PORT, where this
+# proxy classifies/authorizes the request against the rendered l7-auth-conf.json
+# and stamps the owner's credential itself -- so a migrated git provider needs
+# no in-guest token and no addon-side injection. Runs under the SAME
+# COGBOX_PROXY_RUNAS uid:gid as mitmproxy and l7proxy (credgrant grants the cred
+# files to that gid, the GCE l7-ca is chowned to it, and gce/floor.nix classes
+# that uid as trusted-half on loopback), started BETWEEN start_l7mitm and
+# start_l7proxy. Unlike start_l7proxy, a bind failure here is WARN-not-die (it
+# copies start_l7mitm's semantics, not start_l7proxy's): l7proxy's absence breaks
+# ALL :80/:443 egress, but the auth proxy's absence breaks only migrated hosts,
+# and fail-closed -- mitmproxy's retarget to a dead port yields an error to the
+# guest with no credential, never an open path. Escalating that to a fatal die
+# would turn "git access to one provider is down" into "the sandbox won't boot".
+#
+# The pid file ($RUNTIME/authproxy.pid, the v1 health signal) is never given a
+# pid by this script: the Zig side writes its CONTENTS itself, only after its
+# listener bound AND its first conf parse succeeded, so it can never name a
+# process that died on a bind failure. Health is therefore "exists AND is
+# non-empty" (`test -s`), never mere existence -- because this script does
+# PRE-CREATE the file, empty, owned by the proxy uid (precreate_authproxy_pidfile
+# below): under COGBOX_PROXY_RUNAS the auth proxy cannot create anything in
+# $RUNTIME (on GCE that is a root-owned 0755 dir under RuntimeDirectory=cogbox,
+# and nothing chowns it -- only l7-ca is handed over), whereas truncate-writing
+# into an existing file it owns needs no directory permission. The warn branch
+# removes the file again, for the same reason as above.
+#
+# Kept as its own function with no free variables beyond $RUNTIME and
+# $COGBOX_PROXY_RUNAS so tests/test_launch_flags.sh can extract and exercise
+# it without a VM.
+precreate_authproxy_pidfile() {
+	: > "$RUNTIME/authproxy.pid" && chmod 0644 "$RUNTIME/authproxy.pid" || {
+		echo "cogbox-launch: warning: cannot pre-create $RUNTIME/authproxy.pid; the auth proxy's health signal will be unavailable." >&2
+		return 0
+	}
+	if [ -n "${COGBOX_PROXY_RUNAS:-}" ]; then
+		chown "$COGBOX_PROXY_RUNAS" "$RUNTIME/authproxy.pid" 2>/dev/null \
+			|| echo "cogbox-launch: warning: could not chown $RUNTIME/authproxy.pid to $COGBOX_PROXY_RUNAS; the auth proxy's health signal will be unavailable." >&2
+	fi
+	return 0
+}
+start_l7auth() {
+	precreate_authproxy_pidfile
+	"${PROXY_RUNAS_ARGS[@]}" @cogbox@ __authproxy "$RUNTIME" "$L7_BASE" &
+	L7AUTH_PID=$!
+	sleep 0.2
+	if ! kill -0 "$L7AUTH_PID" 2>/dev/null; then
+		echo "cogbox-launch: warning: auth proxy failed to bind 127.0.0.1:${L7_AUTH_PORT}; migrated git providers will be blocked (fail-closed)." >&2
+		L7AUTH_PID=""
+		rm -f "$RUNTIME/authproxy.pid"
+	fi
 }
 
 # Launch QEMU as a background child and wait for it. Backgrounding (rather
@@ -1975,6 +2050,11 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	# proxy handed TLS to a backend that was never started and failed
 	# closed). An idle backend on L4-only instances is the accepted cost.
 	start_l7mitm
+	# The auth proxy sits BETWEEN mitm and l7proxy: mitm must be up so its
+	# retarget target exists, and it is started before l7proxy so the retarget
+	# port is already listening the first time the funnel diverts a migrated
+	# host. Warn-not-die, so its absence never blocks the boot.
+	start_l7auth
 	# Always run the L7 proxy in rules mode so L7 can be enabled on a live
 	# instance without a restart (the funnel only diverts to it once a rule
 	# exists; until then it idles).

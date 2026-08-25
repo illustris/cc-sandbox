@@ -5399,6 +5399,23 @@
 				touch $out
 			'';
 
+			# cogbox-enforce.sh's FIRST-EVER test. Everything in that supervisor
+			# is an ordering or a refusal invisible in the unit file or the pod
+			# spec, so a flake check over the manifest cannot reach any of it. By
+			# RUNNING the script against stub children it asserts: all three
+			# children start in order (mitm -> publish_ca -> auth -> l7proxy),
+			# each is restarted INDEPENDENTLY by the wait -n loop -- the auth-proxy
+			# arm is the correctness obligation of the whole auth-proxy change --
+			# terminate() kills all three, and the two COGBOX_L7_AUTH_* vars reach
+			# mitmdump even when l7-auth-hosts does not exist.
+			enforce-tests = pkgs.runCommand "cogbox-enforce-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gawk gnugrep ];
+			} ''
+				export HOME=$TMPDIR
+				bash ${./tests/test_enforce.sh} ${./cogbox-enforce.sh}
+				touch $out
+			'';
+
 			zig-tests = pkgs.stdenv.mkDerivation {
 				pname = "cogbox-zig-tests";
 				version = "0.1.0";

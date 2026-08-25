@@ -51,6 +51,15 @@ RULES_PATH = os.environ.get("COGBOX_L7_RULES", "")
 # JSON inject-conf written by cogbox-launch.sh; absent/empty => injection off,
 # preserving the legacy "guest carries its own token end-to-end" behavior.
 INJECT_CONF_PATH = os.environ.get("COGBOX_L7_INJECT_CONF", "")
+# Per-sandbox auth proxy retargeting. A host listed one-per-line in
+# COGBOX_L7_AUTH_HOSTS (the render's l7-auth-hosts) is RETARGETED on the loopback
+# hop to 127.0.0.1:COGBOX_L7_AUTH_PORT, where the auth proxy (cogbox __authproxy)
+# classifies/authorizes the request and stamps the owner's credential itself.
+# Both are passed UNCONDITIONALLY by the launcher/enforcer even when the hosts
+# file does not exist yet; AuthHosts tolerates that (empty set) and mtime-reloads
+# once a render creates it. Absent/empty => no retargeting, the legacy path runs.
+AUTH_HOSTS_PATH = os.environ.get("COGBOX_L7_AUTH_HOSTS", "")
+AUTH_PORT = os.environ.get("COGBOX_L7_AUTH_PORT", "")
 
 
 def _is_methods_token(tk):
@@ -321,6 +330,102 @@ def host_insecure(rules, host):
 
 
 RULES = Rules()
+
+
+class AuthHosts:
+    """The set of hosts the per-sandbox auth proxy owns, read one-per-line from
+    COGBOX_L7_AUTH_HOSTS and hot-reloaded on change -- mirroring Rules.maybe_reload
+    with the render's two mandatory hardenings, because writeRuntimeFile
+    truncates-then-rewrites in place (NOT atomic):
+
+      1. key the cache on (mtime, SIZE), not mtime alone -- a truncate-then-
+         rewrite of the same length within one timestamp tick moves neither
+         mtime nor ctime, but it moves size for any real content change;
+      2. NEVER cache a failed read -- leave the previous mtime so the next poll
+         retries, and fall to the EMPTY set (never a partial one), so a torn
+         render can only ever un-retarget a host (fail closed to the legacy
+         path -> the provider 401s), never retarget against half a file.
+
+    An absent/empty path or a missing file yields the empty set: no host is
+    retargeted, and every flow takes the unchanged legacy path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.stat = None  # (mtime, size)
+        self.hosts = frozenset()
+
+    def maybe_reload(self):
+        if not self.path:
+            self.hosts, self.stat = frozenset(), None
+            return
+        try:
+            st = os.stat(self.path)
+            key = (st.st_mtime, st.st_size)
+        except OSError:
+            # Missing/unreadable: empty set, and DROP the cache so the next poll
+            # re-stats once the render creates the file (fail closed meanwhile).
+            self.hosts, self.stat = frozenset(), None
+            return
+        if key == self.stat:
+            return
+        try:
+            with open(self.path) as f:
+                hosts = frozenset(
+                    line for line in (ln.strip().rstrip(".").lower() for ln in f)
+                    if line and not line.startswith("#")
+                )
+            # RE-STAT AFTER THE READ (the spec's mandatory hardening, mirrored
+            # by the Zig conf reader): writeRuntimeFile truncates then
+            # rewrites in place, so a read landing inside that window sees an
+            # empty or partial file. If (mtime, size) moved while we read, the
+            # bytes are torn -- keep the PREVIOUS set and the previous key
+            # (never a partial set, never a cache advance), and let the next
+            # poll retry on settled bytes.
+            st2 = os.stat(self.path)
+            key2 = (st2.st_mtime, st2.st_size)
+        except OSError:
+            # Do NOT advance the cache on a failed read: retry next poll, empty
+            # set for now (never a partial one).
+            self.hosts = frozenset()
+            return
+        if key2 != key:
+            return
+        self.hosts, self.stat = hosts, key
+
+    def contains(self, host):
+        self.maybe_reload()
+        return host.rstrip(".").lower() in self.hosts
+
+
+AUTH_HOSTS = AuthHosts(AUTH_HOSTS_PATH)
+
+
+# Reserved request headers the auth proxy consumes -- ALL of them are stripped
+# unconditionally on every flow before any is set (the namespace is proxy-owned;
+# a guest must never be able to forge one). X-Cogbox-Host is the auth proxy's
+# route key, X-Cogbox-Vetted its upstream socket target (l7proxy's pinned IP,
+# captured BEFORE the retarget), X-Cogbox-Proto the guest's original scheme
+# (audit only).
+COGBOX_RESERVED_PREFIX = "x-cogbox-"
+
+
+def strip_cogbox_headers(headers):
+    """Remove every X-Cogbox-* request header, in place. Runs unconditionally on
+    EVERY flow -- allowed or denied, migrated or not -- for the same reason
+    strip_method_override does: only the addon may author these, so a guest-set
+    one has to be gone before the proxy ever authors its own. Returns the names
+    removed (for the debug log)."""
+    removed = [h for h in list(headers) if h.lower().startswith(COGBOX_RESERVED_PREFIX)]
+    for h in removed:
+        del headers[h]
+    return removed
+
+
+# The one-shot conflict log: a host that has BOTH an inject spec and an auth
+# entry is a control-plane bug (the version gate should make them mutually
+# exclusive). Log it once per host per conf generation, keyed on the CredStore
+# conf mtime so a re-render re-arms it.
+_auth_conflict_logged = {}  # host -> conf generation (CredStore.conf_mtime)
 
 
 # --- Host-side credential injection ---------------------------------------
@@ -1002,6 +1107,55 @@ def resolve_gitlab_style(spec, path):
     return "bearer", ""
 
 
+def retarget_to_authproxy(flow, host, sni):
+    """Retarget an allowed flow whose host the auth proxy owns to the loopback
+    hop 127.0.0.1:AUTH_PORT, carrying l7proxy's vetted address in a reserved
+    header. Returns True on retarget, False when it could not (AUTH_PORT unusable
+    or the flow carries no vetted upstream) -- in which case the caller must fail
+    closed rather than forward.
+
+    The three traps, all load-bearing:
+      * capture pretty_host and the vetted `.data.host/.data.port` BEFORE
+        overwriting them -- the vetted host/port IS the SOCKS5 CONNECT address
+        l7proxy already SSRF-vetted and pinned, the auth proxy's ONLY upstream
+        target (it never re-resolves);
+      * write `.data.host` / `.data.port` DIRECTLY, never the `.host`/`.port`
+        properties -- those setters call _update_host_and_authority() and would
+        rewrite the Host header, destroying the routing signal and the Host==SNI
+        story;
+      * force `flow.request.scheme = "http"` -- left https, mitmproxy would take
+        the retarget as a new upstream, set the loopback IP as SNI and fail
+        verification; the scheme setter has no side effects. The loopback hop is
+        plaintext, the same trust level as the existing l7proxy->mitm SOCKS5 hop.
+    """
+    try:
+        port = int(AUTH_PORT)
+    except (TypeError, ValueError):
+        return False
+    if port <= 0:
+        return False
+    data = getattr(flow.request, "data", None)
+    if data is None:
+        return False
+    vetted_host = getattr(data, "host", None)
+    vetted_port = getattr(data, "port", None)
+    if not vetted_host or not vetted_port:
+        return False
+    # X-Cogbox-* were stripped unconditionally at the top of _enforce_and_inject,
+    # so setting them here cannot append to a guest-forged value.
+    flow.request.headers["X-Cogbox-Host"] = host  # the auth proxy's route key
+    flow.request.headers["X-Cogbox-Vetted"] = "%s:%s" % (vetted_host, vetted_port)
+    # The guest's ORIGINAL scheme, audit only -- the auth proxy's upstream scheme
+    # comes from its conf, never this header. A terminated flow has an SNI (TLS);
+    # a plain-HTTP inject-routed flow does not.
+    flow.request.headers["X-Cogbox-Proto"] = "https" if sni else "http"
+    # DIRECT .data assignment (never the properties); scheme forced to http.
+    flow.request.data.host = "127.0.0.1"
+    flow.request.data.port = port
+    flow.request.scheme = "http"
+    return True
+
+
 def _enforce_and_inject(flow, path, query_service=None):
     """Shared enforcement + injection for a decrypted (or plain-HTTP) request:
     force the upstream SNI, enforce Host==SNI + allow/deny, then inject the
@@ -1017,6 +1171,15 @@ def _enforce_and_inject(flow, path, query_service=None):
         _cred_log("method-override stripped host=%s headers=%s"
                   % (flow.request.pretty_host, ",".join(overrides)))
 
+    # Strip every X-Cogbox-* request header UNCONDITIONALLY, on every flow,
+    # allowed or denied, migrated or not -- the same reason strip_method_override
+    # runs unconditionally: only the addon may author these, so a guest-forged
+    # one must be gone before the retarget block below can set its own.
+    cogbox_stripped = strip_cogbox_headers(flow.request.headers)
+    if cogbox_stripped and os.environ.get("COGBOX_L7_DEBUG_INJECT"):
+        _cred_log("x-cogbox-* stripped host=%s headers=%s"
+                  % (flow.request.pretty_host, ",".join(cogbox_stripped)))
+
     sni = flow.client_conn.sni
     # We connected to the upstream by vetted IP, so use the client's SNI for
     # the upstream TLS handshake + cert validation.
@@ -1031,6 +1194,31 @@ def _enforce_and_inject(flow, path, query_service=None):
     method = getattr(flow.request, "method", None)
     if evaluate(RULES, host, path, method, query_service) != "allow":
         _deny(flow, "denied")
+        return
+
+    # RETARGET: a host the auth proxy owns is steered to the loopback hop AFTER
+    # the allow decision (the addon's rule set stays the outer gate -- an
+    # operator deny still denies before any retarget) and BEFORE the injection
+    # block, which it then bypasses entirely. This is the unconditional injection
+    # skip: the auth proxy stamps the credential itself, so a stale gitlab-oauth
+    # bind lingering through a mode flip must never let the addon double-stamp.
+    if AUTH_HOSTS.contains(host):
+        # One-shot per-host-per-conf-generation warning when a host has BOTH an
+        # inject spec and an auth entry -- a control-plane bug the version gate
+        # is supposed to make impossible (the new kind is never seeded as a
+        # spec). We retarget regardless: the auth entry wins, the spec is
+        # ignored, no token is stamped here.
+        if CREDS.spec_for(host) is not None:
+            gen = CREDS.conf_mtime
+            if _auth_conflict_logged.get(host) != gen:
+                _auth_conflict_logged[host] = gen
+                _cred_log("CONFLICT host=%s has both an inject spec and an auth "
+                          "entry; retargeting to the auth proxy and ignoring the "
+                          "spec (control-plane bug)" % host)
+        if not retarget_to_authproxy(flow, host, sni):
+            # Could not retarget (auth port unusable / no vetted upstream): fail
+            # closed rather than forward the request unauthenticated.
+            _deny(flow, "auth proxy unavailable")
         return
 
     # Credential injection runs LAST, only on an allowed + host==SNI request,

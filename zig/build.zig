@@ -37,6 +37,16 @@ pub fn build(b: *std.Build) void {
 	});
 	l7proxy_mod.addImport("filter", filter_mod);
 
+	// Per-sandbox auth proxy (cogbox __authproxy). Reuses filter for the port
+	// band; links libc for the socket layer (same reason as l7proxy_mod).
+	const authproxy_mod = b.createModule(.{
+		.root_source_file = b.path("src/authproxy/main.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	authproxy_mod.addImport("filter", filter_mod);
+
 	// Divert shim (cogbox __divertshim). The separate-pod enforcer's in-pod
 	// REDIRECT shim: recovers SO_ORIGINAL_DST, then SOCKS5-CONNECTs the dst to the
 	// enforcer. Reuses the filter types + the socks5 client; links libc.
@@ -123,6 +133,7 @@ pub fn build(b: *std.Build) void {
 	cli_mod.addImport("plugin_module", plugin_mod);
 	cli_mod.addImport("secret_module", secret_mod);
 	cli_mod.addImport("l7proxy_module", l7proxy_mod);
+	cli_mod.addImport("authproxy_module", authproxy_mod);
 	cli_mod.addImport("divertshim_module", divertshim_mod);
 	cli_mod.addImport("filter", filter_mod);
 
@@ -166,6 +177,18 @@ pub fn build(b: *std.Build) void {
 		.root_module = divertshim_test_mod,
 	});
 	const run_divertshim_tests = b.addRunArtifact(divertshim_tests);
+
+	const authproxy_test_mod = b.createModule(.{
+		.root_source_file = b.path("src/authproxy/tests.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	authproxy_test_mod.addImport("filter", filter_mod);
+	const authproxy_tests = b.addTest(.{
+		.root_module = authproxy_test_mod,
+	});
+	const run_authproxy_tests = b.addRunArtifact(authproxy_tests);
 
 	const rules_test_mod = b.createModule(.{
 		.root_source_file = b.path("src/rules/tests.zig"),
@@ -264,6 +287,7 @@ pub fn build(b: *std.Build) void {
 	test_step.dependOn(&run_socks5_tests.step);
 	test_step.dependOn(&run_l7proxy_tests.step);
 	test_step.dependOn(&run_divertshim_tests.step);
+	test_step.dependOn(&run_authproxy_tests.step);
 	test_step.dependOn(&run_rules_tests.step);
 	test_step.dependOn(&run_remap_tests.step);
 	test_step.dependOn(&run_l7_tests.step);

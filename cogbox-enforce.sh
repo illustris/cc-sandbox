@@ -52,6 +52,10 @@ CA_CONF=/run/cogbox-ca-conf
 # hop sits at base+2 on loopback (mirrors the VM's L7_MITM_PORT).
 BASE="${COGBOX_DIVERT_PORT:-18443}"
 MITM_PORT=$(( BASE + 2 ))
+# The per-sandbox auth proxy listens DOWNWARD from the base (mirrors
+# filter.l7AuthPortForBase: auth = base - 400). The mitmproxy addon retargets a
+# migrated host to it; the auth proxy authenticates the request itself.
+AUTH_PORT=$(( BASE - 400 ))
 
 mkdir -p "$RUNTIME" "$CAPUB_DIR" "$CA_CONF"
 
@@ -84,6 +88,7 @@ fi
 # -- Child management ----------------------------------------------
 MITM_PID=""
 L7PROXY_PID=""
+AUTH_PID=""
 
 # mitmdump = the L7 terminate backend, SOCKS5 mode + our enforcement addon.
 # confdir is the enforcer-PRIVATE ca-conf volume: mitmproxy self-generates the
@@ -102,8 +107,17 @@ L7PROXY_PID=""
 # effect on a freshly-booted enforcer (the file is always created after launch).
 start_l7mitm() {
 	local inject_conf="${COGBOX_L7_INJECT_CONF:-$RUNTIME/l7-inject-conf.json}"
+	# COGBOX_L7_AUTH_PORT / COGBOX_L7_AUTH_HOSTS are passed UNCONDITIONALLY, even
+	# when l7-auth-hosts does not exist yet -- the same reasoning as inject_conf
+	# above (:93-102): the addon's AuthHosts reader tolerates a missing file
+	# (os.stat -> empty set, keeps the path) and mtime-reloads once the reconcile
+	# render creates it, so a host migrated to the auth proxy after boot is still
+	# retargeted with no restart. Blanking the path would wedge the reader never
+	# reading the file.
 	COGBOX_L7_RULES="$RUNTIME/l7-rules" \
 	COGBOX_L7_INJECT_CONF="$inject_conf" \
+	COGBOX_L7_AUTH_PORT="$AUTH_PORT" \
+	COGBOX_L7_AUTH_HOSTS="$RUNTIME/l7-auth-hosts" \
 	@mitmdump@ --mode "socks5@${MITM_PORT}" --listen-host 127.0.0.1 \
 		--set confdir="$CA_CONF" --set http2=false --set connection_strategy=lazy \
 		-s "@l7addon@" -q &
@@ -125,6 +139,32 @@ start_l7proxy() {
 	@cogbox@ __l7proxy "$RUNTIME" "$BASE" &
 	L7PROXY_PID=$!
 	echo "$L7PROXY_PID" > "$RUNTIME/l7proxy.pid"
+}
+
+# The per-sandbox auth proxy (cogbox __authproxy): the fourth trusted-half
+# process, listening on 127.0.0.1:$AUTH_PORT. The mitmproxy addon retargets a
+# host in l7-auth-hosts here; the auth proxy classifies/authorizes the request
+# against l7-auth-conf.json and stamps the owner's credential itself, so a
+# migrated git provider needs no in-guest token and no addon injection. No runas
+# on the enforcer path (this pod already runs as the enforcer uid). Its own
+# wait -n arm below restarts it after a crash, exactly like the other two.
+#
+# Unlike the other two children, this script never writes a PID into the pid
+# file: $RUNTIME/authproxy.pid is the auth proxy's v1 health signal and its
+# CONTENTS are written by the Zig side itself, only after its listener bound AND
+# its first conf parse succeeded. A pid written here from $! would name a process
+# that may already have died on a bind failure -- exactly what the file exists to
+# rule out. The file IS pre-created EMPTY, mirroring the VM launcher's
+# precreate_authproxy_pidfile: the enforcer uid owns $RUNTIME, so the Zig side
+# could create it itself, but one contract on both paths ("exists and empty" =
+# starting, non-empty = bound + parsed, `test -s` = healthy) means a supervised
+# restart truncates the dead child's stale pid away instead of leaving it to be
+# read as live. Warn-not-die, like everything else about this child.
+start_l7auth() {
+	: > "$RUNTIME/authproxy.pid" && chmod 0644 "$RUNTIME/authproxy.pid" \
+		|| log "warning: cannot pre-create $RUNTIME/authproxy.pid; the auth proxy's health signal will be unavailable"
+	@cogbox@ __authproxy "$RUNTIME" "$BASE" &
+	AUTH_PID=$!
 }
 
 # Publish the CA CERT ONLY (never the key) once mitmproxy mints it, so the
@@ -157,6 +197,7 @@ terminate() {
 	log "received termination signal; stopping children"
 	[ -n "$L7PROXY_PID" ] && kill "$L7PROXY_PID" 2>/dev/null
 	[ -n "$MITM_PID" ] && kill "$MITM_PID" 2>/dev/null
+	[ -n "$AUTH_PID" ] && kill "$AUTH_PID" 2>/dev/null
 	wait 2>/dev/null
 	exit 0
 }
@@ -165,6 +206,10 @@ trap terminate TERM INT
 # -- Bring-up + supervise ------------------------------------------
 start_l7mitm
 publish_ca
+# Between publish_ca and start_l7proxy: mitm must be up (its retarget target)
+# and the auth port must be listening before the funnel first diverts a migrated
+# host to it.
+start_l7auth
 start_l7proxy
 
 # Restart whichever child dies. Edits need no restart (the addon mtime-reloads;
@@ -182,6 +227,15 @@ while true; do
 	if [ -n "$L7PROXY_PID" ] && ! kill -0 "$L7PROXY_PID" 2>/dev/null; then
 		log "l7proxy (pid $L7PROXY_PID) exited; restarting"
 		start_l7proxy
+	fi
+	# The auth proxy gets its own restart arm -- the correctness obligation of
+	# this whole change. Omit it and the enforcer silently runs without the auth
+	# proxy after one crash: mitmproxy keeps retargeting migrated hosts to a dead
+	# port, so every migrated git provider fails closed with no self-heal until
+	# the pod restarts. It supervises exactly like the other two.
+	if [ -n "$AUTH_PID" ] && ! kill -0 "$AUTH_PID" 2>/dev/null; then
+		log "auth proxy (pid $AUTH_PID) exited; restarting"
+		start_l7auth
 	fi
 	sleep 0.2
 done

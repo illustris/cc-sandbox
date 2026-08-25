@@ -748,6 +748,199 @@ pub fn seedGitInjectSpecs(
 	};
 }
 
+/// The `providers[]` array of a VERSION-1 `.network.l7.authpolicy` document, or
+/// null when the section is absent / malformed / carries an unknown version.
+/// The version gate makes a document this binary is too new or too old to
+/// interpret DEAD TEXT rather than live policy (the delivery verb refuses an
+/// unknown version before writing, but a hand-edited or rolled-back config can
+/// still carry one -- fail closed here too). The literal 1 is the cross-repo
+/// schema version (l7/main.zig policy_doc_version; cogworx's renderer).
+fn authPolicyProviders(network: std.json.Value) ?std.json.Array {
+	if (network != .object) return null;
+	const l7 = network.object.getPtr("l7") orelse return null;
+	if (l7.* != .object) return null;
+	const ap = l7.object.getPtr("authpolicy") orelse return null;
+	if (ap.* != .object) return null;
+	const v = ap.object.get("version") orelse return null;
+	if (v != .integer or v.integer != 1) return null;
+	const p = ap.object.getPtr("providers") orelse return null;
+	if (p.* != .array) return null;
+	return p.array;
+}
+
+/// The policy-doc provider entry whose `hosts[]` names `host` (gate 2 of
+/// renderAuthProxyConf), or null. First match wins.
+fn authPolicyEntryForHost(network: std.json.Value, host: []const u8) ?std.json.ObjectMap {
+	const providers = authPolicyProviders(network) orelse return null;
+	for (providers.items) |p| {
+		if (p != .object) continue;
+		const hosts = p.object.get("hosts") orelse continue;
+		if (hosts != .array) continue;
+		for (hosts.array.items) |h| {
+			if (h != .string) continue;
+			if (std.mem.eql(u8, h.string, host)) return p.object;
+		}
+	}
+	return null;
+}
+
+/// Whether `host` is named by an allow rule flagged `insecure_upstream` in
+/// `.network.l7.rules[]` -- the enforcer-side mirror of the addon's
+/// host_insecure scan, single-sourced from the SAME rule set (finding N2):
+/// after a retarget the upstream TLS leg belongs to the auth proxy, which never
+/// sees mitmproxy's per-host verification toggle, so the flag must ride the
+/// conf or a rule marked insecure silently stops applying to a migrated host.
+/// Exact-host compare, like hostNamedInRules: the funnel rule a migrated host
+/// rides is exact by construction, and a WILDCARD insecure rule not propagating
+/// here fails CLOSED (verification stays on -> a named 502, never a silently
+/// unverified leg).
+fn hostInsecureInRules(rules: ?std.json.Array, host: []const u8) bool {
+	const r = rules orelse return false;
+	for (r.items) |item| {
+		if (item != .object) continue;
+		const h = strField(item.object, "allow") orelse continue;
+		if (!std.mem.eql(u8, h, host)) continue;
+		const iv = item.object.get("insecure_upstream") orelse continue;
+		if (iv == .bool and iv.bool) return true;
+	}
+	return false;
+}
+
+/// Whether `host` is already one of the newline-delimited lines in `lines`
+/// (the shape both l7-inject-hosts and l7-auth-hosts carry).
+fn hostInLines(lines: []const u8, host: []const u8) bool {
+	var it = std.mem.splitScalar(u8, lines, '\n');
+	while (it.next()) |l| {
+		if (std.mem.eql(u8, l, host)) return true;
+	}
+	return false;
+}
+
+/// Render the per-sandbox auth proxy's conf (`l7-auth-conf.json`) and its
+/// retarget-host list (`l7-auth-hosts`). Walks the BOUND secrets exactly as
+/// seedGitInjectSpecs does and emits a conf element ONLY when all three gates
+/// hold:
+///
+///   1. the resolved secret is bound, its kind == gitlab_authproxy_kind, and
+///      its audience is set;
+///   2. `.network.l7.authpolicy` (version 1) carries a provider entry whose
+///      `hosts[]` include that audience;
+///   3. an L7 rule NAMES the audience (hostNamedInRules) -- the mirror of
+///      seedGitInjectSpecs' fail-closed gate: it covers the window before the
+///      funnel lands and a control plane that withdrew the rules but left the
+///      bind (no rule, no conf element, 403s -- never owner-token-on-every-
+///      path). NOTE: a stale document after a mode FLIP-BACK is neutralised
+///      by gate 1, not this one -- the flip-back re-applies the legacy rules
+///      (which DO name the host) and re-binds under the legacy kind, so the
+///      kind check is what makes the document dead text there.
+///
+/// `grants`, when non-null, collects the cred file of every EMITTED element --
+/// noted at the exact statement that writes `cred_file`, exactly as
+/// renderL7Inject does, so what the auth proxy may read and what the conf names
+/// it can never diverge. MUST run inside the same credgrant.Grants transaction
+/// as renderL7Inject (see writeL7Inject): Grants.apply revokes group-read on
+/// every bound value file and re-grants only the noted ones, so a render pass
+/// that noted only the inject conf's files would silently revoke the auth
+/// proxy's read access on the next `secret reload`. NOT pure -- reads the store.
+///
+/// Finding N1: every emitted host is ALSO appended to `inject_hosts_out` (the
+/// l7-inject-hosts buffer), deduped against the inject-spec hosts already
+/// there. That file is what routes a host's PLAIN-HTTP egress through the
+/// terminate backend; under the authproxy kind no inject spec exists, so
+/// without this append an `http://` request to a migrated host takes the
+/// raw-L4 splice governed only by the whole-host funnel rule -- anonymous
+/// whole-host reach with no path enforcement. The cleartext-exfil argument
+/// that deliberately keeps HARNESS hosts out of that file (a guest forcing a
+/// cleartext send of the real OAuth token, cogbox-launch.sh) does not apply
+/// here: the guest holds no token at all, and the upstream scheme is
+/// config-derived, never request-derived.
+pub fn renderAuthProxyConf(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	network: std.json.Value,
+	global_secrets_dir: []const u8,
+	instance_secrets_dir: []const u8,
+	out: *std.ArrayList(u8),
+	auth_hosts_out: *std.ArrayList(u8),
+	inject_hosts_out: *std.ArrayList(u8),
+	grants: ?*credgrant.Grants,
+) !void {
+	var arena_inst = std.heap.ArenaAllocator.init(allocator);
+	defer arena_inst.deinit();
+	const arena = arena_inst.allocator();
+
+	var providers_arr = std.json.Array.init(arena);
+
+	// Union of both stores' bound names, instance shadowing global -- the same
+	// walk (and the same shadow semantics) as seedGitInjectSpecs.
+	const instance_names = try secret_store.listBound(arena, io, instance_secrets_dir);
+	const global_names = try secret_store.listBound(arena, io, global_secrets_dir);
+	for ([_][]const []const u8{ instance_names, global_names }) |names| for (names) |name| {
+		const resolved = (try resolveSecret(arena, io, instance_secrets_dir, global_secrets_dir, name)) orelse continue;
+		// GATE 1: bound, the authproxy kind, audience set.
+		if (!resolved.bound) continue;
+		if (!std.mem.eql(u8, resolved.meta.kind, secret_mod.gitlab_authproxy_kind)) continue;
+		const audience = resolved.meta.audience orelse continue; // unset -> not routable
+		// One element per host: a name bound in both stores resolves to the
+		// same instance value twice, and two binds sharing one audience would
+		// hand the conf two ambiguous entries -- first (instance-shadowed) wins.
+		if (hostInLines(auth_hosts_out.items, audience)) continue;
+		// GATE 2: a policy-doc provider entry claims this host. The element's
+		// plugin/scheme/git_user/grants all come from the DOC (the compiled,
+		// decided policy), never from the secret or a request.
+		const entry = authPolicyEntryForHost(network, audience) orelse continue;
+		const plugin = strField(entry, "plugin") orelse continue;
+		const scheme = strField(entry, "scheme") orelse continue;
+		// GATE 3: an L7 rule names the host (the funnel). A doc without ANY
+		// rule naming its host -- the window before the funnel lands, a
+		// partial transaction, a control plane that withdrew the rules --
+		// emits nothing: the request never reaches the addon's retarget
+		// anyway, and a conf element for it would be policy with no delivery
+		// path. (A mode flip-back is gate 1's case, not this one: the legacy
+		// rules it re-applies name the host, and the legacy-kind re-bind is
+		// what fails.)
+		if (!hostNamedInRules(l7Rules(network), audience)) continue;
+
+		var el: std.json.ObjectMap = .empty;
+		try el.put(arena, "host", .{ .string = audience });
+		try el.put(arena, "plugin", .{ .string = plugin });
+		try el.put(arena, "scheme", .{ .string = scheme });
+		try el.put(arena, "insecure", .{ .bool = hostInsecureInRules(l7Rules(network), audience) });
+		try el.put(arena, "cred_file", .{ .string = resolved.value_path });
+		// Note the cred file HERE, at the statement that writes it into the
+		// conf, for the same reason renderL7Inject does: the only paths the
+		// Grants pass can ever make proxy-readable are then the store paths
+		// this resolver produced, never a cred_file a config or operator
+		// override supplied.
+		if (grants) |g| try g.note(resolved.value_path);
+		try el.put(arena, "cred_format", .{ .string = "raw" });
+		try el.put(arena, "git_user", .{ .string = strField(entry, "git_user") orelse secret_mod.default_git_user });
+		// The provider entry's grants[] VERBATIM from the doc -- semantic
+		// tuples the plugin evaluates; never route-shaped, never re-derived.
+		// An entry without them gets an empty array: the plugin then compiles
+		// zero grants and denies everything (fail closed), rather than the
+		// whole conf being refused for every host.
+		try el.put(arena, "grants", entry.get("grants") orelse .{ .array = std.json.Array.init(arena) });
+		try providers_arr.append(.{ .object = el });
+
+		// The addon's retarget set: one EMITTED host per line, nothing else.
+		try auth_hosts_out.appendSlice(allocator, audience);
+		try auth_hosts_out.append(allocator, '\n');
+		// Finding N1 (see the doc comment): route this host's plain-HTTP
+		// egress through the terminate backend too, deduped against the
+		// inject-spec hosts renderL7Inject already emitted.
+		if (!hostInLines(inject_hosts_out.items, audience)) {
+			try inject_hosts_out.appendSlice(allocator, audience);
+			try inject_hosts_out.append(allocator, '\n');
+		}
+	};
+
+	var root: std.json.ObjectMap = .empty;
+	try root.put(arena, "version", .{ .integer = 1 });
+	try root.put(arena, "providers", .{ .array = providers_arr });
+	try config.writeJqTab(allocator, out, .{ .object = root });
+}
+
 /// Resolve a named secret: an instance-produced secret (e.g. a sidecar-minted
 /// session) shadows a global operator-bound one of the same name.
 fn resolveSecret(
@@ -779,16 +972,20 @@ pub fn writeL7Rules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []con
 }
 
 /// Write `<runtime>/l7-inject-conf.json` (the mitmproxy addon's
-/// COGBOX_L7_INJECT_CONF) AND `<runtime>/l7-inject-hosts` (the L7 proxy's
-/// plain-HTTP inject-routing list). Resolves each spec's named secret against
-/// the per-instance then global store. Both files are written from the same
-/// pass so the proxy's HTTP routing can never drift from what the addon injects.
+/// COGBOX_L7_INJECT_CONF), `<runtime>/l7-auth-conf.json` (the auth proxy's
+/// conf), `<runtime>/l7-inject-hosts` (the L7 proxy's plain-HTTP
+/// inject-routing list) AND `<runtime>/l7-auth-hosts` (the addon's retarget
+/// set). Resolves each spec's named secret against the per-instance then
+/// global store. All four are written from ONE pass, under ONE
+/// credgrant.Grants transaction, so the proxy's HTTP routing, the addon's
+/// injection, the auth proxy's policy and the store's read grants can never
+/// drift from each other.
 ///
 /// `proxy_gid` is the gid the L7 proxy was dropped to (COGBOX_PROXY_RUNAS,
 /// resolved by credgrant.proxyGidFromEnv), or null where reader and store owner
 /// are the same uid (container, k8s, local -- an exact no-op there). When set,
 /// this reconciles the store's permissions so that gid can read EXACTLY the cred
-/// files the conf being written names, and nothing else in the store.
+/// files the confs being written name, and nothing else in the store.
 pub fn writeL7Inject(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -802,19 +999,49 @@ pub fn writeL7Inject(
 	defer out.deinit(allocator);
 	var hosts: std.ArrayList(u8) = .empty;
 	defer hosts.deinit(allocator);
+	var auth_out: std.ArrayList(u8) = .empty;
+	defer auth_out.deinit(allocator);
+	var auth_hosts: std.ArrayList(u8) = .empty;
+	defer auth_hosts.deinit(allocator);
 	var grants = credgrant.Grants.init(allocator, proxy_gid);
 	defer grants.deinit();
 	try renderL7Inject(allocator, io, network, global_secrets_dir, instance_secrets_dir, &out, &hosts, &grants);
-	// BEFORE the conf is written, deliberately: the addon re-reads the conf when
-	// its mtime changes, so a cred file it is about to be told about has to be
-	// readable already or the first requests after a live bind fail closed on a
-	// file that is one syscall away from being readable. The revoke direction is
-	// safe in this order too -- the addon can only end up denying, never stamping
-	// a credential this render just took away.
+	// The auth-proxy conf renders inside the SAME Grants transaction, and it
+	// must: grants.apply below revokes group-read on every bound value file
+	// and re-grants only the ones noted in THIS pass, so rendering the auth
+	// conf in a second pass would revoke the auth proxy's cred-file access on
+	// every `secret reload`. It also appends the auth hosts to `hosts` (the
+	// l7-inject-hosts buffer -- finding N1) before that file is written.
+	try renderAuthProxyConf(allocator, io, network, global_secrets_dir, instance_secrets_dir, &auth_out, &auth_hosts, &hosts, &grants);
+	// BEFORE the confs are written, deliberately: the addon and the auth proxy
+	// re-read their confs when the mtime changes, so a cred file they are
+	// about to be told about has to be readable already or the first requests
+	// after a live bind fail closed on a file that is one syscall away from
+	// being readable. The revoke direction is safe in this order too -- both
+	// readers can only end up denying, never stamping a credential this render
+	// just took away.
 	try grants.apply(io, &.{ instance_secrets_dir, global_secrets_dir });
-	try writeRuntimeFile(allocator, io, runtime_dir, "l7-inject-conf.json", out.items);
-	try writeRuntimeFile(allocator, io, runtime_dir, "l7-inject-hosts", hosts.items);
+	// The four wire files, written in l7_inject_write_order (see the constant
+	// for why the order is load-bearing and how a test pins it).
+	const files = [l7_inject_write_order.len][]const u8{ out.items, auth_out.items, hosts.items, auth_hosts.items };
+	for (l7_inject_write_order, files) |name, bytes| {
+		try writeRuntimeFile(allocator, io, runtime_dir, name, bytes);
+	}
 }
+
+/// The ORDER writeL7Inject writes its four wire files in -- a single pinned
+/// list (asserted by a test) rather than four calls whose sequence nothing
+/// checks. Renders are NOT atomic (writeRuntimeFile truncates in place), so
+/// each conf must land before the hosts file that routes traffic to its
+/// consumer, and l7-auth-hosts must land LAST: a torn state is then always
+/// the fail-closed one -- hosts ahead of conf can only 403 (the auth proxy
+/// has no entry yet), never retarget-and-stamp against a stale conf.
+pub const l7_inject_write_order = [_][]const u8{
+	"l7-inject-conf.json",
+	"l7-auth-conf.json",
+	"l7-inject-hosts",
+	"l7-auth-hosts",
+};
 
 fn writeRuntimeFile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, name: []const u8, bytes: []const u8) !void {
 	const path = try std.fs.path.join(allocator, &.{ runtime_dir, name });
@@ -1848,5 +2075,321 @@ test "seedGitInjectSpecs fails closed: GLOBAL-bound gitlab-oauth + NO rule namin
 		try std.testing.expect(std.mem.indexOf(u8, out.items, allow_line) != null);
 		// and still nothing for the git host
 		try std.testing.expect(std.mem.indexOf(u8, out.items, "git.example.internal") == null);
+	}
+}
+
+// --- renderAuthProxyConf (the per-sandbox auth proxy's policy render) --------
+
+// A rules-mode network fixture for the auth-proxy render: the funnel rule
+// (naming the host, optionally insecure) and a version-`ver` authpolicy doc
+// whose one provider entry claims `doc_host`. Caller deinits.
+fn authNetFixture(
+	gpa: std.mem.Allocator,
+	rule_host: []const u8,
+	insecure: bool,
+	ver: []const u8,
+	doc_host: []const u8,
+) !std.json.Parsed(std.json.Value) {
+	var src: std.ArrayList(u8) = .empty;
+	defer src.deinit(gpa);
+	try src.appendSlice(gpa, "{\"l7\":{\"mode\":\"terminate\",\"rules\":[{\"allow\":\"");
+	try src.appendSlice(gpa, rule_host);
+	try src.appendSlice(gpa, "\",\"path\":\"/\",\"plugin\":\"git-grants\"");
+	if (insecure) try src.appendSlice(gpa, ",\"insecure_upstream\":true");
+	try src.appendSlice(gpa, "}],\"authpolicy\":{\"version\":");
+	try src.appendSlice(gpa, ver);
+	try src.appendSlice(gpa, ",\"providers\":[{\"provider\":\"GitLab\",\"plugin\":\"gitlab\",\"hosts\":[\"");
+	try src.appendSlice(gpa, doc_host);
+	try src.appendSlice(gpa, "\"],\"secret\":\"git-gitlab\",\"git_user\":\"oauth2\",\"scheme\":\"https\"," ++
+		"\"grants\":[{\"id\":\"gg-1\",\"scope\":\"project\",\"repo\":\"grp/proj\"," ++
+		"\"project_id\":\"1234\",\"caps\":[\"git-read\",\"issues\"]}]}]}}}");
+	return std.json.parseFromSlice(std.json.Value, gpa, src.items, .{});
+}
+
+const AuthRender = struct {
+	out: std.ArrayList(u8) = .empty,
+	auth_hosts: std.ArrayList(u8) = .empty,
+	inject_hosts: std.ArrayList(u8) = .empty,
+
+	fn deinit(self: *AuthRender, gpa: std.mem.Allocator) void {
+		self.out.deinit(gpa);
+		self.auth_hosts.deinit(gpa);
+		self.inject_hosts.deinit(gpa);
+	}
+};
+
+fn runAuthRender(gpa: std.mem.Allocator, io: std.Io, net: std.json.Value, glob: []const u8, inst: []const u8, r: *AuthRender) !void {
+	try renderAuthProxyConf(gpa, io, net, glob, inst, &r.out, &r.auth_hosts, &r.inject_hosts, null);
+}
+
+test "renderAuthProxyConf: all three gates hold -> one element with the doc's fields, both hosts files fed" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+
+	// The cogworx bind shape: global store, the NEW kind, audience = the host.
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_authproxy_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	var parsed = try authNetFixture(gpa, "git.example.com", false, "1", "git.example.com");
+	defer parsed.deinit();
+
+	var r: AuthRender = .{};
+	defer r.deinit(gpa);
+	try runAuthRender(gpa, io, parsed.value, glob_dir, "zig-inject-test-no-instance", &r);
+	const s = r.out.items;
+
+	// The element carries exactly the contract fields, sourced from the DOC
+	// (plugin/scheme/git_user/grants) and the STORE (cred_file), never a mix.
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"host\": \"git.example.com\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"plugin\": \"gitlab\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"scheme\": \"https\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"insecure\": false") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"cred_format\": \"raw\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"git_user\": \"oauth2\"") != null);
+	// grants[] verbatim from the doc.
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"id\": \"gg-1\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"git-read\"") != null);
+	// the conf is a version-1 document its reader can gate on
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"version\": 1") != null);
+	// the retarget set carries exactly the emitted host...
+	try std.testing.expectEqualStrings("git.example.com\n", r.auth_hosts.items);
+	// ...and finding N1: the host is ALSO routed for plain HTTP.
+	try std.testing.expectEqualStrings("git.example.com\n", r.inject_hosts.items);
+}
+
+test "renderAuthProxyConf: each gate failing ALONE yields no element" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+
+	// GATE 1 (kind): a bound gitlab-OAUTH secret must not render an auth
+	// element even with the doc and the rule in place -- the legacy kind stays
+	// the addon's, the new kind stays the auth proxy's, never both.
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+	{
+		var parsed = try authNetFixture(gpa, "git.example.com", false, "1", "git.example.com");
+		defer parsed.deinit();
+		var r: AuthRender = .{};
+		defer r.deinit(gpa);
+		try runAuthRender(gpa, io, parsed.value, glob_dir, inst_dir, &r);
+		try std.testing.expect(std.mem.indexOf(u8, r.out.items, "git.example.com") == null);
+		try std.testing.expectEqualStrings("", r.auth_hosts.items);
+		try std.testing.expectEqualStrings("", r.inject_hosts.items);
+	}
+
+	// Re-bind under the NEW kind for the remaining gates.
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_authproxy_kind,
+		.tier = "durable",
+		.bound_at = 2,
+	});
+
+	// GATE 2 (doc): no provider entry claims the audience -> nothing. This is
+	// what keeps a bound token inert when the doc leg failed or was withdrawn
+	// (the empty share-suspension document).
+	{
+		var parsed = try authNetFixture(gpa, "git.example.com", false, "1", "git-other.example.com");
+		defer parsed.deinit();
+		var r: AuthRender = .{};
+		defer r.deinit(gpa);
+		try runAuthRender(gpa, io, parsed.value, glob_dir, inst_dir, &r);
+		try std.testing.expect(std.mem.indexOf(u8, r.out.items, "git.example.com") == null);
+		try std.testing.expectEqualStrings("", r.auth_hosts.items);
+	}
+
+	// GATE 2, version arm: an unknown doc version is DEAD TEXT, not live
+	// policy (a rolled-back binary or a hand-edited config must fail closed).
+	{
+		var parsed = try authNetFixture(gpa, "git.example.com", false, "2", "git.example.com");
+		defer parsed.deinit();
+		var r: AuthRender = .{};
+		defer r.deinit(gpa);
+		try runAuthRender(gpa, io, parsed.value, glob_dir, inst_dir, &r);
+		try std.testing.expect(std.mem.indexOf(u8, r.out.items, "git.example.com") == null);
+	}
+
+	// GATE 3 (rule): the doc claims the host but NO rule names it (the window
+	// before the funnel lands, or a control plane that withdrew the rules but
+	// left the bind) -> the doc is dead text; nothing is emitted and nothing
+	// is routed. (A mode flip-back is gate 1's case above: its legacy rules
+	// DO name the host, and the legacy-kind re-bind is what fails.)
+	{
+		var parsed = try authNetFixture(gpa, "api.example.com", false, "1", "git.example.com");
+		defer parsed.deinit();
+		var r: AuthRender = .{};
+		defer r.deinit(gpa);
+		try runAuthRender(gpa, io, parsed.value, glob_dir, inst_dir, &r);
+		try std.testing.expect(std.mem.indexOf(u8, r.out.items, "git.example.com") == null);
+		try std.testing.expectEqualStrings("", r.auth_hosts.items);
+		try std.testing.expectEqualStrings("", r.inject_hosts.items);
+	}
+}
+
+test "renderAuthProxyConf: insecure is single-sourced from the rule scan (finding N2)" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_authproxy_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	// The funnel rule carries insecure_upstream -> the conf element must carry
+	// insecure:true, or the flag silently stops applying the moment the
+	// upstream TLS leg moves from mitmproxy to the auth proxy.
+	var parsed = try authNetFixture(gpa, "git.example.com", true, "1", "git.example.com");
+	defer parsed.deinit();
+	var r: AuthRender = .{};
+	defer r.deinit(gpa);
+	try runAuthRender(gpa, io, parsed.value, glob_dir, "zig-inject-test-no-instance", &r);
+	try std.testing.expect(std.mem.indexOf(u8, r.out.items, "\"insecure\": true") != null);
+}
+
+test "renderAuthProxyConf: the N1 inject-hosts append dedupes against spec-emitted hosts" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_authproxy_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	var parsed = try authNetFixture(gpa, "git.example.com", false, "1", "git.example.com");
+	defer parsed.deinit();
+
+	// The inject-hosts buffer already names the host (an inject spec emitted
+	// it in the same pass) -> no duplicate line.
+	var r: AuthRender = .{};
+	defer r.deinit(gpa);
+	try r.inject_hosts.appendSlice(gpa, "git.example.com\n");
+	try runAuthRender(gpa, io, parsed.value, glob_dir, "zig-inject-test-no-instance", &r);
+	try std.testing.expectEqualStrings("git.example.com\n", r.inject_hosts.items);
+	// the auth conf and retarget set are unaffected by the dedupe
+	try std.testing.expect(std.mem.indexOf(u8, r.out.items, "\"host\": \"git.example.com\"") != null);
+	try std.testing.expectEqualStrings("git.example.com\n", r.auth_hosts.items);
+}
+
+test "writeL7Inject: the wire-file write order is pinned -- each conf before its hosts file, l7-auth-hosts LAST" {
+	// The order is data (l7_inject_write_order) and writeL7Inject iterates it,
+	// so asserting the list IS asserting the sequence. Conf-before-hosts for
+	// both consumers; the retarget set last of all.
+	try std.testing.expectEqual(@as(usize, 4), l7_inject_write_order.len);
+	try std.testing.expectEqualStrings("l7-inject-conf.json", l7_inject_write_order[0]);
+	try std.testing.expectEqualStrings("l7-auth-conf.json", l7_inject_write_order[1]);
+	try std.testing.expectEqualStrings("l7-inject-hosts", l7_inject_write_order[2]);
+	try std.testing.expectEqualStrings("l7-auth-hosts", l7_inject_write_order[3]);
+}
+
+test "writeL7Inject: one pass writes all four wire files; empty auth state renders a valid empty conf" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const rt_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(rt_dir);
+	defer cwd.deleteTree(io, rt_dir) catch {};
+
+	const readFile = struct {
+		fn f(a: std.mem.Allocator, io_: std.Io, dir: []const u8, name: []const u8) ![]u8 {
+			const p = try std.fs.path.join(a, &.{ dir, name });
+			defer a.free(p);
+			const file = try std.Io.Dir.cwd().openFile(io_, p, .{});
+			defer file.close(io_);
+			var buf: [512]u8 = undefined;
+			var rd = file.reader(io_, &buf);
+			return rd.interface.allocRemaining(a, .limited(1 << 16));
+		}
+	}.f;
+
+	// NOTHING bound: the auth conf must still be a VALID empty version-1
+	// document (not an empty file), so the auth proxy's reader caches it
+	// cleanly instead of re-parsing a refusal every poll; the retarget set is
+	// empty, so the addon touches nothing.
+	{
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, "{\"l7\":{\"mode\":\"terminate\",\"rules\":[]}}", .{});
+		defer parsed.deinit();
+		try writeL7Inject(gpa, io, rt_dir, parsed.value, glob_dir, "zig-inject-test-no-instance", null);
+		const conf = try readFile(gpa, io, rt_dir, "l7-auth-conf.json");
+		defer gpa.free(conf);
+		try std.testing.expect(std.mem.indexOf(u8, conf, "\"version\": 1") != null);
+		try std.testing.expect(std.mem.indexOf(u8, conf, "\"providers\": []") != null);
+		const ah = try readFile(gpa, io, rt_dir, "l7-auth-hosts");
+		defer gpa.free(ah);
+		try std.testing.expectEqualStrings("", ah);
+	}
+
+	// Bound + doc + rule: every file carries its half, from ONE pass.
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_authproxy_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+	{
+		var parsed = try authNetFixture(gpa, "git.example.com", false, "1", "git.example.com");
+		defer parsed.deinit();
+		try writeL7Inject(gpa, io, rt_dir, parsed.value, glob_dir, "zig-inject-test-no-instance", null);
+		const conf = try readFile(gpa, io, rt_dir, "l7-auth-conf.json");
+		defer gpa.free(conf);
+		try std.testing.expect(std.mem.indexOf(u8, conf, "\"host\": \"git.example.com\"") != null);
+		const ah = try readFile(gpa, io, rt_dir, "l7-auth-hosts");
+		defer gpa.free(ah);
+		try std.testing.expectEqualStrings("git.example.com\n", ah);
+		// finding N1: the plain-HTTP routing list carries the auth host even
+		// though no inject SPEC names it (the new kind seeds none).
+		const ih = try readFile(gpa, io, rt_dir, "l7-inject-hosts");
+		defer gpa.free(ih);
+		try std.testing.expect(std.mem.indexOf(u8, ih, "git.example.com") != null);
+		// and the addon's own conf exists (empty: no inject spec was seeded).
+		const ic = try readFile(gpa, io, rt_dir, "l7-inject-conf.json");
+		defer gpa.free(ic);
+		try std.testing.expect(std.mem.indexOf(u8, ic, "git.example.com") == null);
 	}
 }

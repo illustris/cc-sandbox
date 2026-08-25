@@ -15,6 +15,7 @@ const reload = rules_module.reload;
 pub fn dispatch(
 	allocator: std.mem.Allocator,
 	io: std.Io,
+	env: *std.process.Environ.Map,
 	config_path: []const u8,
 	runtime_path: []const u8,
 	rest: []const []const u8,
@@ -60,6 +61,7 @@ pub fn dispatch(
 		.clear => |c| try cmdClear(allocator, io, args, rules_arr, c, &loaded),
 		.set => try cmdSet(allocator, io, args, rules_arr, &loaded),
 		.replace => |r| try cmdReplace(allocator, io, args, net, rules_arr, r, &loaded),
+		.policy => try cmdPolicy(allocator, io, env, args, l7, &loaded),
 		.mode => |m| try cmdMode(allocator, io, args, l7, m, &loaded),
 	}
 }
@@ -373,6 +375,120 @@ fn readStdinAll(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
 	return r.interface.allocRemaining(allocator, .limited(1 << 20));
 }
 
+/// Read all of stdin under `limit` bytes; `error.StreamTooLong` past it, so an
+/// over-cap payload is a LOUD refusal (never a truncation).
+fn readStdinCapped(allocator: std.mem.Allocator, io: std.Io, limit: usize) ![]u8 {
+	const stdin = std.Io.File.stdin();
+	var sbuf: [4096]u8 = undefined;
+	var r = stdin.readerStreaming(io, &sbuf);
+	return r.interface.allocRemaining(allocator, .limited(limit));
+}
+
+/// The auth-proxy policy document's byte cap (CROSS-REPO CONTRACT: cogworx's
+/// compiler refuses an over-cap document at compile time, this verb refuses one
+/// at delivery). A cap, not a truncation: a truncated JSON document would parse
+/// as malformed anyway, but refusing BEFORE the parse keeps the failure named.
+pub const max_policy_bytes: usize = 64 * 1024;
+
+/// The auth-proxy policy document schema version this binary understands.
+/// An unknown value is refused BEFORE any write (fail closed both here and in
+/// the enforcer-side conf render, which treats a non-1 doc as dead text).
+pub const policy_doc_version: i64 = 1;
+
+pub const PolicyDocError = error{ MalformedPolicy, UnknownPolicyVersion, OutOfMemory };
+
+/// Validate a policy document WITHOUT writing anything: a JSON object carrying
+/// `"version": 1` and a `providers` array. The EMPTY document
+/// `{"version":1,"providers":[]}` is ACCEPTED -- refusing it would leave the
+/// previous policy live with the control plane unable to withdraw it, the same
+/// reason `l7 replace` accepts an empty batch. Deeper validation is deliberately
+/// the consumers': renderAuthProxyConf drops what it cannot gate and the auth
+/// proxy's own conf reader refuses what it does not fully understand, so a doc
+/// this binary is too old to interpret can only ever DENY, never widen.
+pub fn validatePolicyDoc(allocator: std.mem.Allocator, payload: []const u8) PolicyDocError!void {
+	var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| switch (err) {
+		error.OutOfMemory => return error.OutOfMemory,
+		else => return error.MalformedPolicy,
+	};
+	defer parsed.deinit();
+	const root = parsed.value;
+	if (root != .object) return error.MalformedPolicy;
+	const v = root.object.get("version") orelse return error.MalformedPolicy;
+	if (v != .integer or v.integer != policy_doc_version) return error.UnknownPolicyVersion;
+	const p = root.object.get("providers") orelse return error.MalformedPolicy;
+	if (p != .array) return error.MalformedPolicy;
+}
+
+fn providerCount(doc: std.json.Value) usize {
+	if (doc != .object) return 0;
+	const p = doc.object.get("providers") orelse return 0;
+	if (p != .array) return 0;
+	return p.array.items.len;
+}
+
+/// `l7 policy --from-stdin`: whole-document replace of `.network.l7.authpolicy`,
+/// the per-instance auth-proxy policy. Read stdin under the byte cap, validate
+/// (malformed / unknown version refused BEFORE anything is written), set the
+/// config section, save -- then render via rules_module.renderFiles, NOT
+/// maybeReload. renderFiles is the pass that writes the inject/auth confs inside
+/// ONE credgrant.Grants transaction (Grants.apply revokes group-read on every
+/// bound value file and re-grants only the ones that render noted, so a second
+/// render pass that noted only the inject conf's files would silently revoke the
+/// auth proxy's read access on the next `secret reload`), and it is the only
+/// render path that resolves the secret dirs from `env` -- which is why env is
+/// threaded into this verb at all. Mirrors `secret reload`'s reRenderInstance
+/// shape, both signals included: the render can seed inject specs, and
+/// netfilter-rules' funnel is derived from them, so passt must re-read too.
+fn cmdPolicy(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	env: *std.process.Environ.Map,
+	args: cli.Args,
+	l7: *std.json.Value,
+	loaded: *config.Loaded,
+) !void {
+	const payload = readStdinCapped(allocator, io, max_policy_bytes) catch |err| switch (err) {
+		error.StreamTooLong => return die(
+			allocator,
+			io,
+			"policy document exceeds the {d}-byte cap; refusing",
+			.{max_policy_bytes},
+			65,
+		),
+		else => return err,
+	};
+	defer allocator.free(payload);
+
+	validatePolicyDoc(allocator, payload) catch |err| switch (err) {
+		error.OutOfMemory => return err,
+		error.MalformedPolicy => return die(allocator, io, "invalid policy document (expected a JSON object with version + providers[])", .{}, 65),
+		error.UnknownPolicyVersion => return die(allocator, io, "unknown policy document version (expected {d})", .{policy_doc_version}, 65),
+	};
+
+	// Re-parse INTO THE CONFIG TREE's arena. alloc_always: the stdin buffer is
+	// freed when this function returns, so no parsed string may alias it.
+	const arena = loaded.treeAllocator();
+	const doc = std.json.parseFromSliceLeaky(std.json.Value, arena, payload, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+		error.OutOfMemory => return err,
+		else => unreachable, // validatePolicyDoc already parsed these bytes
+	};
+	try l7.object.put(arena, try arena.dupe(u8, "authpolicy"), doc);
+
+	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try announce(allocator, io, "Auth-proxy policy replaced ({d} provider(s)).", .{providerCount(doc)});
+
+	// No live runtime dir => the instance isn't running; the boot render picks
+	// the document up on next start (same shape as `secret add -n`).
+	const cwd = std.Io.Dir.cwd();
+	cwd.access(io, args.runtime_path, .{}) catch {
+		try announce(allocator, io, "Instance is not running; the policy renders at its next start.", .{});
+		return;
+	};
+	try rules_module.renderFiles(allocator, io, env, args.config_path, args.runtime_path);
+	_ = reload.maybeSignalL7proxy(allocator, io, args.runtime_path) catch {};
+	_ = reload.maybeSignalPasst(allocator, io, args.runtime_path) catch {};
+}
+
 fn cmdSet(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -457,4 +573,50 @@ fn die(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args:
 	const msg = std.fmt.allocPrint(allocator, "cogbox l7: error: " ++ fmt ++ "\n", args) catch "cogbox l7: error: (message too long)\n";
 	writeStderr(io, msg) catch {};
 	std.process.exit(code);
+}
+
+// --- Tests ---
+
+const t = std.testing;
+
+test "validatePolicyDoc: the empty document is accepted" {
+	// {"version":1,"providers":[]} is the share-suspension form the control
+	// plane pushes; refusing it would leave the previous policy live with no
+	// way to withdraw it.
+	try validatePolicyDoc(t.allocator, "{\"version\":1,\"providers\":[]}");
+}
+
+test "validatePolicyDoc: a populated v1 document is accepted" {
+	try validatePolicyDoc(t.allocator,
+		\\{"version":1,"providers":[{
+		\\  "provider":"GitLab","plugin":"gitlab","hosts":["git.example.com"],
+		\\  "secret":"git-gitlab","git_user":"oauth2","scheme":"https",
+		\\  "grants":[{"id":"gg-1","scope":"project","repo":"grp/proj",
+		\\             "project_id":"1234","caps":["git-read","issues"]}]}]}
+	);
+}
+
+test "validatePolicyDoc: malformed and unknown-version documents are refused" {
+	// Malformed JSON / wrong shapes -- all refused BEFORE any write.
+	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, ""));
+	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, "not json"));
+	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, "[]"));
+	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, "{\"providers\":[]}"));
+	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, "{\"version\":1}"));
+	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, "{\"version\":1,\"providers\":{}}"));
+	// An unknown (or non-integer) version is its own named refusal: a NEWER
+	// schema must never be half-interpreted by an older binary.
+	try t.expectError(error.UnknownPolicyVersion, validatePolicyDoc(t.allocator, "{\"version\":2,\"providers\":[]}"));
+	try t.expectError(error.UnknownPolicyVersion, validatePolicyDoc(t.allocator, "{\"version\":\"1\",\"providers\":[]}"));
+}
+
+test "max_policy_bytes: an over-cap stdin read is a loud StreamTooLong, not a truncation" {
+	// readStdinCapped's limit surfaces as error.StreamTooLong (asserted here on
+	// the underlying reader primitive, since stdin itself isn't scriptable in a
+	// unit test) -- which cmdPolicy maps to the named exit-65 refusal.
+	const big = try t.allocator.alloc(u8, max_policy_bytes + 1);
+	defer t.allocator.free(big);
+	@memset(big, 'x');
+	var r = std.Io.Reader.fixed(big);
+	try t.expectError(error.StreamTooLong, r.allocRemaining(t.allocator, .limited(max_policy_bytes)));
 }

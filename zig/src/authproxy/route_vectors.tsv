@@ -1,0 +1,199 @@
+# THE NEW ENGINE'S OWN ORACLE -- read ONLY by zig/src/authproxy/route_vectors_test.zig.
+#
+# Unlike path_vectors.tsv (the SHARED oracle read by three suites), this file
+# has exactly one consumer: the Zig auth proxy's route engine. That single-
+# consumer design is the concrete form of the spec's claim that the dual-matcher
+# obligation for git rules ENDS -- so this file must NOT be staged into the
+# addon-tests derivation, and no Python matcher reads it.
+#
+# TAB-separated. Blank lines and `#` comments ignored. Four kinds:
+#
+#   canon  <TAB> <raw target> <TAB> <seg0> <TAB> <seg1> <TAB> ...
+#       splitTarget (strip fragment, split at first `?`) then canonicalize:
+#       split the PATH on `/` FIRST, percent-decode each segment ONCE. Each
+#       expected segment is its own TAB field -- which is how `grp%2Fproj`
+#       stays ONE segment whose value CONTAINS a slash. A row with zero
+#       expected segments means the empty path (`/`).
+#
+#   refuse <TAB> <raw target> <TAB> <note>
+#       The canonicalizer refuses it outright; the core denies (403, no
+#       credential read, no upstream request).
+#
+#   route  <TAB> <method> <TAB> <raw target> <TAB> <route id | -> <TAB> <note>
+#       classify only (grant-independent). `-` == gate-1 deny (unrouted).
+#
+#   authz  <TAB> allow|deny <TAB> <fixture> <TAB> <method> <TAB> <raw target> <TAB> <note>
+#       classify then authorize under the named grant fixture (defined in the
+#       test file). A route that classify denies is a deny here too.
+
+# ================= canon: the INVERTED oracle vs path_vectors.tsv:62-64 =========
+# The legacy normalizer INFLATES `grp%2Fproj` into extra segments; this engine
+# must produce the OPPOSITE structural claim -- one segment whose value holds a
+# slash. That inversion is the entire point of segment-first single-decode.
+canon	/api/v4/projects/grp%2Fproj	api	v4	projects	grp/proj
+canon	/api/v4/projects/grp%2fproj/issues	api	v4	projects	grp/proj	issues
+canon	/api/v4/projects/a%2Fb%2Fc/access_tokens	api	v4	projects	a/b/c	access_tokens
+# path_vectors.tsv:66 single-pass: %252F -> the literal bytes `%2F`, never re-decoded.
+canon	/api/v4/projects/grp%252Fproj	api	v4	projects	grp%2Fproj
+# path_vectors.tsv:70-73 literal `*`/`#`, and the fragment split.
+canon	/a/*/b	a	*	b
+canon	/a/%2A/b	a	*	b
+canon	/a/%23/b	a	#	b
+canon	/a/#/b	a
+# query is split off first; the path is what canonicalizes.
+canon	/api/v4/projects/1234?statistics=true	api	v4	projects	1234
+canon	//api//v4//user//	api	v4	user
+canon	/api/v4/user	api	v4	user
+canon	/%61pi/v4/user	api	v4	user
+canon	/
+canon	/grp/proj.git/info/refs	grp	proj.git	info	refs
+
+# ================= refuse: dot segments (path_vectors.tsv:84-93) ================
+# The enforcer decides on these segments while the origin routes its own parse,
+# so a step that REMOVES a segment could authorize one resource and route
+# another. Refusing keeps "canonicalization only adds segments" true.
+refuse	/api/../%61dmin/./x	a `.` and a `..` segment, one encoded
+refuse	/v1/%2e%2e/secret	`%2e%2e` decodes to a `..` segment
+refuse	/../..	popping past the root
+refuse	/a/./b	a bare `.` segment
+refuse	/api/v4/projects/1234/issues/../issues/9	even a self-cancelling one
+refuse	/api/v4/projects/1234/issues/..%2F..%2Faccess_tokens	walking OUT of an anchored allow
+refuse	/api/v4/projects/1234/access_tokens/..%2Fissues	walking INTO the allow from under a deny
+refuse	/api/v4/user/keys/..%2F..%2Fprojects%2F1%2Fissues	and in from under a blanket deny
+refuse	/api/v4/groups/77/access_tokens/..%2F..%2F..%2Fprojects%2F1%2Fissues	the groups twin
+refuse	/api/v4/projects/1234/packages/generic/n/1/..%2F..%2F..%2F..%2Fissues	from a glob-tailed route
+# ----- refuse: byte-level (overlong/surrogate UTF-8, control bytes) -----
+refuse	/a/%C0%AF/b	overlong 2-byte solidus
+refuse	/a/%E0%80%AF/b	overlong 3-byte solidus
+refuse	/a/%ED%A0%80/b	a lone surrogate half
+refuse	/a/%00/b	a NUL byte
+refuse	/a/x%0D%0Ay/b	an embedded CRLF
+refuse	/a/%09/b	a tab is a C0 control
+refuse	/a/%C2%85/b	NEL is a C1 control
+refuse	/a/%zz/b	a malformed percent-escape
+# ----- refuse: query VALUES (re-emitted raw into the constructed upstream line) -----
+refuse	/api/v4/projects/1234/issues?a=b%0Dc	a query value decoding to a CR (header injection at the origin)
+refuse	/api/v4/projects/1234/issues?a=b%0Ac	...or a LF
+refuse	/api/v4/projects/1234/issues?a=%00	...or NUL
+refuse	/api/v4/projects/1234/issues?a=100%	a malformed percent-escape in a value
+# ----- refuse: size caps -----
+refuse	/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a	33 segments
+refuse	/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	a 256-byte segment
+
+# ================= route: classify only (grant-independent) =====================
+# the three git smart-HTTP routes, both `.git` and bare forms
+route	GET	/grp/proj.git/info/refs?service=git-upload-pack	git-refs	dot-git form
+route	GET	/grp/proj/info/refs?service=git-upload-pack	git-refs	bare form
+route	POST	/grp/proj.git/git-upload-pack	git-upload	read pack
+route	POST	/grp/proj.git/git-receive-pack	git-receive	write pack
+route	POST	/sub/grp/proj.git/git-upload-pack	git-upload	nested namespace
+# the ambient three + subtrees + archive
+route	GET	/api/v4/user	api-user	ambient
+route	HEAD	/api/v4/version	api-version	ambient
+route	GET	/api/v4/projects/1234	api-project	numeric id
+route	GET	/api/v4/projects/grp%2Fproj	api-project	path-form id
+route	GET	/api/v4/projects/1234/issues	api-issues	collection
+route	PUT	/api/v4/projects/1234/issues/9	api-issues	subtree
+route	GET	/api/v4/projects/1234/issues/9/notes	api-issues	deeper subtree
+route	POST	/api/v4/projects/1234/merge_requests	api-mr	collection
+route	GET	/api/v4/projects/1234/merge_requests/5/approve	api-mr	subtree still covers approve (parity)
+route	GET	/api/v4/projects/1234/repository/archive.tar.gz	api-archive	closed ext
+route	HEAD	/api/v4/projects/1234/repository/archive	api-archive	bare archive
+route	GET	/api/v4/projects/grp%2Fproj/repository/archive.zip	api-archive	path-form id
+# unrouted: a NAMED 403, not an accidental one
+route	GET	/api/v4/projects/1234/repository/archive.rar	-	ext outside the closed set
+route	GET	/api/v4/projects/1234/access_tokens	-	the minting surface, routed nowhere
+route	GET	/api/v4/projects/1234/variables	-	CI/CD variables, nowhere
+route	POST	/api/v4/projects/1234/deploy_keys	-	nowhere
+route	GET	/api/v4/groups/77	-	groups, nowhere
+# the rest of the legacy deny set (path_vectors.tsv:168-179), so a v2 groups
+# route cannot silently reopen any of them: every minting/key surface, in the
+# numeric, the %2F-encoded and the deep-nested id forms.
+route	GET	/api/v4/projects/1234/deploy_tokens	-	deploy tokens, nowhere
+route	POST	/api/v4/projects/1234/access_tokens/7/rotate	-	rotate is a mint too
+route	GET	/api/v4/projects/grp%2Fproj/access_tokens	-	%2F-encoded id: still nowhere (the id is ONE segment)
+route	GET	/api/v4/projects/grp%2Fproj/deploy_tokens	-	%2F-encoded id, deploy tokens
+route	GET	/api/v4/projects/grp%2Fproj/deploy_keys	-	%2F-encoded id, deploy keys
+route	GET	/api/v4/projects/a%2Fb%2Fc/access_tokens	-	deep nesting inside one id segment
+route	GET	/api/v4/projects/a/b/c/access_tokens	-	deep nesting as real segments: not even an id
+route	GET	/api/v4/groups/77/access_tokens	-	group access tokens, nowhere
+route	GET	/api/v4/groups/77/deploy_tokens	-	group deploy tokens, nowhere
+route	GET	/api/v4/groups/top%2Fsub/access_tokens	-	%2F-encoded group id, nowhere
+route	GET	/api/v4/groups/top%2Fsub/deploy_tokens	-	%2F-encoded group id, deploy tokens
+route	POST	/api/v4/personal_access_tokens/7/rotate	-	personal token rotate, nowhere
+route	GET	/api/v4/user/keys	-	the owner's SSH keys, nowhere
+route	GET	/api/v4/projects/1234/uploads/x	-	uploads, nowhere
+route	GET	/oauth/token	-	oauth, nowhere
+route	GET	/admin	-	admin, nowhere
+route	GET	/grp/proj.git/info/lfs/objects/batch	-	info/lfs reserved
+route	POST	/grp/proj.git/git-upload-archive	-	git-upload-archive reserved
+route	GET	/api/v4/projects/%D9%A3/issues	-	a non-ASCII single-segment id is not a well-formed path
+route	GET	/proj/info/refs?service=git-upload-pack	-	a single-component ref is not well-formed
+route	DELETE	/api/v4/projects/1234/issues	api-issues	classify is method-agnostic; authorize clamps DELETE
+
+# ================= authz: classify + authorize under a fixture ==================
+# fixtures (defined in route_vectors_test.zig):
+#   full        project grp/proj#1234 [git-read,git-write,issues]; namespace
+#               /grp/sub/ [git-read,git-write,issues,mr] projects{42,77};
+#               instance [git-read,mr]
+#   inst-read   instance [git-read]
+#   issues-only instance [issues]
+#   ns-mr       namespace /grp/sub/ [mr] projects{42,77}  (NO instance grant)
+#   proj-issues project grp/proj#1234 [issues]            (NO instance grant)
+
+# --- the git smart-HTTP tier: cap + scope ---
+authz	allow	full	GET	/grp/proj.git/info/refs?service=git-upload-pack	git-read on the concrete project
+authz	allow	full	POST	/grp/proj.git/git-receive-pack	git-write on the concrete project
+authz	deny	inst-read	POST	/grp/proj.git/git-receive-pack	cap_missing: only git-read
+authz	allow	inst-read	GET	/grp/proj.git/info/refs?service=git-upload-pack	instance git-read allows any well-formed ref
+authz	deny	inst-read	GET	/grp/proj.git/info/refs?service=git-receive-pack	cap_missing: git-write
+authz	deny	full	GET	/grp/proj.git/info/refs	service_invalid: the query is required
+authz	deny	full	GET	/proj.git/info/refs?service=git-upload-pack	no_route: a single-component ref
+
+# --- the API tier: cap, scope, method clamp, ambient ---
+authz	allow	full	GET	/api/v4/projects/1234/issues	issues on the concrete project
+authz	deny	full	GET	/api/v4/projects/999/issues	scope_mismatch: 999 is under no grant
+authz	deny	full	DELETE	/api/v4/projects/1234/issues	method_not_allowed: DELETE is in no cap
+authz	allow	full	GET	/api/v4/user	ambient: the instance holds issues|mr
+authz	allow	full	HEAD	/api/v4/version	ambient
+authz	deny	inst-read	GET	/api/v4/user	cap_missing: git-read is not issues|mr
+authz	allow	full	GET	/api/v4/projects/1234/repository/archive.tar.gz	archive rides git-read
+authz	deny	issues-only	GET	/api/v4/projects/1234/repository/archive.tar.gz	cap_missing: no git-read
+
+# --- namespace scope, and the grp-secret boundary (slash-terminated prefix) ---
+authz	allow	ns-mr	GET	/api/v4/projects/grp%2Fsub%2Fchild/merge_requests	path form strictly under /grp/sub/
+authz	deny	ns-mr	GET	/api/v4/projects/grp%2Fsub-secret%2Fchild/merge_requests	grp-secret stays EXCLUDED by the slash boundary
+authz	allow	ns-mr	GET	/api/v4/projects/42/merge_requests	numeric form rides projects[]
+authz	deny	ns-mr	GET	/api/v4/projects/99/merge_requests	99 is not in projects[]
+authz	deny	ns-mr	GET	/api/v4/projects/grp%2Fsub/merge_requests	the namespace itself is not under its own subtree
+
+# --- api-project is SCOPED, never ambient (B2): a non-granted project denies in BOTH id forms ---
+# The legacy tier compiled the project lookup as EXACT rules bound to the
+# grant's own project; an ambient read here would let any issues/mr grant use
+# the owner's token as an enumeration oracle over every project it can see.
+authz	allow	proj-issues	GET	/api/v4/projects/1234	the granted project, numeric form
+authz	allow	proj-issues	GET	/api/v4/projects/grp%2Fproj	the granted project, path form
+authz	deny	proj-issues	GET	/api/v4/projects/999	a NON-granted project, numeric form -> scope_mismatch
+authz	deny	proj-issues	GET	/api/v4/projects/other%2Fsecret	a NON-granted project, path form -> scope_mismatch
+authz	deny	proj-issues	HEAD	/api/v4/projects/999	HEAD is no exception
+authz	allow	ns-mr	GET	/api/v4/projects/42	namespace grant: numeric form rides projects[]
+authz	allow	ns-mr	GET	/api/v4/projects/grp%2Fsub%2Fchild	namespace grant: path form under the prefix
+authz	deny	ns-mr	GET	/api/v4/projects/99	namespace grant: 99 is not in projects[]
+authz	deny	ns-mr	GET	/api/v4/projects/other%2Fsecret	namespace grant: outside the prefix
+authz	deny	inst-read	GET	/api/v4/projects/1234	cap_missing: git-read alone never reads project metadata
+authz	allow	full	GET	/api/v4/projects/999	the instance-scope mr grant covers any well-formed id (by design)
+
+# ============ authz: THE SIX ESCAPE ROWS, FLIPPED TO DENY (the acceptance block) ============
+# In the LEGACY oracle each of these MATCHED an allow rule and reached a token
+# mint / key surface (path_vectors.tsv:201,204,228,237,241,242). Under segment-
+# first canonicalization the encoded slash is a typed fact inside ONE id
+# segment, the tail (`access_tokens`/`deploy_keys`) routes NOWHERE, and every
+# one becomes a gate-1 deny -- under the WIDEST fixture, so the deny is real,
+# except :237, which is the concrete tier's own claim and so runs under the
+# concrete-scope fixture (no wildcard, no instance grant to hide behind).
+authz	deny	full	GET	/api/v4/projects/mygroup%2Fissues/access_tokens	:201 `*` absorbed the tail -> now no_route
+authz	deny	full	GET	/api/v4/projects/mygroup%2Fmerge_requests/deploy_keys	:204 the merge_requests twin
+authz	deny	full	GET	/api/v4/projects/1234%2Fissues/access_tokens	:228 all-digit-namespace residual -> no_route
+authz	deny	proj-issues	GET	/api/v4/projects/1234%2Fissues/access_tokens	:237 the NO-WILDCARD concrete-tier twin (mandatory): a resolved-id grant and no instance grant cannot absorb the tail either
+authz	deny	full	GET	/api/v4/projects/1234/access_tokens	:241 the star-terminated footgun
+authz	deny	full	GET	/api/v4/projects/1234/access_tokens	:242 the hash-terminated footgun
